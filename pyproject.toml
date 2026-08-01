@@ -1,0 +1,38 @@
+# ============================================================
+# 智能家居家电互联智能体 — 项目元数据
+# ============================================================
+[project]
+name = "smart-home-agent"
+version = "0.1.0"
+description = "基于 LangGraph + MCP + 阿里百炼的智能家居 AI Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Your Name", email = "your@email.com" }]
+license = { text = "MIT" }
+dependencies = [
+    "langgraph>=1.0.0",
+    "langchain>=1.0.0",
+    "langchain-openai>=1.0.0",
+    "langgraph-checkpoint>=4.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "mcp>=1.0.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "loguru>=0.7.0",
+    "httpx>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
