@@ -582,12 +582,151 @@ class MetricsInterceptor:
 
 ### 6.4 持久化记忆
 
-默认使用内存模式，重启丢失。启用 SQLite 持久化：
+#### 6.4.1 为什么 Agent 需要记忆？
+
+大模型本身是**无状态**的 —— 每次调用 LLM，它都只看到你这次传入的消息，不记得之前说过什么。多轮对话所以能"记住"上下文，全靠我们在每一轮把历史消息重新喂给 LLM。
+
+LangGraph 通过 **Checkpoint（检查点）** 机制解决这个问题：
+
+- 每次节点执行完毕后，自动把图的状态（主要是 `messages` 消息列表）**存档**下来
+- 调用 `graph.invoke(..., config)` 时带上一个 **`thread_id`**（线程 ID），LangGraph 就知道该从哪份存档里恢复上下文
+- 整个 Agent 被设计成"有状态的"：同一 `thread_id` 下连续调用，历史消息自动累加
+
+```
+thread_id="user-abc123"  ──►  第1轮: [用户: 打开客厅灯]
+                              ──►  第2轮: [用户: 打开客厅灯, AI: 已打开, 用户: 空调呢?]  ← 带上了历史!
+```
+
+这就是我们项目里 `graph.compile(checkpointer=...)` 传 `checkpointer` 参数的原因。
+
+#### 6.4.2 两种存储模式对比
+
+项目支持两种检查点存储，通过 `.env` 一键切换：
+
+| 对比项 | 🧠 内存模式 (MemorySaver) | 💾 SQLite 持久化 (SqliteSaver) |
+|--------|--------------------------|-------------------------------|
+| 存储位置 | 程序内存 | `data/checkpoints.db` 文件 |
+| 重启后记忆 | ❌ 丢失 | ✅ 保留 |
+| 依赖 | 内置（LangGraph 自带） | 需额外安装 `langgraph-checkpoint-sqlite` |
+| 性能 | 最快 | 略慢（磁盘 IO，可忽略） |
+| 适用场景 | 开发调试、单元测试 | 生产部署、长期使用 |
+
+#### 6.4.3 代码是如何决定用哪种的？
+
+核心逻辑在 `src/agent/graph.py` 的 `_build_checkpointer()`：
+
+```python
+def _build_checkpointer(settings: Settings):
+    db_path = settings.memory.db_path   # 来自 CHECKPOINT_DB_PATH 环境变量
+
+    # 优先级: 有路径 + 装了 SQLite 支持包 → 用 SqliteSaver
+    if db_path and _HAS_SQLITE:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        return SqliteSaver(conn)        # 💾 持久化
+
+    # 否则回退到内存模式
+    return MemorySaver()                # 🧠 临时
+```
+
+**三个关键细节：**
+
+1. **`_HAS_SQLITE` 是环境探测**：`graph.py` 用 `try: from langgraph.checkpoint.sqlite import SqliteSaver` 探测，**装了这个包才为 `True`**。没装的话，即使配了路径也会静默回退到内存模式。
+2. **目录自动创建**：`sqlite3.connect()` 前会 `os.makedirs(db_dir, exist_ok=True)`，`data/` 目录不存在时自动创建。
+3. **单例配置**：`settings.memory` 来自 `src/config.py` 的 `MemoryConfig`，前缀是 `CHECKPOINT_`。
+
+#### 6.4.4 启用 SQLite 持久化（完整步骤）
+
+**第 1 步：安装 SQLite 支持包**
+
+```bash
+pip install langgraph-checkpoint-sqlite
+```
+
+> ⚠️ 这一步最容易漏。`pyproject.toml` 里没有把它列为硬依赖（保持内存模式开箱即用），需要手动安装。
+
+**第 2 步：在 `.env` 中配置路径**
 
 ```ini
 # .env
 CHECKPOINT_DB_PATH=data/checkpoints.db
 ```
+
+- 路径**留空**（`CHECKPOINT_DB_PATH=`）→ 回到内存模式
+- 路径可以是任意位置，如 `C:/data/home/checkpoints.db`
+
+**第 3 步：重启 Agent**
+
+```bash
+python -m src.main
+```
+
+#### 6.4.5 如何验证记忆真的生效了？
+
+**方式一：检查数据库文件**
+
+```bash
+# 正常对话几轮后，data/ 目录下应出现数据库文件
+ls -la data/
+# 输出: checkpoints.db
+```
+
+**方式二：重启后验证**
+
+1. 启动 Agent，输入 `把客厅灯调暗到 30%`，看到 Agent 执行成功
+2. 按 `/quit` 退出，重新 `python -m src.main`
+3. 输入 `/status` 或 `现在家里什么状态？`
+4. **内存模式**：灯恢复默认亮度 80%（状态重置）
+5. **SQLite 模式**：灯仍是 30%（状态保留）✅
+
+**方式三：用 Python 直接查看数据库**
+
+```python
+import sqlite3
+conn = sqlite3.connect("data/checkpoints.db")
+# 查看有哪些线程（对话）存档
+print(conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
+```
+
+#### 6.4.6 thread_id：对话如何被隔离
+
+`src/main.py` 里每次启动都会生成一个**新的随机 thread_id**：
+
+```python
+thread_id = f"user-{uuid.uuid4().hex[:8]}"   # 如 user-a3f9c2d1
+config = {"configurable": {"thread_id": thread_id}}
+```
+
+- **每次启动 = 新 thread_id = 全新对话**，从零开始
+- 终端里的 **`/reset`** 命令做的事就是生成一个新 thread_id，从而清空当前对话记忆（旧存档仍在数据库里，只是不再被引用）
+- 想让多轮调用共享上下文，手动固定同一个 thread_id 即可：
+
+```python
+config = {"configurable": {"thread_id": "my-fixed-session"}}
+graph.invoke({"messages": [HumanMessage("打开客厅灯")]}, config)
+graph.invoke({"messages": [HumanMessage("空调呢？")]}, config)   # 记得上一轮!
+```
+
+#### 6.4.7 长期记忆（规划中）
+
+目前的记忆是**短期记忆**（对话上下文）。项目还为未来预留了**长期记忆**（用户偏好学习），配置项已就位：
+
+```ini
+# .env
+ENABLE_LONG_TERM_MEMORY=true
+```
+
+规划中的能力：记住用户的习惯（"喜欢暖光"、"空调通常设 25°C"），跨会话、跨 `thread_id` 生效，用于个性化推荐。当前版本尚未实现，代码见 `src/memory/store.py` 的注释说明。
+
+#### 6.4.8 常见问题
+
+**Q: 配了 `CHECKPOINT_DB_PATH` 但重启后记忆还是丢？**
+A: 99% 是没装 `langgraph-checkpoint-sqlite`，代码静默回退到了内存模式。执行第 6.4.4 节的第 1 步。
+
+**Q: `checkpoints.db` 会被提交到 Git 吗？**
+A: 不会。`.gitignore` 中 `data/` 目录已被排除，数据库文件属于本地运行数据。
+
+**Q: 数据库会不会无限膨胀？**
+A: 检查点只存消息和状态，量级很小（KB 级）。如需清理，删除 `data/checkpoints.db` 重启即可。
 
 ---
 
