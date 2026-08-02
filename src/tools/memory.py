@@ -138,7 +138,8 @@ def list_preference_candidates(config: RunnableConfig) -> str:
         return "长期记忆未启用"
     return json.dumps([
         {"id": c.id, "key": c.memory_key, "value": c.memory_value,
-         "observations": c.observation_count, "confidence": c.confidence}
+         "observations": c.observation_count, "confidence": c.confidence,
+         "importance": c.importance, "source_text": c.source_text}
         for c in _service.list_candidates(_context(config))
     ], ensure_ascii=False)
 
@@ -160,3 +161,21 @@ def reject_preference_candidate(candidate_id: str, config: RunnableConfig) -> st
     if not _service.reject_candidate(_context(config), candidate_id):
         raise KeyError(candidate_id)
     return "已拒绝该偏好候选"
+
+
+@tool
+def list_memory_versions(memory_id: str, config: RunnableConfig) -> str:
+    """查看一条当前可访问记忆的历史版本和有效时间区间。"""
+    if _service is None:
+        return "长期记忆未启用"
+    versions = _service.list_versions(_context(config), memory_id)
+    return json.dumps([
+        {
+            "version": v.version,
+            "value": v.memory_value,
+            "valid_from": v.valid_from.isoformat(),
+            "valid_to": v.valid_to.isoformat() if v.valid_to else None,
+            "source": v.source,
+        }
+        for v in versions
+    ], ensure_ascii=False)

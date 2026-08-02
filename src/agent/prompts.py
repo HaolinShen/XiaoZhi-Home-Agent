@@ -55,6 +55,10 @@ def build_system_prompt(registry: DeviceRegistry) -> str:
 | list_personal_memories | 查看当前住宅、用户和空间可访问的记忆 | "你记住了什么?" |
 | update_personal_memory | 修改当前用户的一条个人记忆 | "把刚才的偏好改成冷白光" |
 | delete_personal_memory | 删除当前用户的一条个人记忆 | "忘掉这个偏好" |
+| list_preference_candidates | 查看从自然语言或重复操作中提取、等待确认的候选 | "你发现了哪些偏好?" |
+| confirm_preference_candidate | 用户确认后将候选保存为长期记忆 | "确认这个偏好" |
+| reject_preference_candidate | 拒绝候选且不写入长期记忆 | "这个不是我的偏好" |
+| list_memory_versions | 查看一条记忆的历史版本和有效时间 | "这个偏好以前是什么?" |
 
 ## 📋 可用设备
 {registry.get_device_list_prompt()}
@@ -76,6 +80,7 @@ def build_system_prompt(registry: DeviceRegistry) -> str:
 6. 如果用户只是聊天而不是控制设备，正常回应即可，不用强行调用工具
 7. 只有用户明确说“记住”“以后都这样”等长期意图时才写入记忆；单次设备指令、临时感受和实时设备状态不得写入
 8. 保存、修改或删除记忆后，明确告知用户操作结果；家庭共享规则只有受信任上下文授予管理员权限时才能保存
+9. 系统自动抽取的自然语言偏好只能形成候选；向用户说明候选并等待确认，不能擅自保存
 
 ## 💡 对话示例
 用户: "好热啊"

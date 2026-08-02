@@ -18,6 +18,7 @@ from .memory import (
     list_preference_candidates,
     confirm_preference_candidate,
     reject_preference_candidate,
+    list_memory_versions,
     list_personal_memories,
     save_home_rule,
     save_personal_memory,
@@ -50,6 +51,7 @@ def get_all_tools() -> list:
         list_preference_candidates,
         confirm_preference_candidate,
         reject_preference_candidate,
+        list_memory_versions,
     ]
 
 
@@ -72,4 +74,5 @@ __all__ = [
     "list_preference_candidates",
     "confirm_preference_candidate",
     "reject_preference_candidate",
+    "list_memory_versions",
 ]

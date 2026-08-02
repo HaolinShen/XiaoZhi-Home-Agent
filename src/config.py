@@ -66,6 +66,7 @@ class MemoryConfig(BaseSettings):
     tool_result_max_chars: int = Field(default=1200, ge=100)
     summary_max_chars: int = Field(default=1800, ge=200)
     session_ttl_hours: int = Field(default=168, ge=1)
+    retrieval_top_k: int = Field(default=6, ge=1, le=20)
 
 
 # ============================================================

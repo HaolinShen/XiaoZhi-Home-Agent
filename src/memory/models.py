@@ -45,6 +45,12 @@ class MemoryRecord(BaseModel):
     created_at: datetime
     updated_at: datetime
     expires_at: datetime | None = None
+    importance: float = Field(default=0.5, ge=0, le=1)
+    access_count: int = Field(default=0, ge=0)
+    last_accessed_at: datetime | None = None
+    valid_from: datetime
+    valid_to: datetime | None = None
+    version: int = Field(default=1, ge=1)
 
 
 class MemoryWrite(BaseModel):
@@ -59,6 +65,34 @@ class MemoryWrite(BaseModel):
     source: str | None = None
     confidence: float = Field(default=1.0, ge=0, le=1)
     expires_at: datetime | None = None
+    importance: float = Field(default=0.5, ge=0, le=1)
+    valid_from: datetime | None = None
+
+
+class MemoryVersion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    memory_id: str
+    home_id: str
+    version: int = Field(ge=1)
+    memory_value: dict[str, Any]
+    confidence: float = Field(ge=0, le=1)
+    importance: float = Field(ge=0, le=1)
+    source: str | None = None
+    valid_from: datetime
+    valid_to: datetime | None = None
+    created_at: datetime
+
+
+class ExtractedMemoryCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_key: str
+    memory_value: dict[str, Any]
+    confidence: float = Field(ge=0, le=1)
+    importance: float = Field(default=0.5, ge=0, le=1)
+    source_text: str
 
 
 class PreferenceCandidate(BaseModel):
@@ -73,6 +107,8 @@ class PreferenceCandidate(BaseModel):
     memory_value: dict[str, Any]
     observation_count: int = Field(ge=1)
     confidence: float = Field(ge=0, le=1)
+    importance: float = Field(default=0.5, ge=0, le=1)
+    source_text: str | None = None
     status: str
     created_at: datetime
     updated_at: datetime

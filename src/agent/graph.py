@@ -152,7 +152,13 @@ def build_graph(
             })
 
         if memory_service and state.get("request_home_id") and state.get("request_user_id"):
-            result["memory_context"] = memory_service.format_for_prompt(_context_from_state(state, result))
+            context = _context_from_state(state, result)
+            memory_service.extract_candidates_from_text(context, latest_text)
+            result["memory_context"] = memory_service.format_for_prompt(
+                context,
+                latest_text,
+                top_k=getattr(settings.memory, "retrieval_top_k", 6),
+            )
         return result
 
     def compact_context_node(state: AgentState) -> dict:
