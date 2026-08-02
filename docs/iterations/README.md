@@ -13,5 +13,4 @@
 
 | 序号 | 方案 | 状态 | 文档 |
 | --- | --- | --- | --- |
-| 001 | 智慧生活智能体记忆系统 MVP | 规划中 | [001-memory-system-mvp.md](001-memory-system-mvp.md) |
-
+| 001 | 智慧生活智能体记忆与空间定位系统 MVP | 规划中 | [001-memory-system-mvp.md](001-memory-system-mvp.md) |
