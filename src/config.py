@@ -52,10 +52,20 @@ class MemoryConfig(BaseSettings):
         default="data/checkpoints.db",
         description="SQLite 检查点数据库路径（设为空使用内存模式）",
     )
-    enable_long_term: bool = Field(
-        default=False,
-        description="是否启用长期记忆（用户偏好学习）",
+    long_term_db_path: str = Field(
+        default="data/memories.db",
+        description="SQLite 长期记忆数据库路径",
     )
+    enable_long_term: bool = Field(
+        default=True,
+        validation_alias="ENABLE_LONG_TERM_MEMORY",
+        description="是否启用长期记忆",
+    )
+    context_max_messages: int = Field(default=12, ge=2)
+    context_max_tokens: int = Field(default=2400, ge=100)
+    tool_result_max_chars: int = Field(default=1200, ge=100)
+    summary_max_chars: int = Field(default=1800, ge=200)
+    session_ttl_hours: int = Field(default=168, ge=1)
 
 
 # ============================================================

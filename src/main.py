@@ -26,7 +26,7 @@
 
 import sys
 import os
-import uuid
+from datetime import timedelta
 from typing import Optional
 
 # 确保项目根目录在 Python 路径中
@@ -40,19 +40,20 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
-from rich.live import Live
-from rich.spinner import Spinner
 from rich import box
 from loguru import logger
 
 # ---- 项目模块 ----
 from src.config import get_settings, Settings
 from src.devices import DeviceRegistry, SimulatorBackend
-from src.models import DeviceType
 from src.tools import set_registry as set_tools_registry
-from src.tools import get_all_tools
-from src.agent import build_graph
-from src.agent.state import AgentState
+from src.agent import (
+    AgentContext,
+    SessionManager,
+    SpaceDirectory,
+    build_agent_request,
+    build_graph,
+)
 from langchain_core.messages import HumanMessage
 
 # ============================================================
@@ -71,14 +72,16 @@ console = Console()
 # 启动辅助函数
 # ============================================================
 
-def _print_banner(settings: Settings) -> None:
+def _print_banner(settings: Settings, context: AgentContext) -> None:
     """打印欢迎横幅"""
     banner = Panel(
         f"[bold cyan]🏠 智能家居管家 — 小智[/bold cyan]\n\n"
         f"[dim]模型:[/dim] {settings.model}\n"
         f"[dim]框架:[/dim] LangGraph + LangChain + MCP\n"
         f"[dim]平台:[/dim] 阿里百炼 (Alibaba Bailian)\n"
-        f"[dim]会话:[/dim] {uuid.uuid4().hex[:8]}",
+        f"[dim]住宅:[/dim] {context.home_id}\n"
+        f"[dim]用户:[/dim] {context.user_id}\n"
+        f"[dim]会话:[/dim] {context.session_id}",
         title="Smart Home Agent v0.1.0",
         border_style="cyan",
         padding=(1, 2),
@@ -144,7 +147,8 @@ def _print_scenes() -> None:
 def run_interactive_loop(
     graph,
     registry: DeviceRegistry,
-    thread_id: str,
+    context: AgentContext,
+    sessions: SessionManager,
 ) -> None:
     """
     交互式对话主循环。
@@ -156,8 +160,6 @@ def run_interactive_loop(
       4. 显示 Agent 回复
       5. 循环
     """
-    config = {"configurable": {"thread_id": thread_id}}
-
     while True:
         try:
             # ---- 读取输入 ----
@@ -189,12 +191,16 @@ def run_interactive_loop(
                 continue
 
             elif user_input.lower() == "/reset":
-                # 生成新的 thread_id（新会话）
-                old_id = thread_id
-                new_id = f"user-{uuid.uuid4().hex[:8]}"
-                config = {"configurable": {"thread_id": new_id}}
+                old_id = context.session_id
+                context = sessions.create(
+                    home_id=context.home_id,
+                    user_id=context.user_id,
+                    client_id=context.client_id,
+                    room_id=context.room_id,
+                    device_id=context.device_id,
+                )
                 console.print(
-                    f"\n[dim]✅ 对话记忆已重置 | {old_id} → {new_id}[/dim]"
+                    f"\n[dim]✅ 已创建新会话 | {old_id} → {context.session_id}[/dim]"
                 )
                 continue
 
@@ -202,10 +208,10 @@ def run_interactive_loop(
             console.print("\n[bold cyan]🤖 小智:[/bold cyan] ", end="")
 
             with console.status("[dim]思考中...[/dim]", spinner="dots"):
-                result = graph.invoke(
-                    {"messages": [HumanMessage(content=user_input)]},
-                    config,
+                state_input, config = build_agent_request(
+                    HumanMessage(content=user_input), context
                 )
+                result = graph.invoke(state_input, config)
 
             # 提取最终回复
             final_msg = result["messages"][-1]
@@ -238,6 +244,17 @@ def chat(
     debug: bool = typer.Option(
         False, "--debug", "-d",
         help="开启调试模式（显示详细日志）",
+    ),
+    home_id: str = typer.Option("demo-home", help="住宅 ID"),
+    user_id: str = typer.Option("demo-user", help="用户 ID"),
+    session_id: Optional[str] = typer.Option(None, help="已有会话 ID；留空则新建"),
+    client_id: str = typer.Option("cli", help="终端 ID"),
+    room_id: Optional[str] = typer.Option(None, help="当前房间 ID"),
+    device_id: Optional[str] = typer.Option(None, help="当前设备 ID"),
+    admin: bool = typer.Option(
+        False,
+        "--admin",
+        help="以家庭管理员身份运行（仅供可信后端或本地演示设置）",
     ),
 ):
     """
@@ -276,9 +293,6 @@ def chat(
         colorize=True,
     )
 
-    # ---- 打印横幅 ----
-    _print_banner(settings)
-
     # ---- 初始化设备注册中心 ----
     backend = SimulatorBackend()
     registry = DeviceRegistry(backend)
@@ -286,10 +300,29 @@ def chat(
     # ---- 注入注册中心到工具层 ----
     set_tools_registry(registry)
 
+    space_directory = SpaceDirectory.from_registry(registry, home_id=home_id)
+
     # ---- 构建 Agent 图 ----
     console.print("[dim]正在初始化 Agent...[/dim]")
     try:
-        graph = build_graph(registry, settings)
+        graph = build_graph(registry, settings, space_directory)
+        sessions = SessionManager(
+            space_directory,
+            graph.checkpointer,
+            ttl=timedelta(hours=settings.memory.session_ttl_hours),
+        )
+        expired_sessions = sessions.cleanup_expired()
+        if expired_sessions:
+            logger.info(f"已清理 {expired_sessions} 个过期会话")
+        context = sessions.create(
+            home_id=home_id,
+            user_id=user_id,
+            client_id=client_id,
+            room_id=room_id,
+            device_id=device_id,
+            is_admin=admin,
+            session_id=session_id,
+        )
     except Exception as e:
         console.print(f"\n[red]❌ Agent 初始化失败: {e}[/red]\n")
         console.print(
@@ -299,6 +332,8 @@ def chat(
             "  3. 模型名称不正确[/dim]\n"
         )
         raise typer.Exit(code=1)
+
+    _print_banner(settings, context)
 
     # ---- 打印提示 ----
     console.print()
@@ -312,8 +347,7 @@ def chat(
     console.print("[dim]输入 /help 查看更多用法，/quit 退出[/dim]")
 
     # ---- 启动对话循环 ----
-    thread_id = f"user-{uuid.uuid4().hex[:8]}"
-    run_interactive_loop(graph, registry, thread_id)
+    run_interactive_loop(graph, registry, context, sessions)
 
 
 @app.command()

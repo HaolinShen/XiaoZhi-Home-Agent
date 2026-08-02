@@ -162,8 +162,10 @@ class DeviceRegistry:
         keywords = keywords_map.get(device_type, [])
         for kw in keywords:
             if kw in user_input:
-                # 返回该类型的第一个设备
-                return next(iter(type_devices.values()))
+                # 多候选时拒绝猜测，让 Agent 向用户澄清。
+                if len(type_devices) == 1:
+                    return next(iter(type_devices.values()))
+                return None
 
         return None
 

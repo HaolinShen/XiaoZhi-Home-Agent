@@ -36,6 +36,7 @@
 | 💡 **多设备控制** | 灯光、空调、电视、窗帘的完整控制能力（开关/调温/调音量等） |
 | 🎬 **场景模式** | 回家 / 离家 / 睡眠 / 观影 / 起床，一句话一键执行多个设备操作 |
 | 💬 **多轮对话记忆** | 基于 LangGraph Checkpoint，默认 SQLite 持久化，重启不丢上下文 |
+| 🧠 **结构化长期记忆** | SQLite 保存家庭规则与个人偏好，支持范围隔离、查看、修改和删除 |
 | 🔌 **MCP 集成** | 通过 Model Context Protocol 将工具暴露给 Claude Desktop 等外部 AI |
 | 🛡️ **中间件体系** | 日志记录 + 失败自动重试（指数退避），装饰器模式可自由组合 |
 | 🖥️ **现代化 CLI** | Typer + Rich 构建，支持 Markdown 渲染、彩色面板、交互式命令 |
@@ -145,7 +146,34 @@ python -m src.main
 # 指定模型 / 调试模式
 python -m src.main --model qwen-max
 python -m src.main --debug
+
+# 使用稳定业务会话，并提供 App 当前房间上下文
+python -m src.main --home-id demo-home --user-id user-001 \
+  --session-id session-001 --client-id phone-001 --room-id living_room
+
+# 本地演示家庭共享规则管理（生产环境应由业务后端授予权限）
+python -m src.main --home-id demo-home --user-id admin-001 --admin
 ```
+
+`session_id` 会直接用作 LangGraph `thread_id`。复用同一 `session_id` 可恢复会话，
+`/reset` 会创建新会话；`room_id` 和 `device_id` 会在进入 Agent 前校验住宅归属。
+
+### 长期记忆
+
+长期记忆默认保存到 `data/memories.db`。用户明确表达“记住我喜欢暖光”或
+“以后睡觉时空调设为 25 度”时，Agent 可调用记忆工具保存个人偏好；单次控制指令、
+临时感受和实时设备状态不会保存。
+
+支持的范围包括：
+
+- 家庭共享：`home_id`
+- 房间共享：`home_id + room_id`
+- 设备共享：`home_id + device_id`
+- 个人及个人空间/设备：`home_id + user_id`，可附带 `room_id` 或 `device_id`
+
+所有查询都强制包含 `home_id`。个人记忆只对所属用户可见；家庭、房间和设备共享
+记忆的写入、修改和删除需要可信业务上下文中的管理员权限。模型工具参数不能指定
+任意 `home_id` 或 `user_id`。
 
 ---
 
@@ -224,7 +252,9 @@ langgraph/
 │   ├── models.py               # Pydantic v2 设备数据模型
 │   │
 │   ├── agent/
+│   │   ├── context.py          # 可信请求身份与空间归属校验
 │   │   ├── graph.py            # ★ LangGraph 工作流（Agent 核心）
+│   │   ├── session.py          # 会话创建、恢复与结束
 │   │   ├── state.py            # Agent 状态定义
 │   │   └── prompts.py          # 系统提示词
 │   │
@@ -241,7 +271,12 @@ langgraph/
 │   │   └── client.py           # MCP 客户端
 │   │
 │   ├── memory/
+│   │   ├── models.py           # 长期记忆数据模型
+│   │   ├── repository.py       # SQLite Repository
+│   │   ├── service.py          # 隔离、权限与范围规则
 │   │   └── store.py            # 检查点记忆（内存 / SQLite）
+│   ├── tools/
+│   │   └── memory.py           # 受可信上下文约束的记忆工具
 │   │
 │   └── middleware/
 │       └── interceptors.py     # 中间件（日志 + 重试）
@@ -285,7 +320,13 @@ langgraph/
 | `MCP_SERVER_ENABLED` | `true` | 是否内置启动 MCP 服务器 |
 | `MCP_SERVER_PORT` | `8765` | MCP SSE 模式端口 |
 | `CHECKPOINT_DB_PATH` | `data/checkpoints.db` | 记忆持久化路径（留空=内存模式） |
-| `ENABLE_LONG_TERM_MEMORY` | `false` | 长期记忆（规划中） |
+| `ENABLE_LONG_TERM_MEMORY` | `true` | 是否启用结构化长期记忆 |
+| `CHECKPOINT_LONG_TERM_DB_PATH` | `data/memories.db` | 长期记忆 SQLite 路径 |
+| `CHECKPOINT_CONTEXT_MAX_MESSAGES` | `12` | 模型输入保留的最近消息上限 |
+| `CHECKPOINT_CONTEXT_MAX_TOKENS` | `2400` | 模型输入的估算 token 上限 |
+| `CHECKPOINT_TOOL_RESULT_MAX_CHARS` | `1200` | 单条工具结果保留字符上限 |
+| `CHECKPOINT_SUMMARY_MAX_CHARS` | `1800` | 滚动摘要字符上限 |
+| `CHECKPOINT_SESSION_TTL_HOURS` | `168` | 无活动会话检查点保留小时数 |
 
 ---
 

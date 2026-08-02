@@ -13,6 +13,14 @@ from .scenes import (
     list_scenes,
     set_registry as set_scene_tools_registry,
 )
+from .memory import (
+    delete_personal_memory,
+    list_personal_memories,
+    save_home_rule,
+    save_personal_memory,
+    set_memory_service,
+    update_personal_memory,
+)
 
 
 def set_registry(registry) -> None:
@@ -31,6 +39,11 @@ def get_all_tools() -> list:
         activate_scene,
         list_scenes,
         get_device_status,
+        save_personal_memory,
+        save_home_rule,
+        list_personal_memories,
+        update_personal_memory,
+        delete_personal_memory,
     ]
 
 
@@ -44,4 +57,10 @@ __all__ = [
     "activate_scene",
     "list_scenes",
     "get_device_status",
+    "set_memory_service",
+    "save_personal_memory",
+    "save_home_rule",
+    "list_personal_memories",
+    "update_personal_memory",
+    "delete_personal_memory",
 ]

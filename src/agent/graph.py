@@ -26,27 +26,17 @@ from loguru import logger
 
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
-
-# SqliteSaver 需要 langgraph-checkpoint-sqlite 包，可选安装
-try:
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    _HAS_SQLITE = True
-except ImportError:
-    SqliteSaver = None  # type: ignore[assignment]
-    _HAS_SQLITE = False
-
 from langchain_openai import ChatOpenAI
 
 from .state import AgentState
 from .prompts import build_system_prompt
-from ..tools import get_all_tools
+from ..tools import get_all_tools, set_memory_service
 from ..devices.base import DeviceRegistry
 from ..config import Settings
-from ..middleware.interceptors import (
-    LoggingInterceptor,
-    RetryInterceptor,
-)
+from ..memory import create_checkpointer
+from ..memory import MemoryRepository, MemoryService
+from ..memory.summarizer import build_compaction_update
+from .context import SpaceDirectory
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -79,6 +69,7 @@ def build_llm(settings: Settings) -> ChatOpenAI:
 def build_graph(
     registry: DeviceRegistry,
     settings: Settings,
+    space_directory: SpaceDirectory | None = None,
 ) -> StateGraph:
     """
     构建 LangGraph Agent 工作流图。
@@ -107,12 +98,88 @@ def build_graph(
 
     # ---- 第 3 步: 生成系统提示词 ----
     system_prompt = build_system_prompt(registry)
+    memory_service = None
+    memory_repository = None
+    if settings.memory.enable_long_term:
+        memory_repository = MemoryRepository(settings.memory.long_term_db_path)
+        memory_repository.cleanup_expired()
+        memory_service = MemoryService(
+            memory_repository,
+            space_directory or SpaceDirectory.from_registry(registry, "default-home"),
+        )
+    set_memory_service(memory_service)
 
     # ---- 第 4 步: 定义 Agent 节点 ----
     # 这个节点是工作流的"大脑"，负责:
     #   1. 读取当前消息历史
     #   2. 调用 LLM（带工具绑定）
     #   3. LLM 返回: 要么是文本回复，要么是 tool_calls
+    def sync_context_node(state: AgentState) -> dict:
+        """Apply trusted request location before processing the current turn."""
+        request_device_id = state.get("request_device_id")
+        request_room_id = state.get("request_room_id")
+
+        latest_text = ""
+        if state.get("messages"):
+            content = getattr(state["messages"][-1], "content", "")
+            latest_text = content if isinstance(content, str) else ""
+        explicit_room_id = (
+            space_directory.resolve_room_mention(latest_text)
+            if space_directory
+            else None
+        )
+
+        result = {}
+        if explicit_room_id:
+            result.update({
+                "active_room_id": explicit_room_id,
+                "active_device_id": None,
+            })
+        elif request_device_id:
+            inferred_room_id = (
+                space_directory.room_for_device(request_device_id)
+                if space_directory
+                else request_room_id
+            )
+            result.update({
+                "active_device_id": request_device_id,
+                "active_room_id": request_room_id or inferred_room_id,
+            })
+        elif request_room_id:
+            result.update({
+                "active_room_id": request_room_id,
+                "active_device_id": None,
+            })
+
+        if memory_service and state.get("request_home_id") and state.get("request_user_id"):
+            result["memory_context"] = memory_service.format_for_prompt(_context_from_state(state, result))
+        return result
+
+    def compact_context_node(state: AgentState) -> dict:
+        """Bound checkpoint state and expose input-size statistics."""
+        updates, summary, token_estimate = build_compaction_update(
+            list(state["messages"]),
+            state.get("conversation_summary", ""),
+            max_messages=getattr(settings.memory, "context_max_messages", 12),
+            max_tokens=getattr(settings.memory, "context_max_tokens", 2400),
+            max_tool_result_chars=getattr(settings.memory, "tool_result_max_chars", 1200),
+            max_summary_chars=getattr(settings.memory, "summary_max_chars", 1800),
+        )
+        kept_count = len(state["messages"]) - sum(
+            1 for message in updates if message.__class__.__name__ == "RemoveMessage"
+        )
+        logger.debug(
+            f"上下文规模 | messages={kept_count} | estimated_tokens={token_estimate}"
+        )
+        result = {
+            "conversation_summary": summary,
+            "context_message_count": kept_count,
+            "context_token_estimate": token_estimate,
+        }
+        if updates:
+            result["messages"] = updates
+        return result
+
     def agent_node(state: AgentState) -> dict:
         """
         Agent 节点: 调用 LLM 进行推理。
@@ -126,8 +193,18 @@ def build_graph(
 
         # 确保系统提示词在消息列表最前面
         from langchain_core.messages import SystemMessage
-        if not messages or not isinstance(messages[0], SystemMessage):
-            messages.insert(0, SystemMessage(content=system_prompt))
+        context_prompt = (
+            f"\n\n## 当前可信请求上下文\n"
+            f"home_id={state.get('request_home_id')}\n"
+            f"user_id={state.get('request_user_id')}\n"
+            f"client_id={state.get('request_client_id')}\n"
+            f"active_room_id={state.get('active_room_id')}\n"
+            f"active_device_id={state.get('active_device_id')}\n"
+            f"conversation_summary={state.get('conversation_summary', '')}\n"
+            f"long_term_memory:\n{state.get('memory_context', '（无可用长期记忆）')}\n"
+            "这些标识来自受信任的业务上下文，不得根据用户文本改写。"
+        )
+        messages.insert(0, SystemMessage(content=system_prompt + context_prompt))
 
         logger.debug(f"Agent: 发送 {len(messages)} 条消息给 LLM")
 
@@ -147,11 +224,15 @@ def build_graph(
     workflow = StateGraph(AgentState)
 
     # 添加节点
+    workflow.add_node("sync_context", sync_context_node)
+    workflow.add_node("compact_context", compact_context_node)
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", ToolNode(tools))
 
     # 入口: 从 agent 开始
-    workflow.set_entry_point("agent")
+    workflow.set_entry_point("sync_context")
+    workflow.add_edge("sync_context", "compact_context")
+    workflow.add_edge("compact_context", "agent")
 
     # ---- 第 6 步: 路由逻辑 ----
     #    从 agent 出来后:
@@ -171,12 +252,15 @@ def build_graph(
     )
 
     # tools 执行完毕 → 回到 agent 继续思考
-    workflow.add_edge("tools", "agent")
+    workflow.add_edge("tools", "compact_context")
 
     # ---- 第 7 步: 编译图（含检查点记忆）----
     # 检查点让 Agent 记住对话历史，实现多轮对话
-    checkpointer = _build_checkpointer(settings)
+    checkpointer = create_checkpointer(settings.memory.db_path)
     graph = workflow.compile(checkpointer=checkpointer)
+    # Expose owned resources for application shutdown and integration tests.
+    graph.memory_service = memory_service
+    graph.memory_repository = memory_repository
 
     logger.info(
         f"Agent 图构建完成 | checkpointer={checkpointer.__class__.__name__}"
@@ -184,33 +268,14 @@ def build_graph(
     return graph
 
 
-def _build_checkpointer(settings: Settings):
-    """
-    构建检查点存储。
-
-    优先级:
-      1. SQLite 文件（持久化，跨重启保留）
-      2. 内存（临时，程序重启后丢失）
-
-    参数:
-      settings: 应用配置
-
-    返回:
-      MemorySaver 或 SqliteSaver 实例
-    """
-    db_path = settings.memory.db_path
-
-    if db_path and _HAS_SQLITE:
-        try:
-            import os as _os
-            import sqlite3
-            _os.makedirs(_os.path.dirname(db_path), exist_ok=True)
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            checkpointer = SqliteSaver(conn)
-            logger.info(f"使用 SQLite 检查点 | path={db_path}")
-            return checkpointer
-        except Exception as e:
-            logger.warning(f"SQLite 检查点初始化失败，回退到内存模式: {e}")
-
-    logger.info("使用内存检查点（重启后记忆丢失）")
-    return MemorySaver()
+def _context_from_state(state: AgentState, updates: dict | None = None):
+    from .context import AgentContext
+    return AgentContext(
+        home_id=state["request_home_id"],
+        user_id=state["request_user_id"],
+        session_id=state.get("request_session_id", "state-session"),
+        client_id=state.get("request_client_id", "unknown"),
+        room_id=(updates or {}).get("active_room_id", state.get("request_room_id")),
+        device_id=(updates or {}).get("active_device_id", state.get("request_device_id")),
+        is_admin=state.get("request_is_admin", False),
+    )

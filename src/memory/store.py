@@ -19,6 +19,8 @@
 """
 
 import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from loguru import logger
 
@@ -36,9 +38,7 @@ def create_checkpointer(db_path: Optional[str] = None):
     """
     创建检查点存储器。
 
-    策略:
-      1. 如果提供了 db_path → SQLite 持久化模式
-      2. 如果 db_path 为空或创建失败 → 内存模式（fallback）
+    SQLite is explicit: a configured path must initialize successfully.
 
     参数:
       db_path: SQLite 数据库文件路径。
@@ -55,9 +55,13 @@ def create_checkpointer(db_path: Optional[str] = None):
       # 内存模式
       checkpointer = create_checkpointer(None)
     """
-    if db_path and _HAS_SQLITE:
+    if db_path:
+        if not _HAS_SQLITE:
+            raise RuntimeError(
+                "SQLite checkpointing is configured but "
+                "langgraph-checkpoint-sqlite is not installed"
+            )
         try:
-            import sqlite3
             db_dir = os.path.dirname(db_path)
             if db_dir:
                 os.makedirs(db_dir, exist_ok=True)
@@ -66,8 +70,48 @@ def create_checkpointer(db_path: Optional[str] = None):
             checkpointer = SqliteSaver(conn)
             logger.info(f"✅ SQLite 检查点已就绪 | path={db_path}")
             return checkpointer
-        except Exception as e:
-            logger.warning(f"SQLite 初始化失败，回退到内存模式: {e}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to initialize SQLite checkpointer at {db_path!r}: {exc}"
+            ) from exc
 
     logger.info("📝 使用内存检查点（会话记忆在重启后丢失）")
     return MemorySaver()
+
+
+def close_checkpointer(checkpointer) -> None:
+    """Close the underlying SQLite connection when one is present."""
+    connection = getattr(checkpointer, "conn", None)
+    if connection is not None:
+        connection.close()
+
+
+def cleanup_expired_checkpoints(
+    checkpointer,
+    ttl: timedelta,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Delete checkpoint threads whose latest snapshot is older than ``ttl``."""
+    now = now or datetime.now(timezone.utc)
+    latest_by_thread = {}
+    for item in checkpointer.list(None):
+        configurable = item.config.get("configurable", {})
+        thread_id = configurable.get("thread_id")
+        if not thread_id:
+            continue
+        timestamp = item.checkpoint.get("ts")
+        if timestamp:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            previous = latest_by_thread.get(thread_id)
+            if previous is None or parsed > previous:
+                latest_by_thread[thread_id] = parsed
+
+    expired = [
+        thread_id
+        for thread_id, timestamp in latest_by_thread.items()
+        if now - timestamp.astimezone(timezone.utc) >= ttl
+    ]
+    for thread_id in expired:
+        checkpointer.delete_thread(thread_id)
+    return len(expired)
