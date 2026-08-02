@@ -15,6 +15,9 @@ from .scenes import (
 )
 from .memory import (
     delete_personal_memory,
+    list_preference_candidates,
+    confirm_preference_candidate,
+    reject_preference_candidate,
     list_personal_memories,
     save_home_rule,
     save_personal_memory,
@@ -44,6 +47,9 @@ def get_all_tools() -> list:
         list_personal_memories,
         update_personal_memory,
         delete_personal_memory,
+        list_preference_candidates,
+        confirm_preference_candidate,
+        reject_preference_candidate,
     ]
 
 
@@ -63,4 +69,7 @@ __all__ = [
     "list_personal_memories",
     "update_personal_memory",
     "delete_personal_memory",
+    "list_preference_candidates",
+    "confirm_preference_candidate",
+    "reject_preference_candidate",
 ]

@@ -59,3 +59,34 @@ class MemoryWrite(BaseModel):
     source: str | None = None
     confidence: float = Field(default=1.0, ge=0, le=1)
     expires_at: datetime | None = None
+
+
+class PreferenceCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    home_id: str
+    user_id: str
+    room_id: str | None = None
+    device_id: str | None = None
+    memory_key: str
+    memory_value: dict[str, Any]
+    observation_count: int = Field(ge=1)
+    confidence: float = Field(ge=0, le=1)
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    confirmed_memory_id: str | None = None
+
+
+class MemoryConflict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    memory_id: str
+    home_id: str
+    previous_value: dict[str, Any]
+    incoming_value: dict[str, Any]
+    resolved_value: dict[str, Any]
+    resolution: str
+    created_at: datetime

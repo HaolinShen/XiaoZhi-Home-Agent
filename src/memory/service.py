@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from .models import MemoryRecord, MemoryScope, MemoryWrite
+from datetime import timedelta
+
+from .models import MemoryRecord, MemoryScope, MemoryType, MemoryWrite, PreferenceCandidate, utc_now
 from .repository import MemoryRepository
 from ..agent.context import AgentContext, SpaceDirectory
 
@@ -38,7 +40,82 @@ class MemoryService:
             )
 
         owner = None if shared_scope else context.user_id
+        existing = self.repository.find_by_key(
+            context.home_id, owner, item.room_id, item.device_id,
+            item.scope, item.memory_type, item.memory_key,
+        )
+        if existing:
+            merged = _merge_values(existing.memory_value, item.memory_value)
+            if existing.memory_value != item.memory_value:
+                resolution = "merged" if merged != item.memory_value else "incoming_wins"
+                self.repository.add_conflict(existing, item.memory_value, merged, resolution)
+            item = item.model_copy(update={"memory_value": merged})
         return self.repository.upsert(context.home_id, owner, item)
+
+    def record_operation(
+        self, context: AgentContext, memory_key: str, memory_value: dict,
+        *, minimum_repetitions: int = 3,
+    ) -> PreferenceCandidate | None:
+        """Aggregate a real operation and create, but never auto-save, a candidate."""
+        self.spaces.validate(context)
+        count = self.repository.observe_preference(
+            context.home_id, context.user_id, memory_key, memory_value,
+            context.room_id, context.device_id,
+        )
+        if count < minimum_repetitions:
+            return None
+        confidence = min(0.95, 0.5 + 0.1 * count)
+        return self.repository.upsert_candidate(
+            context.home_id, context.user_id, memory_key, memory_value,
+            count, confidence, context.room_id, context.device_id,
+        )
+
+    def list_candidates(self, context: AgentContext) -> list[PreferenceCandidate]:
+        self.spaces.validate(context)
+        return self.repository.list_candidates(context.home_id, context.user_id)
+
+    def confirm_candidate(self, context: AgentContext, candidate_id: str) -> MemoryRecord:
+        self.spaces.validate(context)
+        candidate = self.repository.get_candidate(candidate_id, context.home_id)
+        if candidate is None or candidate.user_id != context.user_id or candidate.status != "pending":
+            raise KeyError(candidate_id)
+        record = self.save(context, MemoryWrite(
+            scope=MemoryScope.USER,
+            memory_type=MemoryType.PREFERENCE,
+            memory_key=candidate.memory_key,
+            memory_value=candidate.memory_value,
+            room_id=candidate.room_id,
+            device_id=candidate.device_id,
+            confidence=candidate.confidence,
+            source=f"confirmed_candidate:{candidate.id}",
+        ))
+        self.repository.resolve_candidate(
+            candidate.id, context.home_id, context.user_id, "confirmed", record.id
+        )
+        return record
+
+    def reject_candidate(self, context: AgentContext, candidate_id: str) -> bool:
+        self.spaces.validate(context)
+        return self.repository.resolve_candidate(
+            candidate_id, context.home_id, context.user_id, "rejected"
+        )
+
+    def decay_stale_confidence(
+        self, *, stale_after: timedelta = timedelta(days=90), factor: float = 0.9,
+        floor: float = 0.2,
+    ) -> int:
+        if not 0 < factor < 1 or not 0 <= floor <= 1:
+            raise ValueError("invalid confidence decay settings")
+        return self.repository.decay_confidence(utc_now() - stale_after, factor, floor)
+
+    def evaluate_vector_retrieval(self, home_id: str | None = None, *, threshold: int = 500) -> dict:
+        count = self.repository.active_count(home_id)
+        return {
+            "active_memory_count": count,
+            "threshold": threshold,
+            "recommend_vector_retrieval": count >= threshold,
+            "reason": "memory_scale_threshold_reached" if count >= threshold else "structured_filters_sufficient",
+        }
 
     def list(self, context: AgentContext) -> list[MemoryRecord]:
         self.spaces.validate(context)
@@ -126,3 +203,14 @@ class MemoryService:
             }))
 
         return item.model_copy(update={"room_id": room_id, "device_id": device_id})
+
+
+def _merge_values(previous: dict, incoming: dict) -> dict:
+    """Preserve complementary fields while explicit incoming fields take precedence."""
+    merged = dict(previous)
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_values(merged[key], value)
+        else:
+            merged[key] = value
+    return merged

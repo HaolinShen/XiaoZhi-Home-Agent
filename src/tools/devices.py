@@ -17,11 +17,13 @@
 """
 
 from typing import Optional
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from loguru import logger
 
 from ..models import DeviceType, ACMode, FanSpeed
 from ..devices.base import DeviceRegistry
+from .memory import record_preference_operation
 
 
 # ============================================================
@@ -61,6 +63,7 @@ def control_light(
     action: str,
     brightness: int = 50,
     color: str = "暖白",
+    config: RunnableConfig = None,
 ) -> str:
     """
     控制灯光设备。支持打开/关闭、调节亮度、调节色温。
@@ -106,10 +109,18 @@ def control_light(
     elif action == "set_brightness":
         brightness = max(0, min(100, brightness))
         registry.update(device.device_id, brightness=brightness, power=True)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "lighting.brightness", {"brightness": brightness}
+            )
         return f"✅ {device.name}亮度已调至 {brightness}%。"
 
     elif action == "set_color":
         registry.update(device.device_id, color=color, power=True)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "lighting.color", {"color": color}
+            )
         return f"✅ {device.name}色温已调至「{color}」。"
 
     else:
@@ -127,6 +138,7 @@ def control_ac(
     temperature: int = 26,
     mode: str = "cool",
     fan_speed: str = "auto",
+    config: RunnableConfig = None,
 ) -> str:
     """
     控制空调设备。支持打开/关闭、调温、切换模式、调节风速。
@@ -173,6 +185,10 @@ def control_ac(
     elif action == "set_temp":
         temperature = max(16, min(30, temperature))
         registry.update(device.device_id, temperature=temperature, power=True)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "ac.temperature", {"temperature": temperature}
+            )
         return f"✅ {device.name}温度已设为 {temperature}°C。"
 
     elif action == "set_mode":
@@ -180,6 +196,10 @@ def control_ac(
         if mode not in valid_modes:
             return f"❌ 无效的模式「{mode}」。支持: cool(制冷), heat(制热), fan(送风), dry(除湿)"
         registry.update(device.device_id, mode=mode, power=True)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "ac.mode", {"mode": mode}
+            )
         mode_cn = {"cool": "制冷", "heat": "制热", "fan": "送风", "dry": "除湿"}
         return f"✅ {device.name}已切换至{mode_cn[mode]}模式。"
 
@@ -188,6 +208,10 @@ def control_ac(
         if fan_speed not in valid_speeds:
             return f"❌ 无效的风速「{fan_speed}」。支持: auto(自动), low(低), mid(中), high(高)"
         registry.update(device.device_id, fan_speed=fan_speed)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "ac.fan_speed", {"fan_speed": fan_speed}
+            )
         speed_cn = {"auto": "自动", "low": "低", "mid": "中", "high": "高"}
         return f"✅ {device.name}风速已设为{speed_cn[fan_speed]}。"
 
@@ -205,6 +229,7 @@ def control_tv(
     action: str,
     volume: int = 30,
     channel: str = "HDMI 1",
+    config: RunnableConfig = None,
 ) -> str:
     """
     控制电视设备。支持打开/关闭、调节音量、静音、切换输入源。
@@ -246,6 +271,10 @@ def control_tv(
     elif action == "set_volume":
         volume = max(0, min(100, volume))
         registry.update(device.device_id, volume=volume)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "tv.volume", {"volume": volume}
+            )
         return f"✅ {device.name}音量已调至 {volume}%。"
 
     elif action == "mute":
@@ -255,6 +284,10 @@ def control_tv(
 
     elif action == "set_channel":
         registry.update(device.device_id, channel=channel, power=True)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "tv.channel", {"channel": channel}
+            )
         return f"✅ {device.name}已切换至 {channel}。"
 
     else:
@@ -270,6 +303,7 @@ def control_curtain(
     device_name: str,
     action: str,
     percentage: int = 100,
+    config: RunnableConfig = None,
 ) -> str:
     """
     控制窗帘设备。支持完全打开、完全关闭、或调节到指定开合度。
@@ -307,6 +341,10 @@ def control_curtain(
     elif action == "set_position":
         percentage = max(0, min(100, percentage))
         registry.update(device.device_id, position=percentage)
+        if config is not None:
+            record_preference_operation(
+                config, device.device_id, "curtain.position", {"percentage": percentage}
+            )
         if percentage == 0:
             desc = "完全关闭"
         elif percentage == 100:

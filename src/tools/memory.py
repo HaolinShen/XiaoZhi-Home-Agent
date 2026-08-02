@@ -36,6 +36,19 @@ def _is_admin(config: RunnableConfig) -> bool:
     return config.get("configurable", {}).get("is_admin") is True
 
 
+def record_preference_operation(
+    config: RunnableConfig,
+    device_id: str,
+    memory_key: str,
+    memory_value: dict[str, Any],
+) -> None:
+    """Record a successful device setting without exposing identity to the model."""
+    if _service is None:
+        return
+    context = _context(config).model_copy(update={"room_id": None, "device_id": device_id})
+    _service.record_operation(context, memory_key, memory_value)
+
+
 @tool
 def save_personal_memory(
     memory_key: str,
@@ -116,3 +129,34 @@ def delete_personal_memory(memory_id: str, config: RunnableConfig) -> str:
         return "长期记忆未启用"
     _service.delete(_context(config), memory_id)
     return "记忆已删除"
+
+
+@tool
+def list_preference_candidates(config: RunnableConfig) -> str:
+    """查看系统根据重复操作生成、等待用户确认的偏好候选。"""
+    if _service is None:
+        return "长期记忆未启用"
+    return json.dumps([
+        {"id": c.id, "key": c.memory_key, "value": c.memory_value,
+         "observations": c.observation_count, "confidence": c.confidence}
+        for c in _service.list_candidates(_context(config))
+    ], ensure_ascii=False)
+
+
+@tool
+def confirm_preference_candidate(candidate_id: str, config: RunnableConfig) -> str:
+    """用户明确确认一个偏好候选后，将其保存为个人长期记忆。"""
+    if _service is None:
+        return "长期记忆未启用"
+    record = _service.confirm_candidate(_context(config), candidate_id)
+    return f"已确认并保存偏好 {record.memory_key}（id={record.id}）"
+
+
+@tool
+def reject_preference_candidate(candidate_id: str, config: RunnableConfig) -> str:
+    """拒绝一个偏好候选，不会写入长期记忆。"""
+    if _service is None:
+        return "长期记忆未启用"
+    if not _service.reject_candidate(_context(config), candidate_id):
+        raise KeyError(candidate_id)
+    return "已拒绝该偏好候选"
