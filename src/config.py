@@ -69,6 +69,16 @@ class MemoryConfig(BaseSettings):
     retrieval_top_k: int = Field(default=6, ge=1, le=20)
 
 
+class PlanningConfig(BaseSettings):
+    """Planner–Executor–Verifier loop limits."""
+    model_config = SettingsConfigDict(env_prefix="PLANNING_")
+
+    enabled: bool = Field(default=True)
+    max_steps: int = Field(default=8, ge=2, le=12)
+    max_step_retries: int = Field(default=1, ge=0, le=3)
+    max_replans: int = Field(default=1, ge=0, le=3)
+
+
 # ============================================================
 # 主配置
 # ============================================================
@@ -151,6 +161,7 @@ class Settings(BaseSettings):
     # ---- 子配置 ----
     mcp_server: MCPServerConfig = Field(default_factory=MCPServerConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    planning: PlanningConfig = Field(default_factory=PlanningConfig)
 
     # ---- 最终解析后的值（非 Field，用于内部使用）----
     _api_key: str = ""

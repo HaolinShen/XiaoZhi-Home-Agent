@@ -3,16 +3,11 @@ LangGraph Agent 工作流
 ======================
 构建智能家居 Agent 的核心工作流图。
 
-架构: ReAct (Reasoning + Acting) 循环
+架构: ReAct + Human-in-the-loop + Planner–Executor–Verifier
 
-    ┌─────────────────────────────────────────────────────┐
-    │                                                     │
-    │  用户输入 → [Agent 节点] → 有工具调用? ──是──→ [Tool 节点] ──┘
-    │                    │                                 │
-    │                    否                                │
-    │                    ↓                                 │
-    │                  [END]                               │
-    └─────────────────────────────────────────────────────┘
+    普通请求 → ReAct Agent → ToolNode
+    场景请求 → ReAct Agent → interrupt → ToolNode
+    复杂任务 → Planner → interrupt → Executor → Verifier → retry/replan/final
 
 关键设计决策:
   1. 使用 ToolNode（LangGraph 预置），而非自己解析 tool_calls
@@ -28,6 +23,8 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
 
 from .state import AgentState
 from .prompts import build_system_prompt
@@ -42,6 +39,14 @@ from .approval import (
     approval_is_granted,
     build_approval_request,
     rejection_tool_messages,
+)
+from .planning import (
+    ExecutionPlan,
+    expected_state_for_step,
+    plan_approval_payload,
+    planner_prompt,
+    should_use_planner,
+    verify_step,
 )
 
 
@@ -99,6 +104,7 @@ def build_graph(
 
     # ---- 第 2 步: 获取工具列表并绑定到 LLM ----
     tools = get_all_tools()
+    tools_by_name = {tool.name: tool for tool in tools}
     llm_with_tools = llm.bind_tools(tools)
     logger.info(f"已绑定 {len(tools)} 个工具到 LLM")
 
@@ -192,6 +198,170 @@ def build_graph(
             result["messages"] = updates
         return result
 
+    def task_router_node(state: AgentState) -> dict:
+        """Select the explicit planning branch only for custom multi-step goals."""
+        latest_text = ""
+        if state.get("messages"):
+            content = getattr(state["messages"][-1], "content", "")
+            latest_text = content if isinstance(content, str) else ""
+        planning_enabled = getattr(getattr(settings, "planning", None), "enabled", True)
+        use_planner = planning_enabled and should_use_planner(latest_text)
+        if not use_planner:
+            return {"planning_active": False}
+        return {
+            "planning_active": True,
+            "planning_goal": latest_text,
+            "plan": None,
+            "plan_revision": 0,
+            "current_step_index": 0,
+            "step_retry_count": 0,
+            "replan_count": 0,
+            "planning_status": "planning",
+            "planning_failure_feedback": "",
+            "planning_results": [],
+        }
+
+    def planner_node(state: AgentState) -> dict:
+        """Generate or revise a structured plan without executing tools."""
+        structured_planner = llm.with_structured_output(ExecutionPlan)
+        prompt = planner_prompt(
+            state["planning_goal"],
+            registry,
+            state.get("memory_context", "（无可用长期记忆）"),
+            state.get("planning_failure_feedback", ""),
+        )
+        plan = structured_planner.invoke(prompt)
+        if not isinstance(plan, ExecutionPlan):
+            plan = ExecutionPlan.model_validate(plan)
+        max_steps = getattr(getattr(settings, "planning", None), "max_steps", 8)
+        if len(plan.steps) > max_steps:
+            plan = plan.model_copy(update={"steps": plan.steps[:max_steps]})
+        revision = state.get("plan_revision", 0) + 1
+        logger.info(
+            "Planner 生成计划 | revision={} | steps={} | goal={}",
+            revision,
+            len(plan.steps),
+            plan.goal,
+        )
+        return {
+            "plan": plan.model_dump(),
+            "plan_revision": revision,
+            "current_step_index": 0,
+            "step_retry_count": 0,
+            "planning_status": "awaiting_approval",
+            "last_execution": None,
+            "last_verification": None,
+        }
+
+    def plan_approval_node(state: AgentState) -> dict:
+        """Pause before executing a newly generated or revised plan."""
+        request = plan_approval_payload(state["plan"])
+        decision = interrupt(request)
+        approved = approval_is_granted(decision)
+        return {
+            "approval_request": request,
+            "approval_decision": "approved" if approved else "rejected",
+            "planning_status": "executing" if approved else "cancelled",
+        }
+
+    def executor_node(state: AgentState, config: RunnableConfig) -> dict:
+        """Execute exactly one plan step using the existing trusted tools."""
+        step = state["plan"]["steps"][state.get("current_step_index", 0)]
+        device_id, expected_state, preparation_error = expected_state_for_step(step, registry)
+        tool = tools_by_name.get(step["tool_name"])
+        try:
+            if tool is None:
+                tool_result = f"❌ 未注册工具 {step['tool_name']}"
+            elif preparation_error:
+                tool_result = f"❌ {preparation_error}"
+            else:
+                tool_result = str(tool.invoke(step["arguments"], config=config))
+        except Exception as exc:
+            logger.warning(
+                "Executor 工具异常 | step={} | tool={} | error={}",
+                step["step_id"], step["tool_name"], exc,
+            )
+            tool_result = f"❌ 工具执行异常: {exc}"
+        return {
+            "last_execution": {
+                "step": step,
+                "device_id": device_id,
+                "expected_state": expected_state,
+                "preparation_error": preparation_error,
+                "tool_result": tool_result,
+            },
+            "planning_status": "executing",
+            "approval_request": None,
+        }
+
+    def verifier_node(state: AgentState) -> dict:
+        """Check the actual device state and select the next control action."""
+        execution = state["last_execution"]
+        verification = verify_step(
+            registry,
+            execution.get("device_id"),
+            execution.get("expected_state", {}),
+            execution.get("tool_result", ""),
+            execution.get("preparation_error"),
+        )
+        index = state.get("current_step_index", 0)
+        results = list(state.get("planning_results", []))
+        results.append({
+            "plan_revision": state.get("plan_revision", 1),
+            "step_id": execution["step"]["step_id"],
+            "description": execution["step"]["description"],
+            "tool_result": execution["tool_result"],
+            "verification": verification.model_dump(),
+        })
+        if verification.success:
+            next_index = index + 1
+            finished = next_index >= len(state["plan"]["steps"])
+            return {
+                "last_verification": verification.model_dump(),
+                "planning_results": results,
+                "current_step_index": next_index,
+                "step_retry_count": 0,
+                "planning_status": "completed" if finished else "executing",
+            }
+
+        retry_count = state.get("step_retry_count", 0) + 1
+        max_retries = getattr(getattr(settings, "planning", None), "max_step_retries", 1)
+        if retry_count <= max_retries:
+            next_status = "executing"
+            replan_count = state.get("replan_count", 0)
+        else:
+            replan_count = state.get("replan_count", 0) + 1
+            max_replans = getattr(getattr(settings, "planning", None), "max_replans", 1)
+            next_status = "planning" if replan_count <= max_replans else "failed"
+        return {
+            "last_verification": verification.model_dump(),
+            "planning_results": results,
+            "step_retry_count": retry_count,
+            "replan_count": replan_count,
+            "planning_status": next_status,
+            "planning_failure_feedback": (
+                f"步骤 {execution['step']['step_id']}（{execution['step']['description']}）失败："
+                f"{verification.reason}。工具结果：{execution['tool_result']}"
+            ),
+        }
+
+    def planning_finalize_node(state: AgentState) -> dict:
+        """Produce a deterministic summary of the completed planning trajectory."""
+        status = state.get("planning_status")
+        results = state.get("planning_results", [])
+        succeeded = sum(1 for item in results if item["verification"]["success"])
+        if status == "cancelled":
+            content = "已取消该多步骤计划，所有尚未执行的设备操作都不会执行。"
+        elif status == "completed":
+            content = f"多步骤任务已完成，共验证通过 {succeeded} 个步骤。"
+        else:
+            failure = state.get("planning_failure_feedback", "未知原因")
+            content = f"多步骤任务未能完成，已停止继续执行。最后失败原因：{failure}"
+        return {
+            "messages": [AIMessage(content=content)],
+            "planning_active": False,
+        }
+
     def agent_node(state: AgentState) -> dict:
         """
         Agent 节点: 调用 LLM 进行推理。
@@ -266,16 +436,64 @@ def build_graph(
 
     # 添加节点
     workflow.add_node("sync_context", sync_context_node)
+    workflow.add_node("task_router", task_router_node)
     workflow.add_node("compact_context", compact_context_node)
     workflow.add_node("agent", agent_node)
     workflow.add_node("approval", approval_node)
     workflow.add_node("reject_tools", reject_tools_node)
     workflow.add_node("tools", ToolNode(tools))
+    workflow.add_node("planner", planner_node)
+    workflow.add_node("plan_approval", plan_approval_node)
+    workflow.add_node("executor", executor_node)
+    workflow.add_node("verifier", verifier_node)
+    workflow.add_node("planning_finalize", planning_finalize_node)
 
     # 入口: 从 agent 开始
     workflow.set_entry_point("sync_context")
-    workflow.add_edge("sync_context", "compact_context")
+    workflow.add_edge("sync_context", "task_router")
+
+    def route_task(state: AgentState) -> Literal["planner", "compact_context"]:
+        return "planner" if state.get("planning_active") else "compact_context"
+
+    workflow.add_conditional_edges(
+        "task_router",
+        route_task,
+        {"planner": "planner", "compact_context": "compact_context"},
+    )
     workflow.add_edge("compact_context", "agent")
+
+    workflow.add_edge("planner", "plan_approval")
+
+    def route_after_plan_approval(state: AgentState) -> Literal["executor", "planning_finalize"]:
+        return "executor" if state.get("planning_status") == "executing" else "planning_finalize"
+
+    workflow.add_conditional_edges(
+        "plan_approval",
+        route_after_plan_approval,
+        {"executor": "executor", "planning_finalize": "planning_finalize"},
+    )
+    workflow.add_edge("executor", "verifier")
+
+    def route_after_verifier(
+        state: AgentState,
+    ) -> Literal["executor", "planner", "planning_finalize"]:
+        status = state.get("planning_status")
+        if status == "executing":
+            return "executor"
+        if status == "planning":
+            return "planner"
+        return "planning_finalize"
+
+    workflow.add_conditional_edges(
+        "verifier",
+        route_after_verifier,
+        {
+            "executor": "executor",
+            "planner": "planner",
+            "planning_finalize": "planning_finalize",
+        },
+    )
+    workflow.add_edge("planning_finalize", END)
 
     # ---- 第 6 步: 路由逻辑 ----
     #    从 agent 出来后:

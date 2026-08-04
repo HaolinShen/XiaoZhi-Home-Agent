@@ -58,19 +58,24 @@
   ↓
 sync_context             同步可信身份、房间、设备和长期记忆
   ↓
-compact_context          控制消息窗口并维护滚动摘要
-  ↓
-agent                    LLM 决定回复或生成工具调用
-  ├── 无工具调用 ─────────────────────────────────────→ END
-  ├── 普通工具调用 ───────────────────────────────────→ tools
-  └── activate_scene ─→ approval
-                          ├── interrupt：暂停等待用户决定
-                          ├── approved ───────────────→ tools
-                          └── rejected ───────────────→ reject_tools
-                                                               ↓
-                         compact_context ←──────────────────────┘
-                                  ↓
-                                agent
+task_router
+  ├── 普通请求 / 预定义场景
+  │      ↓
+  │   compact_context → agent
+  │      ├── 无工具调用 ───────────────────────────────→ END
+  │      ├── 普通工具调用 ─────────────────────────────→ tools
+  │      └── activate_scene → approval → tools / reject_tools
+  │
+  └── 自定义多步骤目标
+         ↓
+      planner → plan_approval（interrupt）
+                    ├── rejected ──────────────────────→ finalize
+                    └── approved
+                           ↓
+                        executor → verifier
+                                      ├── 下一步 / retry → executor
+                                      ├── replan         → planner
+                                      └── 完成 / 失败     → finalize
 ```
 
 图中的两类持久状态分别是：
@@ -154,6 +159,7 @@ langgraph/
 │   │   ├── state.py          # Agent 状态定义 (AgentState)
 │   │   ├── prompts.py        # 系统提示词模板
 │   │   ├── approval.py       # 风险识别、中断数据和拒绝结果
+│   │   ├── planning.py       # 结构化计划、预期状态和 Verifier
 │   │   └── graph.py          # LangGraph 工作流图 (build_graph)
 │   │
 │   ├── mcp/                  # MCP 层
@@ -182,7 +188,8 @@ langgraph/
 │   ├── test_phase_three.py
 │   ├── test_phase_four.py
 │   ├── test_phase_five.py
-│   └── test_phase_six.py     # Human-in-the-loop 测试
+│   ├── test_phase_six.py     # Human-in-the-loop 测试
+│   └── test_phase_seven.py   # Planner–Executor–Verifier 测试
 │
 ├── docs/                     # 文档
 │   ├── tutorial.md           # 本教程
@@ -420,11 +427,17 @@ print(result["messages"][-1].content)
 | 节点 | 作用 |
 | --- | --- |
 | `sync_context` | 同步可信请求位置，抽取记忆候选并检索长期记忆 |
+| `task_router` | 将明确的自定义多步骤目标路由到规划分支 |
 | `compact_context` | 限制消息和 token 规模，维护滚动摘要 |
 | `agent` | 调用绑定工具后的 LLM |
 | `approval` | 对批量场景调用执行 `interrupt` |
 | `tools` | 使用 `ToolNode` 执行已批准或无需确认的工具 |
 | `reject_tools` | 拒绝时生成匹配工具调用 ID 的取消结果 |
+| `planner` | 通过结构化输出生成或修订 `ExecutionPlan` |
+| `plan_approval` | 在执行完整计划前暂停并展示步骤 |
+| `executor` | 每次只执行当前计划中的一个原子工具步骤 |
+| `verifier` | 读取真实设备状态，判断成功、重试或重新规划 |
+| `planning_finalize` | 汇总完成、取消或失败结果 |
 
 简化后的构图代码如下：
 
@@ -432,14 +445,25 @@ print(result["messages"][-1].content)
 workflow = StateGraph(AgentState)
 
 workflow.add_node("sync_context", sync_context_node)
+workflow.add_node("task_router", task_router_node)
 workflow.add_node("compact_context", compact_context_node)
 workflow.add_node("agent", agent_node)
 workflow.add_node("approval", approval_node)
 workflow.add_node("tools", ToolNode(tools))
 workflow.add_node("reject_tools", reject_tools_node)
+workflow.add_node("planner", planner_node)
+workflow.add_node("plan_approval", plan_approval_node)
+workflow.add_node("executor", executor_node)
+workflow.add_node("verifier", verifier_node)
+workflow.add_node("planning_finalize", planning_finalize_node)
 
 workflow.set_entry_point("sync_context")
-workflow.add_edge("sync_context", "compact_context")
+workflow.add_edge("sync_context", "task_router")
+
+workflow.add_conditional_edges("task_router", route_task, {
+    "planner": "planner",
+    "compact_context": "compact_context",
+})
 workflow.add_edge("compact_context", "agent")
 
 workflow.add_conditional_edges("agent", router, {
@@ -455,6 +479,18 @@ workflow.add_conditional_edges("approval", route_after_approval, {
 
 workflow.add_edge("tools", "compact_context")
 workflow.add_edge("reject_tools", "compact_context")
+
+workflow.add_edge("planner", "plan_approval")
+workflow.add_conditional_edges("plan_approval", route_after_plan_approval, {
+    "executor": "executor",
+    "planning_finalize": "planning_finalize",
+})
+workflow.add_edge("executor", "verifier")
+workflow.add_conditional_edges("verifier", route_after_verifier, {
+    "executor": "executor",
+    "planner": "planner",
+    "planning_finalize": "planning_finalize",
+})
 
 graph = workflow.compile(checkpointer=create_checkpointer(db_path))
 ```
@@ -604,7 +640,7 @@ python -m src.mcp.server --transport sse --port 8765
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-当前测试覆盖阶段一至阶段六，共 43 个测试。Human-in-the-loop 相关测试位于 `tests/test_phase_six.py`，重点验证：
+当前测试覆盖阶段一至阶段七，共 50 个测试。Human-in-the-loop 相关测试位于 `tests/test_phase_six.py`，重点验证：
 
 1. 中断返回时，批量场景尚未修改设备；
 2. `approved=True` 后才执行真实场景；
@@ -612,6 +648,17 @@ python -m unittest discover -s tests -p "test_*.py" -v
 4. 拒绝路径产生匹配工具调用 ID 的 `ToolMessage`；
 5. 普通单设备工具不会触发中断；
 6. SQLite Checkpoint 关闭并重新构建图后，仍可使用相同 `thread_id` 恢复。
+
+Planner–Executor–Verifier 相关测试位于 `tests/test_phase_seven.py`，重点验证：
+
+1. 复杂任务路由不会影响单设备和预定义场景；
+2. 计划需要批准后才开始执行；
+3. Executor 按步骤调用现有工具；
+4. Verifier 根据真实设备状态判断结果；
+5. 单步失败能够有限重试；
+6. 重试耗尽后能够重新规划并再次确认；
+7. SQLite Checkpoint 能在图重建后恢复已暂停的计划；
+8. 重试和重新规划额度全部耗尽后任务会明确停止。
 
 ---
 
@@ -1404,105 +1451,166 @@ workflow.add_conditional_edges(
 
 #### 6.5.3 Planner–Executor：把规划和执行分开
 
-当前 Agent 更接近 ReAct 模式：模型根据当前消息决定下一次工具调用，再根据工具结果继续思考。面对“准备睡觉”“执行离家模式”这类包含多个目标的任务，可以增加显式规划：
+阶段七已经实现 Planner–Executor 分支。项目现在保留两种执行方式：
+
+- 普通单步请求和预定义场景继续使用原来的 ReAct 分支；
+- 明确包含多个自定义设备动作的请求进入 Planner 分支。
+
+例如：
+
+```text
+“关闭客厅灯，然后打开卧室空调到 25 度” → Planner
+“关闭客厅灯”                           → 普通 ReAct
+“我要出门了”                           → 预定义离家场景 + 场景确认
+```
+
+路由器采用保守规则，只有检测到多个动作，并且涉及多种设备或明显连接词时才启用 Planner。这样可以避免所有请求都额外调用一次规划模型。
+
+当前流程为：
 
 ```text
 用户目标
   ↓
 planner 生成计划
   ↓
+plan_approval 展示完整计划并暂停
+  ↓ approved
 executor 执行当前步骤
   ↓
 verifier 检查步骤结果
   ├── 成功且还有步骤 → executor
   ├── 全部完成         → final
-  ├── 可以修复         → retry
-  └── 计划已不适用     → planner 重新规划
+  ├── 可以修复         → retry 当前步骤
+  └── 重试耗尽         → planner 带失败信息重新规划
 ```
 
-计划不要只保存为一段文本，最好定义为结构化状态：
+计划位于 `src/agent/planning.py`，使用 Pydantic 结构化输出：
 
 ```python
 class PlanStep(BaseModel):
     step_id: int
     description: str
-    tool_name: str | None
+    tool_name: Literal[
+        "control_light", "control_ac", "control_tv", "control_curtain"
+    ]
     arguments: dict
-    status: Literal["pending", "running", "completed", "failed"]
 
-class Plan(BaseModel):
+class ExecutionPlan(BaseModel):
     goal: str
+    rationale: str
     steps: list[PlanStep]
 ```
 
-`AgentState` 可以增加：
+Planner 使用：
 
 ```python
-plan: NotRequired[list[PlanStep]]
-current_step: NotRequired[int]
-completed_steps: NotRequired[list[int]]
-failed_steps: NotRequired[list[int]]
+structured_planner = llm.with_structured_output(ExecutionPlan)
+plan = structured_planner.invoke(planner_prompt)
 ```
 
-例如“帮我调整到睡眠状态”可能得到：
+模型只能生成计划，不能在 Planner 节点中执行工具。工具名也被限制为四个原子设备工具，不允许在自定义计划中嵌套 `activate_scene`。
+
+`AgentState` 已增加：
+
+```python
+planning_goal: str
+plan: dict
+plan_revision: int
+current_step_index: int
+step_retry_count: int
+replan_count: int
+planning_status: str
+planning_results: list[dict]
+planning_failure_feedback: str
+```
+
+例如用户输入：
 
 ```text
-1. 查询卧室当前设备状态
-2. 关闭客厅灯和电视
-3. 将卧室灯调为暖光
-4. 将卧室空调调到用户已确认的偏好温度
-5. 再次查询关键设备，验证目标是否完成
+关闭客厅灯，然后打开卧室空调到 25 度。
 ```
 
-实现时需要主动思考：
+Planner 可以生成：
 
-- Planner 只生成计划，还是也允许直接调用工具；
-- 执行失败后是重试当前步骤，还是重新规划整个任务；
-- 用户偏好和家庭规则应在规划前变成约束，还是交给 Planner 自行理解；
-- 哪些步骤存在依赖，哪些步骤可以并行；
-- 如何避免模型不断修改计划而无法结束。
+```text
+1. control_light(device_name="客厅灯", action="off")
+2. control_ac(device_name="卧室空调", action="on", temperature=25, mode="cool")
+```
+
+在真正执行前，`plan_approval` 会调用 `interrupt`，CLI 展示完整步骤。用户拒绝后任何步骤都不会执行；用户批准后 Executor 从第一步开始。
+
+当前限制如下：
+
+- 计划长度默认最多 8 步；
+- 每一步默认最多重试 1 次；
+- 整个任务默认最多重新规划 1 次；
+- 重新规划产生新计划后，需要再次经过用户确认；
+- 当前按顺序执行，阶段八再研究并行步骤。
+
+配置项位于 `.env`：
+
+```text
+PLANNING_ENABLED=true
+PLANNING_MAX_STEPS=8
+PLANNING_MAX_STEP_RETRIES=1
+PLANNING_MAX_REPLANS=1
+```
 
 #### 6.5.4 Reflection 与 Verifier：让智能体检查执行结果
 
-工具返回“调用成功”不一定代表用户目标已经实现。例如模型可能选错房间、参数不完整，或者设备虽然接收了命令但状态没有变化。因此可以在工具节点之后增加验证或反思节点：
+阶段七没有让模型对自己的操作进行纯文本“自我评价”，而是实现了确定性的 Verifier。工具返回“调用成功”不一定代表用户目标已经实现，因此 Verifier 会根据工具名和参数推导期望状态，再读取 `DeviceRegistry` 的真实设备状态进行比较。
 
 ```text
-agent / executor
-  ↓
-tools
+executor 调用原子工具
   ↓
 verifier
-  ├── success  → 继续或结束
-  ├── retry    → 修正参数后重试
-  ├── replan   → 返回 planner
-  └── clarify  → 询问用户
+  ├── success + 还有步骤 → executor
+  ├── success + 全部完成 → planning_finalize
+  ├── failure + 未达重试上限 → executor 重试当前步骤
+  ├── failure + 可重新规划 → planner
+  └── failure + 已达上限 → planning_finalize
 ```
 
-反思结果同样应该结构化：
+验证结果结构化为：
 
 ```python
-class ReflectionResult(BaseModel):
+class VerificationResult(BaseModel):
     success: bool
     problem_type: Literal[
         "none",
-        "wrong_tool",
-        "wrong_argument",
-        "missing_information",
-        "device_failure",
-        "goal_not_achieved",
+        "device_not_found",
+        "tool_error",
+        "state_mismatch",
+        "unsupported_action",
     ]
-    next_action: Literal["finish", "retry", "replan", "ask_user"]
     reason: str
+    actual_state: dict
+    expected_state: dict
 ```
 
-状态中必须保存循环次数：
+例如执行：
 
 ```python
-retry_count: int
-max_retry_count: int
+control_ac(device_name="卧室空调", action="set_temp", temperature=25)
 ```
 
-否则 `tools → verifier → retry → tools` 可能形成无限循环。反思节点也不应该无条件调用大模型：设备离线、参数越界等确定性错误可以直接由代码分类，只有模糊的目标完成判断才交给模型。
+Verifier 推导期望值：
+
+```python
+{"power": True, "temperature": 25}
+```
+
+然后读取 `registry.get(device_id)`，只有真实状态匹配时才判定成功。工具文字声称成功但设备状态没有改变时，会得到 `state_mismatch`，触发重试。
+
+当同一步骤重试耗尽时，Planner 会收到类似反馈：
+
+```text
+步骤 1（关闭客厅灯）失败：device state mismatch...工具结果：...
+```
+
+Planner 根据反馈生成修订版计划，`plan_revision` 加一，并再次请求用户批准。如果重新规划次数也耗尽，图会停止，不会无限循环。
+
+目前 Reflection 主要体现在确定性的状态验证和失败反馈中。对于“环境是否舒适”“观影氛围是否合适”这类主观目标，后续可以再增加模型型 Verifier，但不应替代当前可验证设备状态检查。
 
 #### 6.5.5 Evaluator–Optimizer：生成后评分并改进
 
@@ -1759,7 +1867,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 阶段六：人在回路与可恢复执行（已实现）
   interrupt、Command、Checkpoint 恢复、确认分支
         ↓
-阶段七：规划、执行和反思
+阶段七：规划、执行和反思（已实现）
   Planner、Executor、Verifier、重试与重新规划
         ↓
 阶段八：子图与动态并行
@@ -1772,7 +1880,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
   知识检索、来源路由、执行轨迹比较
 ```
 
-阶段六已经在当前项目中完成，并通过内存 Checkpoint 和 SQLite Checkpoint 两种方式验证。下一步推荐继续实现“阶段七：规划、执行和反思”，在现有确认流程之上增加结构化计划、步骤状态、执行验证和有限次数的重新规划。
+阶段六和阶段七已经在当前项目中完成。下一步推荐继续实现“阶段八：子图与动态并行”，将不断扩大的规划分支封装为 Subgraph，并使用 `Send` 和 reducer 并行执行互不依赖的设备查询或控制步骤。
 
 ### 6.6 家居领域模型训练：SFT、LoRA 与强化学习
 
