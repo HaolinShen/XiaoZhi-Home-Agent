@@ -14,3 +14,4 @@
 | 序号 | 方案 | 状态 | 文档 |
 | --- | --- | --- | --- |
 | 001 | 智慧生活智能体记忆与空间定位系统 MVP | 规划中 | [001-memory-system-mvp.md](001-memory-system-mvp.md) |
+| 002 | Human-in-the-loop 批量设备操作确认 | 已实现 | [002-human-in-the-loop.md](002-human-in-the-loop.md) |

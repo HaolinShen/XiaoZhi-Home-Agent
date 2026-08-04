@@ -8,7 +8,7 @@ State 设计原则:
   - 可以添加额外字段（如 device_context, user_profile 等）用于增强 Agent 能力
 """
 
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from typing_extensions import NotRequired, TypedDict
 from langgraph.graph.message import add_messages
 
@@ -40,3 +40,5 @@ class AgentState(TypedDict):
     memory_context: NotRequired[str]
     context_message_count: NotRequired[int]
     context_token_estimate: NotRequired[int]
+    approval_request: NotRequired[dict[str, Any] | None]
+    approval_decision: NotRequired[Literal["approved", "rejected"] | None]

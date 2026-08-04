@@ -26,6 +26,7 @@ from loguru import logger
 
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
 from langchain_openai import ChatOpenAI
 
 from .state import AgentState
@@ -37,6 +38,11 @@ from ..memory import create_checkpointer
 from ..memory import MemoryRepository, MemoryService
 from ..memory.summarizer import build_compaction_update
 from .context import SpaceDirectory
+from .approval import (
+    approval_is_granted,
+    build_approval_request,
+    rejection_tool_messages,
+)
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -226,6 +232,35 @@ def build_graph(
 
         return {"messages": [response]}
 
+    def approval_node(state: AgentState) -> dict:
+        """Pause before executing a batch scene and wait for trusted approval."""
+        last_msg = state["messages"][-1]
+        tool_calls = getattr(last_msg, "tool_calls", [])
+        request = build_approval_request(tool_calls)
+        if request is None:
+            return {"approval_request": None, "approval_decision": "approved"}
+
+        decision = interrupt(request)
+        approved = approval_is_granted(decision)
+        logger.info(
+            "批量设备操作确认结果 | approved={} | tools={}",
+            approved,
+            [call.get("name") for call in tool_calls],
+        )
+        return {
+            "approval_request": request,
+            "approval_decision": "approved" if approved else "rejected",
+        }
+
+    def reject_tools_node(state: AgentState) -> dict:
+        """Represent rejected tool calls as results without touching devices."""
+        last_msg = state["messages"][-1]
+        tool_calls = getattr(last_msg, "tool_calls", [])
+        return {
+            "messages": rejection_tool_messages(tool_calls),
+            "approval_request": None,
+        }
+
     # ---- 第 5 步: 构建图结构 ----
     workflow = StateGraph(AgentState)
 
@@ -233,6 +268,8 @@ def build_graph(
     workflow.add_node("sync_context", sync_context_node)
     workflow.add_node("compact_context", compact_context_node)
     workflow.add_node("agent", agent_node)
+    workflow.add_node("approval", approval_node)
+    workflow.add_node("reject_tools", reject_tools_node)
     workflow.add_node("tools", ToolNode(tools))
 
     # 入口: 从 agent 开始
@@ -244,21 +281,33 @@ def build_graph(
     #    从 agent 出来后:
     #      - 如果 LLM 发出了 tool_calls → 去 tools 节点执行
     #      - 否则 → 结束
-    def router(state: AgentState) -> Literal["tools", "__end__"]:
+    def router(state: AgentState) -> Literal["approval", "tools", "__end__"]:
         """路由函数: 检查是否需要执行工具"""
         last_msg = state["messages"][-1]
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+            if build_approval_request(last_msg.tool_calls) is not None:
+                return "approval"
             return "tools"
         return "__end__"
 
     workflow.add_conditional_edges(
         "agent",
         router,
-        {"tools": "tools", "__end__": END},
+        {"approval": "approval", "tools": "tools", "__end__": END},
+    )
+
+    def route_after_approval(state: AgentState) -> Literal["tools", "reject_tools"]:
+        return "tools" if state.get("approval_decision") == "approved" else "reject_tools"
+
+    workflow.add_conditional_edges(
+        "approval",
+        route_after_approval,
+        {"tools": "tools", "reject_tools": "reject_tools"},
     )
 
     # tools 执行完毕 → 回到 agent 继续思考
     workflow.add_edge("tools", "compact_context")
+    workflow.add_edge("reject_tools", "compact_context")
 
     # ---- 第 7 步: 编译图（含检查点记忆）----
     # 检查点让 Agent 记住对话历史，实现多轮对话

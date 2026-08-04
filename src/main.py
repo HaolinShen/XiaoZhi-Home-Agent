@@ -55,6 +55,7 @@ from src.agent import (
     build_graph,
 )
 from langchain_core.messages import HumanMessage
+from langgraph.types import Command
 
 # ============================================================
 # 全局对象
@@ -131,6 +132,35 @@ def _print_scenes() -> None:
     """打印可用场景列表"""
     from src.tools.scenes import SCENE_META
     console.print()
+
+
+def _approval_payload(result: dict):
+    """Extract the first LangGraph interrupt payload from an invoke result."""
+    interrupts = result.get("__interrupt__", ())
+    return interrupts[0].value if interrupts else None
+
+
+def _ask_for_approval(payload: dict) -> bool:
+    """Render one approval request and return a strict yes/no decision."""
+    console.print()
+    console.print(Panel(
+        payload.get("question", "该操作需要确认，是否继续？"),
+        title=f"⚠️ 操作确认 · {payload.get('risk_level', 'unknown')}",
+        border_style="yellow",
+    ))
+    answer = console.input("[bold yellow]确认执行？[y/N]:[/bold yellow] ").strip().lower()
+    return answer in {"y", "yes", "确认", "同意", "继续"}
+
+
+def _invoke_with_approval(graph, state_input: dict, config: dict) -> dict:
+    """Invoke a graph and resume any approval interrupts using the same thread."""
+    with console.status("[dim]思考中...[/dim]", spinner="dots"):
+        result = graph.invoke(state_input, config)
+    while payload := _approval_payload(result):
+        approved = _ask_for_approval(payload)
+        with console.status("[dim]正在继续执行...[/dim]", spinner="dots"):
+            result = graph.invoke(Command(resume={"approved": approved}), config)
+    return result
     table = Table(title="🎬 可用场景模式", box=box.ROUNDED, border_style="dim")
     table.add_column("场景", style="bold cyan")
     table.add_column("说明", style="white")
@@ -207,11 +237,10 @@ def run_interactive_loop(
             # ---- 正常对话 ----
             console.print("\n[bold cyan]🤖 小智:[/bold cyan] ", end="")
 
-            with console.status("[dim]思考中...[/dim]", spinner="dots"):
-                state_input, config = build_agent_request(
-                    HumanMessage(content=user_input), context
-                )
-                result = graph.invoke(state_input, config)
+            state_input, config = build_agent_request(
+                HumanMessage(content=user_input), context
+            )
+            result = _invoke_with_approval(graph, state_input, config)
 
             # 提取最终回复
             final_msg = result["messages"][-1]

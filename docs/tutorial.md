@@ -1,6 +1,6 @@
 # 智能家居家电互联智能体 — 开发教程
 
-> **适用版本**: v0.1.0  
+> **适用版本**: v0.2.0（已包含长期记忆与 Human-in-the-loop）
 > **适用人群**: 想要学习现代 AI Agent 开发的 Python 开发者  
 > **前置知识**: Python 基础（类、装饰器、类型注解）、理解 LLM 的基本概念  
 > **完成时间**: 阅读约 45 分钟，动手实践约 2 小时  
@@ -26,7 +26,18 @@
 
 ### 1.1 这是什么？
 
-一个基于 **LangGraph + MCP (Model Context Protocol)** 的智能家居 AI Agent。你可以用自然语言控制智能设备，支持多轮对话记忆、场景模式、以及标准的 MCP 工具暴露。
+一个基于 **LangGraph + MCP (Model Context Protocol)** 的智能家居 AI Agent。你可以用自然语言查询和控制设备，并学习状态图编排、工具调用、会话检查点、上下文压缩、长期记忆以及 Human-in-the-loop 可恢复执行。
+
+当前项目已经具备：
+
+- 灯光、空调、电视、窗帘等模拟设备控制；
+- 回家、离家、睡眠、观影、起床等多设备场景；
+- LangGraph ReAct 工具调用循环；
+- 基于 `thread_id` 的短期会话记忆；
+- 结构化长期记忆、候选确认、混合检索和版本追踪；
+- 场景操作执行前的 `interrupt` 人工确认；
+- 使用 `Command(resume=...)` 从原检查点批准或拒绝操作；
+- MCP Server 工具暴露和外部 MCP Client 接入能力。
 
 ### 1.2 技术栈
 
@@ -42,28 +53,32 @@
 
 ### 1.3 Agent 工作流
 
+```text
+用户输入
+  ↓
+sync_context             同步可信身份、房间、设备和长期记忆
+  ↓
+compact_context          控制消息窗口并维护滚动摘要
+  ↓
+agent                    LLM 决定回复或生成工具调用
+  ├── 无工具调用 ─────────────────────────────────────→ END
+  ├── 普通工具调用 ───────────────────────────────────→ tools
+  └── activate_scene ─→ approval
+                          ├── interrupt：暂停等待用户决定
+                          ├── approved ───────────────→ tools
+                          └── rejected ───────────────→ reject_tools
+                                                               ↓
+                         compact_context ←──────────────────────┘
+                                  ↓
+                                agent
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    LangGraph Agent                        │
-│                                                          │
-│  用户输入                                                  │
-│     │                                                    │
-│     ▼                                                    │
-│  ┌─────────┐    有 tool_calls?     ┌──────────┐         │
-│  │ Agent   │ ───────────────────→  │  Tools   │         │
-│  │ (LLM)   │                       │ (执行工具) │         │
-│  │         │ ←───────────────────  │          │         │
-│  └────┬────┘   返回执行结果          └──────────┘         │
-│       │                                                  │
-│       │ 没有 tool_calls                                   │
-│       ▼                                                  │
-│   最终回复 → 返回给用户                                     │
-│                                                          │
-│  记忆层: MemorySaver / SqliteSaver (跨轮次状态保持)         │
-└──────────────────────────────────────────────────────────┘
 
-同时，工具通过 MCP Server 暴露给外部 AI 客户端（如 Claude Desktop）
-```
+图中的两类持久状态分别是：
+
+- LangGraph Checkpoint：保存消息、摘要、当前位置以及中断点；
+- 长期记忆 SQLite：保存跨会话用户偏好、家庭规则、候选和历史版本。
+
+工具还可以通过 MCP Server 暴露给外部 AI 客户端。需要注意，当前 Human-in-the-loop 是 Agent 图的编排能力；外部客户端如果绕过图直接调用 MCP 工具，需要由外部客户端或 MCP 服务层另外实现确认策略。
 
 ---
 
@@ -129,12 +144,16 @@ langgraph/
 │   ├── tools/                # 工具层
 │   │   ├── __init__.py       # 工具注册 & 导出
 │   │   ├── devices.py        # 设备控制工具 (control_light, ac, tv, curtain)
-│   │   └── scenes.py         # 场景模式工具 (activate_scene, list_scenes)
+│   │   ├── scenes.py         # 场景模式工具 (activate_scene, list_scenes)
+│   │   └── memory.py         # 长期记忆管理工具
 │   │
 │   ├── agent/                # Agent 层
 │   │   ├── __init__.py
+│   │   ├── context.py        # 可信请求身份和空间归属校验
+│   │   ├── session.py        # session_id / thread_id 生命周期
 │   │   ├── state.py          # Agent 状态定义 (AgentState)
 │   │   ├── prompts.py        # 系统提示词模板
+│   │   ├── approval.py       # 风险识别、中断数据和拒绝结果
 │   │   └── graph.py          # LangGraph 工作流图 (build_graph)
 │   │
 │   ├── mcp/                  # MCP 层
@@ -144,7 +163,12 @@ langgraph/
 │   │
 │   ├── memory/               # 记忆层
 │   │   ├── __init__.py
-│   │   └── store.py          # 检查点存储 (MemorySaver / SqliteSaver)
+│   │   ├── store.py          # Checkpoint (MemorySaver / SqliteSaver)
+│   │   ├── summarizer.py     # 上下文窗口和滚动摘要
+│   │   ├── models.py         # 长期记忆、候选、版本和冲突模型
+│   │   ├── repository.py     # SQLite Repository 和迁移
+│   │   ├── extractor.py      # 自然语言记忆候选抽取
+│   │   └── service.py        # 权限、检索和生命周期规则
 │   │
 │   ├── middleware/           # 中间件层
 │   │   ├── __init__.py
@@ -152,31 +176,40 @@ langgraph/
 │   │
 │   └── main.py               # ★ CLI 主入口 (typer + rich)
 │
-├── tests/                    # 测试
-│   └── __init__.py
+├── tests/                    # 阶段一至阶段六自动化测试
+│   ├── test_phase_one.py
+│   ├── test_phase_two.py
+│   ├── test_phase_three.py
+│   ├── test_phase_four.py
+│   ├── test_phase_five.py
+│   └── test_phase_six.py     # Human-in-the-loop 测试
 │
 ├── docs/                     # 文档
-│   └── tutorial.md           # 本教程
+│   ├── tutorial.md           # 本教程
+│   └── iterations/           # 各阶段设计与实现说明
 │
 └── data/                     # 运行时数据（自动创建）
-    └── checkpoints.db        # SQLite 对话记忆
+    ├── checkpoints.db        # SQLite 会话检查点
+    └── memories.db           # SQLite 长期结构化记忆
 ```
 
 ### 架构分层
 
 ```
-┌─────────────────────────────────────────────┐
-│  CLI / MCP Server  (表示层)                  │
-├─────────────────────────────────────────────┤
-│  Agent Graph        (编排层) ← LangGraph     │
-│  Tools              (工具层) ← @tool         │
-├─────────────────────────────────────────────┤
-│  Device Registry    (领域层)                 │
-│  Models             (数据层) ← Pydantic      │
-├─────────────────────────────────────────────┤
-│  Config             (配置层)                 │
-│  Memory / Middleware (基础设施)              │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  CLI / MCP Server                   表示与协议层       │
+├─────────────────────────────────────────────────────┤
+│  LangGraph + Human-in-the-loop       编排层           │
+│  sync / compact / agent / approval / tools           │
+├─────────────────────────────────────────────────────┤
+│  @tool 设备、场景和记忆工具            工具层           │
+├─────────────────────────────────────────────────────┤
+│  DeviceRegistry / SpaceDirectory      领域与上下文层    │
+├─────────────────────────────────────────────────────┤
+│  Checkpoint / Long-term Memory        状态与记忆层      │
+├─────────────────────────────────────────────────────┤
+│  SimulatorBackend / SQLite / Config   基础设施层        │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -341,18 +374,30 @@ def control_light(device_name: str, action: str, brightness: int = 50) -> str:
 
 **工具调用流程**:
 
+普通单设备操作会直接进入 `ToolNode`：
+
+```text
+用户：“打开客厅灯”
+  → LLM 生成 control_light 工具调用
+  → 风险判断：普通单设备操作，不需要确认
+  → ToolNode 执行 control_light
+  → ToolMessage 返回真实执行结果
+  → LLM 生成最终回复
 ```
-用户: "打开客厅灯"
-  → LLM 分析: 需要调用 control_light
-  → LLM 输出: tool_calls=[{"name":"control_light","args":{"device_name":"客厅","action":"on"}}]
-  → ToolNode 执行: control_light("客厅", "on")
-  → 工具返回: "✅ 客厅灯已打开"
-  → 返回给 LLM → LLM 生成自然语言回复
+
+场景工具会在执行前进入确认节点：
+
+```text
+用户：“我要出门了”
+  → LLM 生成 activate_scene(scene_name="离家模式")
+  → approval 节点调用 interrupt
+  → 用户批准后 ToolNode 才执行场景
+  → 用户拒绝则生成取消 ToolMessage，不执行场景
 ```
 
 ### 4.5 Agent 图 (`agent/graph.py`)
 
-LangGraph 的 `StateGraph` 定义了 Agent 的思考-行动循环：
+LangGraph 的 `StateGraph` 定义了上下文准备、模型决策、人工确认和工具执行循环：
 
 ```python
 from src.agent import build_graph
@@ -362,34 +407,78 @@ graph = build_graph(registry, settings)
 
 # 运行
 result = graph.invoke(
-    {"messages": [HumanMessage(content="打开客厅灯")]},
-    config={"configurable": {"thread_id": "user-001"}}
+    state_input,
+    context.to_config(),
 )
 
 # 获取回复
 print(result["messages"][-1].content)
 ```
 
-**图结构**:
+当前图包含以下节点：
+
+| 节点 | 作用 |
+| --- | --- |
+| `sync_context` | 同步可信请求位置，抽取记忆候选并检索长期记忆 |
+| `compact_context` | 限制消息和 token 规模，维护滚动摘要 |
+| `agent` | 调用绑定工具后的 LLM |
+| `approval` | 对批量场景调用执行 `interrupt` |
+| `tools` | 使用 `ToolNode` 执行已批准或无需确认的工具 |
+| `reject_tools` | 拒绝时生成匹配工具调用 ID 的取消结果 |
+
+简化后的构图代码如下：
 
 ```python
 workflow = StateGraph(AgentState)
 
-# 节点
-workflow.add_node("agent", agent_node)   # LLM 推理
-workflow.add_node("tools", ToolNode())   # 工具执行
+workflow.add_node("sync_context", sync_context_node)
+workflow.add_node("compact_context", compact_context_node)
+workflow.add_node("agent", agent_node)
+workflow.add_node("approval", approval_node)
+workflow.add_node("tools", ToolNode(tools))
+workflow.add_node("reject_tools", reject_tools_node)
 
-# 边
-workflow.set_entry_point("agent")
+workflow.set_entry_point("sync_context")
+workflow.add_edge("sync_context", "compact_context")
+workflow.add_edge("compact_context", "agent")
+
 workflow.add_conditional_edges("agent", router, {
-    "tools": "tools",    # 有 tool_calls → 执行
-    "__end__": END,      # 无 tool_calls → 结束
+    "approval": "approval",
+    "tools": "tools",
+    "__end__": END,
 })
-workflow.add_edge("tools", "agent")      # 执行完 → 回到 LLM
 
-# 编译（带记忆）
-graph = workflow.compile(checkpointer=MemorySaver())
+workflow.add_conditional_edges("approval", route_after_approval, {
+    "tools": "tools",
+    "reject_tools": "reject_tools",
+})
+
+workflow.add_edge("tools", "compact_context")
+workflow.add_edge("reject_tools", "compact_context")
+
+graph = workflow.compile(checkpointer=create_checkpointer(db_path))
 ```
+
+为什么拒绝后还要经过 `reject_tools`？因为模型已经生成了工具调用消息。每个工具调用都应该有匹配 `tool_call_id` 的 `ToolMessage`；否则下一次模型调用会收到不完整的消息协议。`reject_tools` 用“用户拒绝，工具未执行”闭合调用，然后再由 Agent 生成自然语言说明。
+
+如果图在 `approval` 节点中断，第一次 `invoke` 的结果中会出现：
+
+```python
+result["__interrupt__"][0].value
+```
+
+调用方读取其中的 `question`、`summary` 和 `tool_calls`，取得用户决定后使用原配置恢复：
+
+```python
+from langgraph.types import Command
+
+result = graph.invoke(
+    Command(resume={"approved": True}),
+    context.to_config(),
+)
+```
+
+这里必须继续使用相同的 `thread_id`，因为中断位置保存在该线程对应的 Checkpoint 中。
 
 ### 4.6 中间件 (`middleware/interceptors.py`)
 
@@ -449,13 +538,30 @@ python -m src.main
 
 👤 你: 我回来了，有点热
 
-🤖 小智: 欢迎回家！我帮你激活回家模式：
+🤖 小智: 准备激活回家模式。
+
+┌────────────── ⚠️ 操作确认 · medium ──────────────┐
+│ 即将执行批量设备操作：回家模式……是否继续？       │
+└──────────────────────────────────────────────────┘
+确认执行？[y/N]: y
+
+🤖 小智: 已为你激活回家模式：
 ✅ 已激活「🏠 回家模式」
   · 客厅灯已打开（亮度 80%，暖白）
   · 客厅空调已开启（制冷 26°C）
   · 客厅窗帘已完全打开
 🏠 欢迎回家！
 ```
+
+如果输入 `n` 或直接回车，图会从中断点恢复到拒绝分支，不调用 `activate_scene`，并回复操作已经取消。普通的“打开客厅灯”等单设备请求不会弹出确认。
+
+确认时 CLI 并不是重新发送一条“用户说同意”的普通聊天消息，而是使用：
+
+```python
+Command(resume={"approved": True})
+```
+
+因此模型不会重新生成计划，LangGraph 会从原来的 `approval` 节点继续。
 
 ### 5.2 常用命令
 
@@ -489,6 +595,23 @@ python -m src.mcp.server
 # SSE 模式（HTTP 长连接）
 python -m src.mcp.server --transport sse --port 8765
 ```
+
+### 5.5 运行自动化测试
+
+使用项目现有的 `langgraph` Conda 环境运行：
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+当前测试覆盖阶段一至阶段六，共 43 个测试。Human-in-the-loop 相关测试位于 `tests/test_phase_six.py`，重点验证：
+
+1. 中断返回时，批量场景尚未修改设备；
+2. `approved=True` 后才执行真实场景；
+3. `approved=False` 后设备保持原状；
+4. 拒绝路径产生匹配工具调用 ID 的 `ToolMessage`；
+5. 普通单设备工具不会触发中断；
+6. SQLite Checkpoint 关闭并重新构建图后，仍可使用相同 `thread_id` 恢复。
 
 ---
 
@@ -1062,13 +1185,13 @@ A：没有。当前使用结构化权限过滤和可解释的混合排序。家�
 
 #### 6.5.1 Human-in-the-loop：让智能体暂停并等待用户确认
 
-当前图的主要执行路径是：
+在加入 Human-in-the-loop 之前，图的主要执行路径是：
 
 ```text
 sync_context → compact_context → agent → tools → agent
 ```
 
-当模型决定调用工具后，工具通常会立即执行。对于查询设备状态、打开普通灯光等低风险操作，这种方式没有问题；但批量关闭设备、修改整个家庭场景或控制高风险设备时，更合理的流程是先暂停：
+如果模型决定调用工具后立即执行，对于查询设备状态、打开普通灯光等低风险操作没有问题；但批量关闭设备、修改整个家庭场景或控制高风险设备时，更合理的流程是先暂停。当前项目已经采用下面的流程：
 
 ```text
 用户请求
@@ -1084,14 +1207,14 @@ sync_context → compact_context → agent → tools → agent
                   Command 恢复执行
 ```
 
-这一扩展可以重点学习 LangGraph 的以下能力：
+这一实现集中使用了 LangGraph 的以下能力：
 
 - `interrupt()`：在节点内部暂停图执行，并将待确认信息返回给调用方；
 - `Command(resume=...)`：携带用户决定，从原检查点继续运行；
 - Checkpoint：保存暂停前的状态，使应用不必重新执行前面的节点；
 - durable execution：即使确认发生在下一次请求中，也能继续原任务。
 
-例如，用户说“把家里所有设备都关掉”时，可以先生成待确认对象：
+例如，用户说“把家里所有设备都关掉”时，系统会生成待确认对象：
 
 ```python
 class PendingApproval(TypedDict):
@@ -1126,6 +1249,100 @@ graph.invoke(
 ```
 
 这个实验的重点不是增加一个确认弹窗，而是理解 LangGraph 图可以跨请求暂停和恢复，它不是一次性执行完毕的普通函数。
+
+##### 当前项目中的实现
+
+本项目已经将这一流程接入 Agent 图。当前策略是：
+
+- `activate_scene` 会同时修改多台设备，因此执行前必须确认；
+- `control_light`、`control_ac` 等普通单设备操作仍然直接执行；
+- 用户拒绝后不会调用真实工具，也不会改变任何设备状态；
+- 批准和拒绝都使用原来的 `session_id/thread_id` 恢复图；
+- CLI 会自动识别 `__interrupt__`，显示确认面板并使用 `Command(resume=...)` 继续。
+
+相关代码分工如下：
+
+| 文件 | 职责 |
+| --- | --- |
+| `src/agent/approval.py` | 判断工具调用是否需要确认，构造中断数据，解析恢复决定 |
+| `src/agent/graph.py` | 增加 `approval` 和 `reject_tools` 节点及条件边 |
+| `src/agent/state.py` | 保存确认请求和确认结果 |
+| `src/main.py` | CLI 展示确认信息，并通过 `Command` 恢复执行 |
+| `tests/test_phase_six.py` | 验证批准、拒绝和普通操作三条路径 |
+
+实际图结构为：
+
+```text
+agent
+  ├── 没有工具调用 ───────────────────────────→ END
+  ├── 普通工具调用 ───────────────────────────→ tools
+  └── activate_scene ─→ approval
+                          ├── approved ────────→ tools
+                          └── rejected ────────→ reject_tools
+                                                     ↓
+compact_context ←────────────────────────────────────┘
+       ↓
+     agent
+```
+
+`approval_node` 不执行设备操作，只负责暂停：
+
+```python
+def approval_node(state: AgentState) -> dict:
+    last_msg = state["messages"][-1]
+    request = build_approval_request(last_msg.tool_calls)
+    decision = interrupt(request)
+    approved = approval_is_granted(decision)
+    return {
+        "approval_request": request,
+        "approval_decision": "approved" if approved else "rejected",
+    }
+```
+
+如果用户批准，条件边才会进入原来的 `ToolNode`。如果用户拒绝，`reject_tools` 会为每个被拒绝的工具调用生成对应的 `ToolMessage`：
+
+```text
+用户未批准该操作，工具没有执行，任何设备状态都未改变。
+```
+
+这一步很重要。模型已经生成了带 `tool_call_id` 的工具调用，如果直接跳回 Agent 而不给出对应工具结果，消息历史会成为不完整的工具调用协议。用拒绝结果闭合工具调用后，模型可以正常回复“操作已取消”。
+
+CLI 中的恢复逻辑如下：
+
+```python
+result = graph.invoke(state_input, config)
+
+while result.get("__interrupt__"):
+    payload = result["__interrupt__"][0].value
+    approved = ask_user(payload)
+    result = graph.invoke(
+        Command(resume={"approved": approved}),
+        config,
+    )
+```
+
+恢复时不能创建新的 `session_id`。`Command` 必须使用与发生中断时相同的配置，否则 LangGraph 无法找到暂停的检查点。
+
+可以使用下面的指令体验流程：
+
+```text
+用户：我要出门了。
+Agent：准备调用 activate_scene(scene_name="离家模式")。
+系统：暂停并显示离家模式会修改的设备范围。
+用户：y
+系统：从检查点恢复，执行离家模式。
+```
+
+拒绝路径：
+
+```text
+用户：我要睡觉了。
+系统：是否执行睡眠模式？
+用户：n
+Agent：已取消操作，设备状态没有变化。
+```
+
+自动化测试还会在暂停后读取模拟设备状态，确保设备只有在 `approved=True` 的恢复请求之后才发生变化。这样验证的是实际副作用，而不只是检查返回文字。
 
 #### 6.5.2 显式意图识别与条件路由
 
@@ -1539,7 +1756,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 这些方向不建议一次全部加入当前图。可以按照对 LangGraph 核心能力的依赖关系分阶段学习：
 
 ```text
-阶段六：人在回路与可恢复执行
+阶段六：人在回路与可恢复执行（已实现）
   interrupt、Command、Checkpoint 恢复、确认分支
         ↓
 阶段七：规划、执行和反思
@@ -1555,7 +1772,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
   知识检索、来源路由、执行轨迹比较
 ```
 
-如果只选择一个方向继续实现，推荐先做“人在回路与可恢复执行”。它与智能家居的操作确认场景天然匹配，而且能够集中练习 LangGraph 区别于普通 Agent 循环的核心能力：图执行可以暂停、保存并在后续请求中恢复。
+阶段六已经在当前项目中完成，并通过内存 Checkpoint 和 SQLite Checkpoint 两种方式验证。下一步推荐继续实现“阶段七：规划、执行和反思”，在现有确认流程之上增加结构化计划、步骤状态、执行验证和有限次数的重新规划。
 
 ### 6.6 家居领域模型训练：SFT、LoRA 与强化学习
 
