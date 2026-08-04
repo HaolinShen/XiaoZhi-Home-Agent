@@ -48,6 +48,7 @@ from .planning import (
     should_use_planner,
     verify_step,
 )
+from .routing import classify_intent, classify_intent_fallback
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -199,16 +200,36 @@ def build_graph(
         return result
 
     def task_router_node(state: AgentState) -> dict:
-        """Select the explicit planning branch only for custom multi-step goals."""
+        """Classify the request, then select planning or the normal ReAct path."""
         latest_text = ""
         if state.get("messages"):
             content = getattr(state["messages"][-1], "content", "")
             latest_text = content if isinstance(content, str) else ""
+        routing_config = getattr(settings, "routing", None)
+        routing_enabled = getattr(routing_config, "enabled", False)
+        intent = (
+            classify_intent(llm, latest_text)
+            if routing_enabled
+            else classify_intent_fallback(latest_text)
+        )
+        confidence_threshold = getattr(routing_config, "confidence_threshold", 0.6)
         planning_enabled = getattr(getattr(settings, "planning", None), "enabled", True)
         use_planner = planning_enabled and should_use_planner(latest_text)
+        intent_route = "planner" if use_planner else "react"
+        if not use_planner and (
+            intent.intent == "clarification" or intent.confidence < confidence_threshold
+        ):
+            intent_route = "clarification"
+        result = {
+            "intent": intent.intent,
+            "intent_confidence": intent.confidence,
+            "intent_reason": intent.reason,
+            "intent_route": intent_route,
+        }
         if not use_planner:
-            return {"planning_active": False}
-        return {
+            result["planning_active"] = False
+            return result
+        result.update({
             "planning_active": True,
             "planning_goal": latest_text,
             "plan": None,
@@ -219,7 +240,8 @@ def build_graph(
             "planning_status": "planning",
             "planning_failure_feedback": "",
             "planning_results": [],
-        }
+        })
+        return result
 
     def planner_node(state: AgentState) -> dict:
         """Generate or revise a structured plan without executing tools."""
@@ -362,6 +384,9 @@ def build_graph(
             "planning_active": False,
         }
 
+    def clarification_node(state: AgentState) -> dict:
+        return {"messages": [AIMessage(content="为了安全执行，请补充具体的设备、房间或要执行的动作。")], "planning_active": False}
+
     def agent_node(state: AgentState) -> dict:
         """
         Agent 节点: 调用 LLM 进行推理。
@@ -447,19 +472,23 @@ def build_graph(
     workflow.add_node("executor", executor_node)
     workflow.add_node("verifier", verifier_node)
     workflow.add_node("planning_finalize", planning_finalize_node)
+    workflow.add_node("clarification", clarification_node)
 
     # 入口: 从 agent 开始
     workflow.set_entry_point("sync_context")
     workflow.add_edge("sync_context", "task_router")
 
-    def route_task(state: AgentState) -> Literal["planner", "compact_context"]:
+    def route_task(state: AgentState) -> Literal["planner", "compact_context", "clarification"]:
+        if state.get("intent_route") == "clarification":
+            return "clarification"
         return "planner" if state.get("planning_active") else "compact_context"
 
     workflow.add_conditional_edges(
         "task_router",
         route_task,
-        {"planner": "planner", "compact_context": "compact_context"},
+        {"planner": "planner", "compact_context": "compact_context", "clarification": "clarification"},
     )
+    workflow.add_edge("clarification", END)
     workflow.add_edge("compact_context", "agent")
 
     workflow.add_edge("planner", "plan_approval")

@@ -1393,7 +1393,7 @@ Agent：已取消操作，设备状态没有变化。
 
 #### 6.5.2 显式意图识别与条件路由
 
-当前项目主要让绑定了工具的模型自行决定是回复文本还是调用工具。这属于比较自由的 Agent 模式。为了学习确定性工作流和自主决策的边界，可以在 `sync_context` 后增加一个结构化意图路由节点：
+阶段八已经在 `sync_context` 后增加结构化意图路由。Router 先识别请求属于哪类业务，再决定进入普通 ReAct、阶段七 Planner 或澄清节点；具体工具仍由后续节点选择：
 
 ```text
 sync_context
@@ -1407,7 +1407,7 @@ intent_router
   └── clarification      → 澄清分支
 ```
 
-路由结果应使用结构化输出，而不是让代码解析模型生成的自然语言：
+路由结果使用结构化输出，而不是让代码解析模型生成的自然语言：
 
 ```python
 class IntentResult(BaseModel):
@@ -1463,6 +1463,27 @@ workflow.add_conditional_edges(
 “关闭客厅灯”                           → 普通 ReAct
 “我要出门了”                           → 预定义离家场景 + 场景确认
 ```
+
+当前实现位于 `src/agent/routing.py`。`task_router` 会保存：
+
+```python
+intent: str
+intent_confidence: float
+intent_reason: str
+intent_route: Literal["react", "planner", "clarification"]
+```
+
+正常运行时使用 `llm.with_structured_output(IntentResult)`。如果模型不支持结构化输出或调用异常，系统会回退到保守的关键词分类器，避免路由故障导致整个图不可用。低于 `ROUTING_CONFIDENCE_THRESHOLD`（默认 `0.6`）或明确分类为 `clarification` 的请求会直接询问用户补充设备、房间或动作，不会调用工具。
+
+阶段八没有为六种意图立即创建六套 Agent。当前业务映射是：
+
+```text
+复杂多动作 device_control → Planner–Executor–Verifier
+低置信度 / clarification   → clarification_node
+其余已识别意图             → 现有 ReAct Agent
+```
+
+这样先把“识别意图”和“执行工具”拆开，同时保留阶段六场景确认、阶段七规划循环和已有记忆工具。下一阶段再把稳定的业务流程封装成子图。
 
 路由器采用保守规则，只有检测到多个动作，并且涉及多种设备或明显连接词时才启用 Planner。这样可以避免所有请求都额外调用一次规划模型。
 
@@ -1874,7 +1895,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 阶段七：规划、执行和反思（已实现）
   Planner、Executor、Verifier、重试与重新规划
         ↓
-阶段八：结构化意图路由（待实现）
+阶段八：结构化意图路由（已实现）
   IntentResult、置信度、澄清分支、条件边
         ↓
 阶段九：子图与动态并行（待实现）
@@ -1895,7 +1916,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 - 阶段六：Human-in-the-loop（对应 6.5.1）；
 - 阶段七：Planner–Executor，以及确定性的 Verifier、重试和重新规划（对应 6.5.3 和 6.5.4）。
 
-当前项目的 `task_router` 仍是面向复杂多动作请求的规则型路由，并不是完整的结构化 IntentRouter。因此下一步推荐先实现“阶段八：结构化意图路由”，再进入“阶段九：子图与动态并行”。完成路由后，可以把设备控制、场景规划和记忆管理分别封装为子图；随后在设备查询或互不依赖的多设备控制中引入 `Send` 和 reducer。这样每一步新增的抽象都能对应一个清晰的学习问题，也便于与阶段六、阶段七回归测试对照。
+阶段八也已完成：`task_router` 现在会生成结构化 `IntentResult`，记录意图、置信度和原因，并为信息不足的请求提供澄清分支。因此下一步推荐进入“阶段九：子图与动态并行”：把设备控制、场景规划和记忆管理分别封装为子图；随后在设备查询或互不依赖的多设备控制中引入 `Send` 和 reducer。
 
 ### 6.6 家居领域模型训练：SFT、LoRA 与强化学习
 

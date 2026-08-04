@@ -16,3 +16,4 @@
 | 001 | 智慧生活智能体记忆与空间定位系统 MVP | 规划中 | [001-memory-system-mvp.md](001-memory-system-mvp.md) |
 | 002 | Human-in-the-loop 批量设备操作确认 | 已实现 | [002-human-in-the-loop.md](002-human-in-the-loop.md) |
 | 003 | Planner–Executor–Verifier 规划执行循环 | 已实现 | [003-planner-executor-verifier.md](003-planner-executor-verifier.md) |
+| 004 | 结构化意图路由 | 已实现 | [004-structured-intent-routing.md](004-structured-intent-routing.md) |

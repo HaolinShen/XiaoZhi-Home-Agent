@@ -79,6 +79,14 @@ class PlanningConfig(BaseSettings):
     max_replans: int = Field(default=1, ge=0, le=3)
 
 
+class RoutingConfig(BaseSettings):
+    """Structured intent router settings."""
+    model_config = SettingsConfigDict(env_prefix="ROUTING_")
+
+    enabled: bool = Field(default=True)
+    confidence_threshold: float = Field(default=0.6, ge=0, le=1)
+
+
 # ============================================================
 # 主配置
 # ============================================================
@@ -162,6 +170,7 @@ class Settings(BaseSettings):
     mcp_server: MCPServerConfig = Field(default_factory=MCPServerConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
     # ---- 最终解析后的值（非 Field，用于内部使用）----
     _api_key: str = ""
