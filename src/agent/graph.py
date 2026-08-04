@@ -49,6 +49,11 @@ from .planning import (
     verify_step,
 )
 from .routing import classify_intent, classify_intent_fallback
+from .parallel import (
+    build_device_query_subgraph,
+    extract_query_targets,
+    should_use_parallel_query,
+)
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -121,6 +126,7 @@ def build_graph(
             space_directory or SpaceDirectory.from_registry(registry, "default-home"),
         )
     set_memory_service(memory_service)
+    device_query_subgraph = build_device_query_subgraph(registry)
 
     # ---- 第 4 步: 定义 Agent 节点 ----
     # 这个节点是工作流的"大脑"，负责:
@@ -216,6 +222,12 @@ def build_graph(
         planning_enabled = getattr(getattr(settings, "planning", None), "enabled", True)
         use_planner = planning_enabled and should_use_planner(latest_text)
         intent_route = "planner" if use_planner else "react"
+        if (
+            not use_planner
+            and intent.intent == "device_query"
+            and should_use_parallel_query(latest_text, registry)
+        ):
+            intent_route = "parallel_query"
         if not use_planner and (
             intent.intent == "clarification" or intent.confidence < confidence_threshold
         ):
@@ -387,6 +399,19 @@ def build_graph(
     def clarification_node(state: AgentState) -> dict:
         return {"messages": [AIMessage(content="为了安全执行，请补充具体的设备、房间或要执行的动作。")], "planning_active": False}
 
+    def parallel_query_node(state: AgentState) -> dict:
+        latest_text = getattr(state["messages"][-1], "content", "")
+        targets = extract_query_targets(latest_text, registry)
+        result = device_query_subgraph.invoke({
+            "query": latest_text,
+            "targets": targets,
+            "parallel_results": [],
+        })
+        return {
+            "messages": [AIMessage(content=result.get("response", "没有找到可查询的设备。"))],
+            "parallel_query_results": result.get("parallel_results", []),
+        }
+
     def agent_node(state: AgentState) -> dict:
         """
         Agent 节点: 调用 LLM 进行推理。
@@ -473,22 +498,33 @@ def build_graph(
     workflow.add_node("verifier", verifier_node)
     workflow.add_node("planning_finalize", planning_finalize_node)
     workflow.add_node("clarification", clarification_node)
+    workflow.add_node("device_query_subgraph", parallel_query_node)
 
     # 入口: 从 agent 开始
     workflow.set_entry_point("sync_context")
     workflow.add_edge("sync_context", "task_router")
 
-    def route_task(state: AgentState) -> Literal["planner", "compact_context", "clarification"]:
+    def route_task(state: AgentState) -> Literal[
+        "planner", "compact_context", "clarification", "device_query_subgraph"
+    ]:
         if state.get("intent_route") == "clarification":
             return "clarification"
+        if state.get("intent_route") == "parallel_query":
+            return "device_query_subgraph"
         return "planner" if state.get("planning_active") else "compact_context"
 
     workflow.add_conditional_edges(
         "task_router",
         route_task,
-        {"planner": "planner", "compact_context": "compact_context", "clarification": "clarification"},
+        {
+            "planner": "planner",
+            "compact_context": "compact_context",
+            "clarification": "clarification",
+            "device_query_subgraph": "device_query_subgraph",
+        },
     )
     workflow.add_edge("clarification", END)
+    workflow.add_edge("device_query_subgraph", END)
     workflow.add_edge("compact_context", "agent")
 
     workflow.add_edge("planner", "plan_approval")

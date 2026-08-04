@@ -45,7 +45,7 @@ def classify_intent_fallback(text: str) -> IntentResult:
         return IntentResult(intent="clarification", confidence=0.1, reason="请求为空")
     memory_words = ("记住", "忘记", "删除记忆", "偏好", "喜欢", "家庭规则", "记忆")
     scene_words = ("场景", "模式", "睡眠", "离家", "回家", "观影", "起床")
-    query_words = ("查询", "状态", "温度多少", "开着吗", "在线", "有哪些设备")
+    query_words = ("查询", "状态", "温度", "开着吗", "在线", "有哪些设备")
     control_words = ("打开", "关闭", "开启", "关掉", "调到", "设置", "调高", "调低")
     if any(word in value for word in memory_words):
         return IntentResult(intent="memory_management", confidence=0.92, reason="包含记忆或偏好操作词")
