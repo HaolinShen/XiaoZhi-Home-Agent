@@ -55,6 +55,8 @@ from .parallel import (
     should_use_parallel_query,
 )
 from .multi_agent import agent_for_intent, role_prompt
+from .reasoning import format_memory_decision, reason_about_memories
+from .observability import emit_progress
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -189,12 +191,37 @@ def build_graph(
         if memory_service and state.get("request_home_id") and state.get("request_user_id"):
             context = _context_from_state(state, result)
             memory_service.extract_candidates_from_text(context, latest_text)
-            result["memory_context"] = memory_service.format_for_prompt(
-                context,
-                latest_text,
+            records = memory_service.retrieve(
+                context, latest_text,
                 top_k=getattr(settings.memory, "retrieval_top_k", 6),
             )
+            result["retrieved_memories"] = [record.model_dump(mode="json") for record in records]
+            result["memory_context"] = "\n".join(
+                f"- [{record.scope.value}/{record.memory_type.value}] "
+                f"{record.memory_key}: {record.memory_value} "
+                f"(confidence={record.confidence:.2f}, importance={record.importance:.2f})"
+                for record in records
+            ) or "（无可用长期记忆）"
+        emit_progress("context_synced", intent_text=latest_text[:80])
         return result
+
+    def memory_reasoner_node(state: AgentState) -> dict:
+        decision = reason_about_memories(
+            state.get("retrieved_memories", []),
+            _latest_text(state),
+        )
+        emit_progress(
+            "memory_reasoned",
+            applicable_count=len(decision.applicable_memory_ids),
+            needs_clarification=decision.needs_clarification,
+        )
+        return {
+            "memory_decision": decision.model_dump(),
+            "memory_context": (
+                state.get("memory_context", "（无可用长期记忆）")
+                + "\n显式记忆决策: " + format_memory_decision(decision)
+            ),
+        }
 
     def compact_context_node(state: AgentState) -> dict:
         """Bound checkpoint state and expose input-size statistics."""
@@ -227,6 +254,7 @@ def build_graph(
         if state.get("messages"):
             content = getattr(state["messages"][-1], "content", "")
             latest_text = content if isinstance(content, str) else ""
+        emit_progress("supervisor_routing", request=latest_text[:80])
         routing_config = getattr(settings, "routing", None)
         routing_enabled = getattr(routing_config, "enabled", False)
         intent = (
@@ -246,6 +274,7 @@ def build_graph(
             intent_route = "parallel_query"
         if not use_planner and (
             intent.intent == "clarification" or intent.confidence < confidence_threshold
+            or state.get("memory_decision", {}).get("needs_clarification", False)
         ):
             intent_route = "clarification"
         result = {
@@ -300,6 +329,7 @@ def build_graph(
             len(plan.steps),
             plan.goal,
         )
+        emit_progress("plan_generated", revision=revision, step_count=len(plan.steps))
         return {
             "plan": plan.model_dump(),
             "plan_revision": revision,
@@ -324,6 +354,7 @@ def build_graph(
     def executor_node(state: AgentState, config: RunnableConfig) -> dict:
         """Execute exactly one plan step using the existing trusted tools."""
         step = state["plan"]["steps"][state.get("current_step_index", 0)]
+        emit_progress("step_started", step_id=step["step_id"], description=step["description"])
         device_id, expected_state, preparation_error = expected_state_for_step(step, registry)
         tool = tools_by_name.get(step["tool_name"])
         try:
@@ -361,6 +392,7 @@ def build_graph(
             execution.get("tool_result", ""),
             execution.get("preparation_error"),
         )
+        emit_progress("step_verified", success=verification.success)
         index = state.get("current_step_index", 0)
         results = list(state.get("planning_results", []))
         results.append({
@@ -430,6 +462,7 @@ def build_graph(
             "targets": targets,
             "parallel_results": [],
         })
+        emit_progress("parallel_query_completed", target_count=len(targets))
         return {
             "messages": [AIMessage(content=result.get("response", "没有找到可查询的设备。"))],
             "parallel_query_results": result.get("parallel_results", []),
@@ -457,6 +490,7 @@ def build_graph(
             f"active_device_id={state.get('active_device_id')}\n"
             f"conversation_summary={state.get('conversation_summary', '')}\n"
             f"long_term_memory:\n{state.get('memory_context', '（无可用长期记忆）')}\n"
+            f"memory_decision={state.get('memory_decision', {})}\n"
             "这些标识来自受信任的业务上下文，不得根据用户文本改写。"
         )
         multi_agent_enabled = getattr(getattr(settings, "multi_agent", None), "enabled", False)
@@ -480,6 +514,7 @@ def build_graph(
         result = {"messages": [response]}
         if role:
             result["collaboration_status"] = "working"
+        emit_progress("agent_completed", role=role or "legacy", has_tool_calls=bool(getattr(response, "tool_calls", [])))
         return result
 
     def supervisor_finalize_node(state: AgentState) -> dict:
@@ -525,6 +560,7 @@ def build_graph(
     # 添加节点
     workflow.add_node("sync_context", sync_context_node)
     workflow.add_node("task_router", task_router_node)
+    workflow.add_node("memory_reasoner", memory_reasoner_node)
     workflow.add_node("compact_context", compact_context_node)
     workflow.add_node("agent", agent_node)
     workflow.add_node("approval", approval_node)
@@ -541,7 +577,8 @@ def build_graph(
 
     # 入口: 从 agent 开始
     workflow.set_entry_point("sync_context")
-    workflow.add_edge("sync_context", "task_router")
+    workflow.add_edge("sync_context", "memory_reasoner")
+    workflow.add_edge("memory_reasoner", "task_router")
 
     def route_task(state: AgentState) -> Literal[
         "planner", "compact_context", "clarification", "device_query_subgraph"
@@ -664,3 +701,10 @@ def _context_from_state(state: AgentState, updates: dict | None = None):
         device_id=(updates or {}).get("active_device_id", state.get("request_device_id")),
         is_admin=state.get("request_is_admin", False),
     )
+
+
+def _latest_text(state: AgentState) -> str:
+    if not state.get("messages"):
+        return ""
+    content = getattr(state["messages"][-1], "content", "")
+    return content if isinstance(content, str) else ""

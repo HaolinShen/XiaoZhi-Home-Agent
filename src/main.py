@@ -110,6 +110,7 @@ def _print_help() -> None:
     cmd_table.add_row("/status", "查看所有设备状态（直接查询，不经过 LLM）")
     cmd_table.add_row("/scenes", "列出所有可用的场景模式")
     cmd_table.add_row("/reset", "重置对话记忆（开始新对话）")
+    cmd_table.add_row("/history", "查看当前会话最近的 Checkpoint 状态历史")
     cmd_table.add_row("/help", "显示此帮助信息")
     cmd_table.add_row("/quit, /exit", "退出程序")
 
@@ -132,6 +133,29 @@ def _print_scenes() -> None:
     """打印可用场景列表"""
     from src.tools.scenes import SCENE_META
     console.print()
+    table = Table(title="🎬 可用场景模式", box=box.ROUNDED, border_style="dim")
+    table.add_column("场景", style="bold cyan")
+    table.add_column("说明", style="white")
+    for name, meta in SCENE_META.items():
+        table.add_row(f"{meta['emoji']} {name}", meta['description'])
+    console.print(table)
+    console.print()
+
+
+def _print_checkpoint_history(graph, config: dict) -> None:
+    from src.agent.time_travel import list_state_history
+    history = list_state_history(graph, config, limit=10)
+    table = Table(title="🕰️ Checkpoint 状态历史", box=box.ROUNDED, border_style="cyan")
+    table.add_column("Checkpoint", style="dim")
+    table.add_column("时间")
+    table.add_column("下一节点")
+    for item in history:
+        table.add_row(
+            str(item["checkpoint_id"] or "-")[:12],
+            str(item["created_at"] or "-"),
+            ", ".join(item["next"]) or "END",
+        )
+    console.print(table)
 
 
 def _approval_payload(result: dict):
@@ -161,13 +185,6 @@ def _invoke_with_approval(graph, state_input: dict, config: dict) -> dict:
         with console.status("[dim]正在继续执行...[/dim]", spinner="dots"):
             result = graph.invoke(Command(resume={"approved": approved}), config)
     return result
-    table = Table(title="🎬 可用场景模式", box=box.ROUNDED, border_style="dim")
-    table.add_column("场景", style="bold cyan")
-    table.add_column("说明", style="white")
-    for name, meta in SCENE_META.items():
-        table.add_row(f"{meta['emoji']} {name}", meta['description'])
-    console.print(table)
-    console.print()
 
 
 # ============================================================
@@ -232,6 +249,10 @@ def run_interactive_loop(
                 console.print(
                     f"\n[dim]✅ 已创建新会话 | {old_id} → {context.session_id}[/dim]"
                 )
+                continue
+
+            elif user_input.lower() == "/history":
+                _print_checkpoint_history(graph, context.to_config())
                 continue
 
             # ---- 正常对话 ----

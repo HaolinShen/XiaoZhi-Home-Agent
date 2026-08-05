@@ -44,6 +44,8 @@ class AgentState(TypedDict):
     delegated_agent: NotRequired[Literal["device", "scene", "memory", "chat"]]
     handoff_count: NotRequired[int]
     collaboration_status: NotRequired[Literal["delegated", "working", "completed", "stopped"]]
+    retrieved_memories: NotRequired[list[dict[str, Any]]]
+    memory_decision: NotRequired[dict[str, Any] | None]
     conversation_summary: NotRequired[str]
     memory_context: NotRequired[str]
     context_message_count: NotRequired[int]

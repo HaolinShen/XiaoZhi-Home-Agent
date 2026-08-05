@@ -1792,6 +1792,8 @@ collaboration_status: Literal["delegated", "working", "completed", "stopped"]
 
 当前项目通过 `sync_context` 检索 Top-K 记忆，并将其格式化后放进系统提示词：
 
+阶段十一已经增加 `memory_reasoner`。`sync_context` 会同时保留结构化 `retrieved_memories`，随后生成 `MemoryDecision`，明确哪些记忆适用、哪些被当前临时指令覆盖、哪些属于必须遵守的约束，以及是否存在冲突。
+
 ```text
 检索记忆 → 拼接 Prompt → 模型自行判断如何使用
 ```
@@ -1841,6 +1843,8 @@ class MemoryDecision(BaseModel):
 
 Checkpoint 不只是保存聊天记录，还可以支持查看过去状态并从指定位置重新执行。可以为项目增加一个学习用调试入口：
 
+阶段十一已经提供 `src/agent/time_travel.py`：`list_state_history` 查看历史，`fork_from_checkpoint` 使用完整历史快照配置调用 `graph.update_state` 创建分支。CLI 中可输入 `/history` 查看当前会话最近十个 Checkpoint。
+
 ```text
 查看某个 thread_id 的状态历史
   ↓
@@ -1865,6 +1869,8 @@ Checkpoint 不只是保存聊天记录，还可以支持查看过去状态并从
 #### 6.5.11 流式输出与自定义进度事件
 
 智能体的“流式输出”不只包含模型逐字生成的 Token，还包括图执行进度和工具状态：
+
+阶段十一已经在关键节点中通过 `get_stream_writer` 发出 `custom` 事件。调用方可以使用 `graph.stream(input, config, stream_mode="custom")` 获取上下文同步、记忆判断、Supervisor 路由、规划、步骤执行、验证、并行查询和 Agent 完成事件。
 
 ```text
 正在识别房间和设备……
@@ -1931,7 +1937,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 阶段十：多智能体协作（已实现）
   Supervisor、Handoff、专用 Agent、协作终止条件
         ↓
-阶段十一：记忆显式参与推理、时间旅行与流式事件
+阶段十一：记忆显式参与推理、时间旅行与流式事件（已实现）
   MemoryReasoner、状态历史、可观测进度
         ↓
 阶段十二：Agentic RAG 与轨迹评测
@@ -1943,7 +1949,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 - 阶段六：Human-in-the-loop（对应 6.5.1）；
 - 阶段七：Planner–Executor，以及确定性的 Verifier、重试和重新规划（对应 6.5.3 和 6.5.4）。
 
-阶段八至阶段十均已完成：结构化 Router 负责识别意图，阶段九查询子图负责动态并行，阶段十 Supervisor 再把其余请求委派给工具权限互斥的专用 Agent。下一步推荐进入阶段十一，研究长期记忆如何显式参与决策、Checkpoint 时间旅行和图执行进度事件；多设备控制并行仍应等到依赖关系、审批范围和失败策略明确后再扩展。
+阶段八至阶段十一均已完成：结构化 Router、动态并行查询子图、Supervisor 专用 Agent、显式记忆推理、Checkpoint 时间旅行和自定义进度事件已经形成一条可观察的完整执行链。下一步推荐进入阶段十二 Agentic RAG 与轨迹评测；多设备控制并行仍应等到依赖关系、审批范围和失败策略明确后再扩展。
 
 ### 6.6 家居领域模型训练：SFT、LoRA 与强化学习
 

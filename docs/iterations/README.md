@@ -19,3 +19,4 @@
 | 004 | 结构化意图路由 | 已实现 | [004-structured-intent-routing.md](004-structured-intent-routing.md) |
 | 005 | 子图与动态并行 | 已实现 | [005-subgraph-dynamic-parallel.md](005-subgraph-dynamic-parallel.md) |
 | 006 | Supervisor 多智能体协作 | 已实现 | [006-supervisor-multi-agent.md](006-supervisor-multi-agent.md) |
+| 007 | 记忆推理、时间旅行与进度事件 | 已实现 | [007-memory-time-travel-streaming.md](007-memory-time-travel-streaming.md) |
