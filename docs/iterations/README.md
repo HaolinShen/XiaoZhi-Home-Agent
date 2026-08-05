@@ -18,3 +18,4 @@
 | 003 | Planner–Executor–Verifier 规划执行循环 | 已实现 | [003-planner-executor-verifier.md](003-planner-executor-verifier.md) |
 | 004 | 结构化意图路由 | 已实现 | [004-structured-intent-routing.md](004-structured-intent-routing.md) |
 | 005 | 子图与动态并行 | 已实现 | [005-subgraph-dynamic-parallel.md](005-subgraph-dynamic-parallel.md) |
+| 006 | Supervisor 多智能体协作 | 已实现 | [006-supervisor-multi-agent.md](006-supervisor-multi-agent.md) |

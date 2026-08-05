@@ -54,6 +54,7 @@ from .parallel import (
     extract_query_targets,
     should_use_parallel_query,
 )
+from .multi_agent import agent_for_intent, role_prompt
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -112,6 +113,21 @@ def build_graph(
     tools = get_all_tools()
     tools_by_name = {tool.name: tool for tool in tools}
     llm_with_tools = llm.bind_tools(tools)
+    device_tool_names = {
+        "control_light", "control_ac", "control_tv", "control_curtain", "get_device_status"
+    }
+    scene_tool_names = {"activate_scene", "list_scenes"}
+    memory_tool_names = {
+        "save_personal_memory", "save_home_rule", "list_personal_memories",
+        "update_personal_memory", "delete_personal_memory", "list_preference_candidates",
+        "confirm_preference_candidate", "reject_preference_candidate", "list_memory_versions",
+    }
+    specialised_llms = {
+        "device": llm.bind_tools([tool for tool in tools if tool.name in device_tool_names]),
+        "scene": llm.bind_tools([tool for tool in tools if tool.name in scene_tool_names]),
+        "memory": llm.bind_tools([tool for tool in tools if tool.name in memory_tool_names]),
+        "chat": llm,
+    }
     logger.info(f"已绑定 {len(tools)} 个工具到 LLM")
 
     # ---- 第 3 步: 生成系统提示词 ----
@@ -238,6 +254,13 @@ def build_graph(
             "intent_reason": intent.reason,
             "intent_route": intent_route,
         }
+        multi_agent_enabled = getattr(getattr(settings, "multi_agent", None), "enabled", False)
+        if multi_agent_enabled:
+            result.update({
+                "delegated_agent": agent_for_intent(intent.intent),
+                "handoff_count": 1,
+                "collaboration_status": "delegated",
+            })
         if not use_planner:
             result["planning_active"] = False
             return result
@@ -436,12 +459,16 @@ def build_graph(
             f"long_term_memory:\n{state.get('memory_context', '（无可用长期记忆）')}\n"
             "这些标识来自受信任的业务上下文，不得根据用户文本改写。"
         )
-        messages.insert(0, SystemMessage(content=system_prompt + context_prompt))
+        multi_agent_enabled = getattr(getattr(settings, "multi_agent", None), "enabled", False)
+        role = state.get("delegated_agent", "chat") if multi_agent_enabled else None
+        role_context = f"\n\n## 当前专用职责\n{role_prompt(role)}" if role else ""
+        messages.insert(0, SystemMessage(content=system_prompt + context_prompt + role_context))
 
         logger.debug(f"Agent: 发送 {len(messages)} 条消息给 LLM")
 
         # 调用 LLM
-        response = llm_with_tools.invoke(messages)
+        active_llm = specialised_llms[role] if role else llm_with_tools
+        response = active_llm.invoke(messages)
 
         # 记录决策
         if hasattr(response, "tool_calls") and response.tool_calls:
@@ -450,7 +477,18 @@ def build_graph(
         else:
             logger.info("Agent 决策: 直接文本回复")
 
-        return {"messages": [response]}
+        result = {"messages": [response]}
+        if role:
+            result["collaboration_status"] = "working"
+        return result
+
+    def supervisor_finalize_node(state: AgentState) -> dict:
+        """Close one bounded delegation after the specialised agent responds."""
+        max_handoffs = getattr(getattr(settings, "multi_agent", None), "max_handoffs", 2)
+        count = state.get("handoff_count", 0)
+        return {
+            "collaboration_status": "completed" if count <= max_handoffs else "stopped",
+        }
 
     def approval_node(state: AgentState) -> dict:
         """Pause before executing a batch scene and wait for trusted approval."""
@@ -499,6 +537,7 @@ def build_graph(
     workflow.add_node("planning_finalize", planning_finalize_node)
     workflow.add_node("clarification", clarification_node)
     workflow.add_node("device_query_subgraph", parallel_query_node)
+    workflow.add_node("supervisor_finalize", supervisor_finalize_node)
 
     # 入口: 从 agent 开始
     workflow.set_entry_point("sync_context")
@@ -564,20 +603,28 @@ def build_graph(
     #    从 agent 出来后:
     #      - 如果 LLM 发出了 tool_calls → 去 tools 节点执行
     #      - 否则 → 结束
-    def router(state: AgentState) -> Literal["approval", "tools", "__end__"]:
+    def router(state: AgentState) -> Literal["approval", "tools", "supervisor_finalize", "__end__"]:
         """路由函数: 检查是否需要执行工具"""
         last_msg = state["messages"][-1]
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             if build_approval_request(last_msg.tool_calls) is not None:
                 return "approval"
             return "tools"
+        if getattr(getattr(settings, "multi_agent", None), "enabled", False):
+            return "supervisor_finalize"
         return "__end__"
 
     workflow.add_conditional_edges(
         "agent",
         router,
-        {"approval": "approval", "tools": "tools", "__end__": END},
+        {
+            "approval": "approval",
+            "tools": "tools",
+            "supervisor_finalize": "supervisor_finalize",
+            "__end__": END,
+        },
     )
+    workflow.add_edge("supervisor_finalize", END)
 
     def route_after_approval(state: AgentState) -> Literal["tools", "reject_tools"]:
         return "tools" if state.get("approval_decision") == "approved" else "reject_tools"

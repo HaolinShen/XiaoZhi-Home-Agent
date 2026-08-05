@@ -87,6 +87,14 @@ class RoutingConfig(BaseSettings):
     confidence_threshold: float = Field(default=0.6, ge=0, le=1)
 
 
+class MultiAgentConfig(BaseSettings):
+    """Supervisor and specialised-agent collaboration limits."""
+    model_config = SettingsConfigDict(env_prefix="MULTI_AGENT_")
+
+    enabled: bool = Field(default=True)
+    max_handoffs: int = Field(default=2, ge=1, le=5)
+
+
 # ============================================================
 # 主配置
 # ============================================================
@@ -171,6 +179,7 @@ class Settings(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    multi_agent: MultiAgentConfig = Field(default_factory=MultiAgentConfig)
 
     # ---- 最终解析后的值（非 Field，用于内部使用）----
     _api_key: str = ""

@@ -1737,6 +1737,8 @@ parallel_results: Annotated[list[dict], operator.add]
 
 当设备控制、场景规划、记忆管理和安全审查已经形成清晰边界后，可以进一步研究多智能体：
 
+阶段十已经实现 Supervisor 模式。阶段八的结构化 `task_router` 同时承担 Supervisor：根据意图设置 `delegated_agent`，再把请求交给只拥有对应工具集的专用 Agent。专用 Agent 最终回复后进入 `supervisor_finalize`，记录本轮协作已经完成。
+
 ```text
 Supervisor
 ├── Device Agent：设备定位、查询和控制
@@ -1764,6 +1766,27 @@ Handoff 模式：
 - 多 Agent 是否真的比单 Agent 加工具具有更高成功率。
 
 如果职责尚未清楚，优先使用一个 Agent 加子图；当不同模块确实需要不同工具集、提示词和状态边界时，再拆成多个 Agent。
+
+当前项目实际拆分为：
+
+| Agent | 允许使用的工具 |
+| --- | --- |
+| Device Agent | 四类原子设备控制工具、设备状态查询 |
+| Scene Agent | `activate_scene`、`list_scenes` |
+| Memory Agent | 长期记忆、候选确认和版本管理工具 |
+| Chat Agent | 不绑定工具 |
+
+安全能力没有被包装成一个只输出文字的“角色”。场景副作用继续由阶段六 Human-in-the-loop 拦截，多步骤设备操作继续由阶段七 Verifier 检查真实状态。这些确定性节点共同构成 Safety 层。
+
+协作状态包含：
+
+```python
+delegated_agent: Literal["device", "scene", "memory", "chat"]
+handoff_count: int
+collaboration_status: Literal["delegated", "working", "completed", "stopped"]
+```
+
+`MULTI_AGENT_MAX_HANDOFFS` 默认是 2。当前版本每轮只进行一次 Supervisor 委派，该限制为后续跨 Agent handoff 预留终止边界。
 
 #### 6.5.9 让长期记忆显式参与推理
 
@@ -1905,7 +1928,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 阶段九：子图与动态并行（已实现）
   Subgraph、Send、Reducer、结果聚合
         ↓
-阶段十：多智能体协作
+阶段十：多智能体协作（已实现）
   Supervisor、Handoff、专用 Agent、协作终止条件
         ↓
 阶段十一：记忆显式参与推理、时间旅行与流式事件
@@ -1920,7 +1943,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 - 阶段六：Human-in-the-loop（对应 6.5.1）；
 - 阶段七：Planner–Executor，以及确定性的 Verifier、重试和重新规划（对应 6.5.3 和 6.5.4）。
 
-阶段八也已完成：`task_router` 现在会生成结构化 `IntentResult`，记录意图、置信度和原因，并为信息不足的请求提供澄清分支。阶段九已经落地一个安全切片：多设备状态查询会进入设备查询子图，由 `Send` 根据运行时目标数量 fan-out，再使用 reducer 聚合结果；普通控制请求、场景请求和阶段七 Planner 行为保持不变。下一步可以在明确依赖关系和失败策略后，再扩展到更多子图或安全的独立控制任务。
+阶段八至阶段十均已完成：结构化 Router 负责识别意图，阶段九查询子图负责动态并行，阶段十 Supervisor 再把其余请求委派给工具权限互斥的专用 Agent。下一步推荐进入阶段十一，研究长期记忆如何显式参与决策、Checkpoint 时间旅行和图执行进度事件；多设备控制并行仍应等到依赖关系、审批范围和失败策略明确后再扩展。
 
 ### 6.6 家居领域模型训练：SFT、LoRA 与强化学习
 
