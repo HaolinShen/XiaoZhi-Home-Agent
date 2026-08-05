@@ -1891,7 +1891,7 @@ Checkpoint 不只是保存聊天记录，还可以支持查看过去状态并从
 
 #### 6.5.12 Agentic RAG：区分记忆、实时状态和外部知识
 
-长期记忆保存用户偏好和家庭规则，但不适合保存设备说明书、故障代码和产品知识。可以增加设备文档 RAG 分支：
+长期记忆保存用户偏好和家庭规则，但不适合保存设备说明书、故障代码和产品知识。阶段十二已经实现设备文档 RAG 分支：
 
 ```text
 用户：空调显示 E3 是什么意思？
@@ -1917,6 +1917,30 @@ Checkpoint 不只是保存聊天记录，还可以支持查看过去状态并从
 
 Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备工具取得型号，再检索知识库，还可能根据检索结果继续查询状态或给出下一步操作建议。
 
+当前实现使用 `docs/knowledge/catalog.json` 保存型号与 Markdown 文件的结构化映射，`src/knowledge/base.py` 使用标准库完成可解释词法检索，不需要额外安装向量数据库。`src/knowledge/rag.py` 构建如下子图：
+
+```text
+identify_device
+  ↓
+retrieve
+  ├── 命中 → answer + citations
+  ├── 未命中且可重试 → rewrite_query → retrieve
+  └── 仍未命中 → refuse
+```
+
+结构化 Router 新增 `device_knowledge` 意图。知识请求进入 RAG 子图，不绑定设备控制工具。故障代码查询还会要求文档中出现完全相同的代码，例如知识库只有 E3 时，询问 E9 不会返回“相似答案”，而是明确拒答。
+
+RAG 状态会保存：
+
+```python
+rag_status: Literal["answered", "refused"]
+rag_citations: list[str]
+rag_trajectory: list[dict]
+rag_device_model: str | None
+```
+
+`src/evaluation/trajectory.py` 可以离线计算路由准确、回答/拒答状态、来源正确性、是否发生检索、查询改写次数和引用数量。评测关注的是整条轨迹，而不只是最终回答是否流畅。
+
 #### 6.5.13 推荐的进阶学习顺序
 
 这些方向不建议一次全部加入当前图。可以按照对 LangGraph 核心能力的依赖关系分阶段学习：
@@ -1940,7 +1964,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 阶段十一：记忆显式参与推理、时间旅行与流式事件（已实现）
   MemoryReasoner、状态历史、可观测进度
         ↓
-阶段十二：Agentic RAG 与轨迹评测
+阶段十二：Agentic RAG 与轨迹评测（已实现）
   知识检索、来源路由、执行轨迹比较
 ```
 
@@ -1949,7 +1973,7 @@ Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备
 - 阶段六：Human-in-the-loop（对应 6.5.1）；
 - 阶段七：Planner–Executor，以及确定性的 Verifier、重试和重新规划（对应 6.5.3 和 6.5.4）。
 
-阶段八至阶段十一均已完成：结构化 Router、动态并行查询子图、Supervisor 专用 Agent、显式记忆推理、Checkpoint 时间旅行和自定义进度事件已经形成一条可观察的完整执行链。下一步推荐进入阶段十二 Agentic RAG 与轨迹评测；多设备控制并行仍应等到依赖关系、审批范围和失败策略明确后再扩展。
+阶段六至阶段十二均已完成。项目现在覆盖人在回路、规划验证、结构化路由、子图并行、Supervisor 多智能体、显式记忆推理、时间旅行、进度事件以及带来源的 Agentic RAG。下一步更适合从评测数据出发补齐薄弱场景，或进入 6.6 的家居领域 SFT、LoRA 与偏好优化路线，而不是继续无目标增加节点。
 
 ### 6.6 家居领域模型训练：SFT、LoRA 与强化学习
 

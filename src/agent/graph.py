@@ -57,6 +57,7 @@ from .parallel import (
 from .multi_agent import agent_for_intent, role_prompt
 from .reasoning import format_memory_decision, reason_about_memories
 from .observability import emit_progress
+from ..knowledge import KnowledgeBase, build_knowledge_rag_subgraph
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -128,6 +129,7 @@ def build_graph(
         "device": llm.bind_tools([tool for tool in tools if tool.name in device_tool_names]),
         "scene": llm.bind_tools([tool for tool in tools if tool.name in scene_tool_names]),
         "memory": llm.bind_tools([tool for tool in tools if tool.name in memory_tool_names]),
+        "knowledge": llm,
         "chat": llm,
     }
     logger.info(f"已绑定 {len(tools)} 个工具到 LLM")
@@ -145,6 +147,13 @@ def build_graph(
         )
     set_memory_service(memory_service)
     device_query_subgraph = build_device_query_subgraph(registry)
+    rag_config = getattr(settings, "rag", None)
+    knowledge_base = KnowledgeBase(getattr(rag_config, "knowledge_path", "docs/knowledge"))
+    knowledge_rag_subgraph = build_knowledge_rag_subgraph(
+        knowledge_base,
+        top_k=getattr(rag_config, "top_k", 3),
+        max_rewrites=getattr(rag_config, "max_rewrites", 1),
+    )
 
     # ---- 第 4 步: 定义 Agent 节点 ----
     # 这个节点是工作流的"大脑"，负责:
@@ -266,6 +275,12 @@ def build_graph(
         planning_enabled = getattr(getattr(settings, "planning", None), "enabled", True)
         use_planner = planning_enabled and should_use_planner(latest_text)
         intent_route = "planner" if use_planner else "react"
+        if (
+            not use_planner
+            and intent.intent == "device_knowledge"
+            and getattr(rag_config, "enabled", False)
+        ):
+            intent_route = "knowledge_rag"
         if (
             not use_planner
             and intent.intent == "device_query"
@@ -468,6 +483,23 @@ def build_graph(
             "parallel_query_results": result.get("parallel_results", []),
         }
 
+    def knowledge_rag_node(state: AgentState) -> dict:
+        latest_text = _latest_text(state)
+        result = knowledge_rag_subgraph.invoke({"query": latest_text})
+        emit_progress(
+            "knowledge_rag_completed",
+            status=result.get("rag_status"),
+            citation_count=len(result.get("citations", [])),
+        )
+        return {
+            "messages": [AIMessage(content=result["answer"])],
+            "rag_status": result.get("rag_status"),
+            "rag_citations": result.get("citations", []),
+            "rag_trajectory": result.get("trajectory", []),
+            "rag_device_model": result.get("device_model"),
+            "collaboration_status": "completed",
+        }
+
     def agent_node(state: AgentState) -> dict:
         """
         Agent 节点: 调用 LLM 进行推理。
@@ -573,6 +605,7 @@ def build_graph(
     workflow.add_node("planning_finalize", planning_finalize_node)
     workflow.add_node("clarification", clarification_node)
     workflow.add_node("device_query_subgraph", parallel_query_node)
+    workflow.add_node("knowledge_rag", knowledge_rag_node)
     workflow.add_node("supervisor_finalize", supervisor_finalize_node)
 
     # 入口: 从 agent 开始
@@ -581,12 +614,14 @@ def build_graph(
     workflow.add_edge("memory_reasoner", "task_router")
 
     def route_task(state: AgentState) -> Literal[
-        "planner", "compact_context", "clarification", "device_query_subgraph"
+        "planner", "compact_context", "clarification", "device_query_subgraph", "knowledge_rag"
     ]:
         if state.get("intent_route") == "clarification":
             return "clarification"
         if state.get("intent_route") == "parallel_query":
             return "device_query_subgraph"
+        if state.get("intent_route") == "knowledge_rag":
+            return "knowledge_rag"
         return "planner" if state.get("planning_active") else "compact_context"
 
     workflow.add_conditional_edges(
@@ -597,10 +632,12 @@ def build_graph(
             "compact_context": "compact_context",
             "clarification": "clarification",
             "device_query_subgraph": "device_query_subgraph",
+            "knowledge_rag": "knowledge_rag",
         },
     )
     workflow.add_edge("clarification", END)
     workflow.add_edge("device_query_subgraph", END)
+    workflow.add_edge("knowledge_rag", END)
     workflow.add_edge("compact_context", "agent")
 
     workflow.add_edge("planner", "plan_approval")

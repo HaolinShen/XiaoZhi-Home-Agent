@@ -95,6 +95,16 @@ class MultiAgentConfig(BaseSettings):
     max_handoffs: int = Field(default=2, ge=1, le=5)
 
 
+class RAGConfig(BaseSettings):
+    """Local Agentic RAG settings."""
+    model_config = SettingsConfigDict(env_prefix="RAG_")
+
+    enabled: bool = Field(default=True)
+    knowledge_path: str = Field(default="docs/knowledge")
+    top_k: int = Field(default=3, ge=1, le=10)
+    max_rewrites: int = Field(default=1, ge=0, le=3)
+
+
 # ============================================================
 # 主配置
 # ============================================================
@@ -180,6 +190,7 @@ class Settings(BaseSettings):
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     multi_agent: MultiAgentConfig = Field(default_factory=MultiAgentConfig)
+    rag: RAGConfig = Field(default_factory=RAGConfig)
 
     # ---- 最终解析后的值（非 Field，用于内部使用）----
     _api_key: str = ""

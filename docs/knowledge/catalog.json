@@ -1,0 +1,7 @@
+{
+  "documents": [
+    {"id": "smartcool-ac2024-errors", "title": "SmartCool AC2024 故障代码", "model": "SmartCool-AC2024", "file": "smartcool-ac2024-errors.md"},
+    {"id": "smartcool-ac2024-maintenance", "title": "SmartCool AC2024 滤网维护", "model": "SmartCool-AC2024", "file": "smartcool-ac2024-maintenance.md"},
+    {"id": "visiontv-v1-errors", "title": "VisionTV V1 故障代码", "model": "VisionTV-V1", "file": "visiontv-v1-errors.md"}
+  ]
+}
