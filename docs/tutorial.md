@@ -1,9 +1,9 @@
 # 智能家居家电互联智能体 — 开发教程
 
-> **适用版本**: v0.2.0（已包含长期记忆与 Human-in-the-loop）
+> **适用版本**: 阶段十二（已包含 Agentic RAG 与轨迹评测）
 > **适用人群**: 想要学习现代 AI Agent 开发的 Python 开发者  
 > **前置知识**: Python 基础（类、装饰器、类型注解）、理解 LLM 的基本概念  
-> **完成时间**: 阅读约 45 分钟，动手实践约 2 小时  
+> **完成时间**: 核心章节阅读约 2 小时，完整实践建议分阶段完成
 
 ---
 
@@ -26,7 +26,7 @@
 
 ### 1.1 这是什么？
 
-一个基于 **LangGraph + MCP (Model Context Protocol)** 的智能家居 AI Agent。你可以用自然语言查询和控制设备，并学习状态图编排、工具调用、会话检查点、上下文压缩、长期记忆以及 Human-in-the-loop 可恢复执行。
+一个基于 **LangGraph + MCP (Model Context Protocol)** 的智能家居 AI Agent。你可以用自然语言查询和控制设备，并学习状态图编排、工具调用、会话检查点、上下文压缩、长期记忆、Human-in-the-loop、规划执行、结构化路由、多智能体协作以及 Agentic RAG。
 
 当前项目已经具备：
 
@@ -37,14 +37,19 @@
 - 结构化长期记忆、候选确认、混合检索和版本追踪；
 - 场景操作执行前的 `interrupt` 人工确认；
 - 使用 `Command(resume=...)` 从原检查点批准或拒绝操作；
+- Planner–Executor–Verifier 规划、执行、验证、重试与重新规划；
+- 结构化意图路由、设备查询子图和动态并行；
+- Supervisor 按职责向设备、场景、记忆和聊天 Agent 委派；
+- 显式记忆推理、Checkpoint 时间旅行和自定义进度事件；
+- 基于本地设备文档的 Agentic RAG、来源引用与轨迹评测；
 - MCP Server 工具暴露和外部 MCP Client 接入能力。
 
 ### 1.2 技术栈
 
 | 技术 | 版本 | 作用 |
 |------|------|------|
-| **LangGraph** | ≥1.2 | Agent 工作流编排（状态图、节点、条件路由） |
-| **LangChain** | ≥1.3 | LLM 调用封装、工具定义、消息管理 |
+| **LangGraph** | ≥1.0 | Agent 工作流编排（状态图、节点、条件路由） |
+| **LangChain** | ≥1.0 | LLM 调用封装、工具定义、消息管理 |
 | **MCP (Model Context Protocol)** | ≥1.0 | 标准化工具暴露/消费协议 |
 | **Pydantic v2** | ≥2.0 | 类型安全的数据模型 & 配置管理 |
 | **Typer + Rich** | - | 现代化 CLI 终端界面 |
@@ -56,26 +61,32 @@
 ```text
 用户输入
   ↓
-sync_context             同步可信身份、房间、设备和长期记忆
+sync_context             同步可信位置，抽取候选并检索长期记忆
+  ↓
+memory_reasoner          判断记忆是否适用、冲突或被临时指令覆盖
   ↓
 task_router
-  ├── 普通请求 / 预定义场景
+  ├── 信息不足 ───────────────────────────────→ clarification → END
+  ├── 多设备状态查询 ────────────────→ device_query_subgraph → END
+  ├── 设备知识或故障问题 ─────────────────────→ knowledge_rag → END
+  ├── 自定义多步骤目标
   │      ↓
-  │   compact_context → agent
-  │      ├── 无工具调用 ───────────────────────────────→ END
-  │      ├── 普通工具调用 ─────────────────────────────→ tools
-  │      └── activate_scene → approval → tools / reject_tools
+  │   planner → plan_approval（interrupt）
+  │                 ├── rejected ─────────────────────→ finalize
+  │                 └── approved
+  │                        ↓
+  │                     executor → verifier
+  │                                   ├── 下一步 / retry → executor
+  │                                   ├── replan         → planner
+  │                                   └── 完成 / 失败     → finalize
   │
-  └── 自定义多步骤目标
+  └── 普通请求 / 预定义场景 / 专用 Agent
          ↓
-      planner → plan_approval（interrupt）
-                    ├── rejected ──────────────────────→ finalize
-                    └── approved
-                           ↓
-                        executor → verifier
-                                      ├── 下一步 / retry → executor
-                                      ├── replan         → planner
-                                      └── 完成 / 失败     → finalize
+      compact_context → agent
+         ├── 普通工具调用 ────────────────────────────→ tools ─┐
+         ├── 高风险或批量调用 → approval → tools / reject_tools ┤
+         └── 无工具调用 → supervisor_finalize / END              │
+                                                                  └→ compact_context
 ```
 
 图中的两类持久状态分别是：
@@ -103,10 +114,8 @@ conda activate langgraph
 # 进入项目目录
 cd G:\大厂学习\minimind\langgraph
 
-# 安装所有依赖
-pip install langgraph langchain langchain-openai langgraph-checkpoint-sqlite \
-            pydantic pydantic-settings python-dotenv \
-            mcp typer rich loguru httpx
+# 根据 pyproject.toml 安装项目及测试依赖
+pip install -e ".[dev]"
 ```
 
 ### 2.3 获取 API Key
@@ -122,7 +131,7 @@ pip install langgraph langchain langchain-openai langgraph-checkpoint-sqlite \
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入你的 BAILIAN_API_KEY
+# 编辑 .env，至少填写 LLM_API_KEY；模型和服务地址可按需调整
 ```
 
 ---
@@ -160,7 +169,13 @@ langgraph/
 │   │   ├── prompts.py        # 系统提示词模板
 │   │   ├── approval.py       # 风险识别、中断数据和拒绝结果
 │   │   ├── planning.py       # 结构化计划、预期状态和 Verifier
-│   │   └── graph.py          # LangGraph 工作流图 (build_graph)
+│   │   ├── routing.py        # 结构化意图识别与确定性回退路由
+│   │   ├── parallel.py       # 设备查询子图、Send 动态并行与聚合
+│   │   ├── multi_agent.py    # Supervisor 角色和专用工具集
+│   │   ├── reasoning.py      # 结构化长期记忆适用性判断
+│   │   ├── time_travel.py    # Checkpoint 历史查看与分支恢复
+│   │   ├── observability.py  # 自定义流式进度事件
+│   │   └── graph.py          # 主 LangGraph 工作流图 (build_graph)
 │   │
 │   ├── mcp/                  # MCP 层
 │   │   ├── __init__.py
@@ -176,24 +191,37 @@ langgraph/
 │   │   ├── extractor.py      # 自然语言记忆候选抽取
 │   │   └── service.py        # 权限、检索和生命周期规则
 │   │
+│   ├── knowledge/            # 设备知识与 Agentic RAG 子图
+│   │   ├── base.py           # Markdown 文档加载、型号过滤和词法检索
+│   │   └── rag.py            # 识别、检索、改写、回答与拒答流程
+│   │
+│   ├── evaluation/           # Agent 轨迹评测
+│   │   └── trajectory.py     # 路由、状态、来源和拒答指标
+│   │
 │   ├── middleware/           # 中间件层
 │   │   ├── __init__.py
 │   │   └── interceptors.py   # 日志拦截器 + 重试拦截器
 │   │
 │   └── main.py               # ★ CLI 主入口 (typer + rich)
 │
-├── tests/                    # 阶段一至阶段六自动化测试
+├── tests/                    # 阶段一至阶段十二自动化测试
 │   ├── test_phase_one.py
 │   ├── test_phase_two.py
 │   ├── test_phase_three.py
 │   ├── test_phase_four.py
 │   ├── test_phase_five.py
 │   ├── test_phase_six.py     # Human-in-the-loop 测试
-│   └── test_phase_seven.py   # Planner–Executor–Verifier 测试
+│   ├── test_phase_seven.py   # Planner–Executor–Verifier 测试
+│   ├── test_phase_eight.py   # 结构化意图路由测试
+│   ├── test_phase_nine.py    # 子图与动态并行测试
+│   ├── test_phase_ten.py     # Supervisor 多智能体测试
+│   ├── test_phase_eleven.py  # 记忆推理、时间旅行与事件测试
+│   └── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
 │
 ├── docs/                     # 文档
 │   ├── tutorial.md           # 本教程
-│   └── iterations/           # 各阶段设计与实现说明
+│   ├── iterations/           # 各阶段设计与实现说明
+│   └── knowledge/            # 型号目录与本地设备知识文档
 │
 └── data/                     # 运行时数据（自动创建）
     ├── checkpoints.db        # SQLite 会话检查点
@@ -206,14 +234,14 @@ langgraph/
 ┌─────────────────────────────────────────────────────┐
 │  CLI / MCP Server                   表示与协议层       │
 ├─────────────────────────────────────────────────────┤
-│  LangGraph + Human-in-the-loop       编排层           │
-│  sync / compact / agent / approval / tools           │
+│  LangGraph 主图 / 子图 / Supervisor    编排层           │
+│  路由 / 规划 / 审批 / 并行 / RAG / 工具循环            │
 ├─────────────────────────────────────────────────────┤
 │  @tool 设备、场景和记忆工具            工具层           │
 ├─────────────────────────────────────────────────────┤
 │  DeviceRegistry / SpaceDirectory      领域与上下文层    │
 ├─────────────────────────────────────────────────────┤
-│  Checkpoint / Long-term Memory        状态与记忆层      │
+│  Checkpoint / Long-term Memory / RAG  状态与知识层      │
 ├─────────────────────────────────────────────────────┤
 │  SimulatorBackend / SQLite / Config   基础设施层        │
 └─────────────────────────────────────────────────────┘
@@ -231,14 +259,15 @@ langgraph/
 from src.config import get_settings
 
 settings = get_settings()
-print(settings.bailian_model)   # "qwen-plus"
+print(settings.model)           # "qwen-plus"
 print(settings.mcp_server.port) # 8765
+print(settings.rag.top_k)       # 3
 ```
 
 **特性**:
 - 自动从 `.env` 加载，支持系统环境变量覆盖
 - 字段级验证（API Key 不能为空/占位符）
-- 嵌套配置对象（MCP、Memory 子配置）
+- 嵌套配置对象（MCP、Memory、Planning、Routing、Multi-agent、RAG）
 - IDE 友好的类型提示
 
 ### 4.2 数据模型 (`models.py`)
@@ -427,9 +456,13 @@ print(result["messages"][-1].content)
 | 节点 | 作用 |
 | --- | --- |
 | `sync_context` | 同步可信请求位置，抽取记忆候选并检索长期记忆 |
-| `task_router` | 将明确的自定义多步骤目标路由到规划分支 |
+| `memory_reasoner` | 判断检索到的记忆是否适用、冲突、属于约束或被临时指令覆盖 |
+| `task_router` | 识别结构化意图，选择澄清、并行查询、RAG、规划或普通 Agent 分支 |
+| `clarification` | 信息不足或路由置信度低时请求用户补充信息 |
+| `device_query_subgraph` | 使用子图和 `Send` 并行查询多个设备并聚合结果 |
+| `knowledge_rag` | 按设备型号检索本地知识，支持改写、引用和无依据拒答 |
 | `compact_context` | 限制消息和 token 规模，维护滚动摘要 |
-| `agent` | 调用绑定工具后的 LLM |
+| `agent` | 运行普通 ReAct 或接收 Supervisor 委派后的专用 Agent |
 | `approval` | 对批量场景调用执行 `interrupt` |
 | `tools` | 使用 `ToolNode` 执行已批准或无需确认的工具 |
 | `reject_tools` | 拒绝时生成匹配工具调用 ID 的取消结果 |
@@ -438,6 +471,7 @@ print(result["messages"][-1].content)
 | `executor` | 每次只执行当前计划中的一个原子工具步骤 |
 | `verifier` | 读取真实设备状态，判断成功、重试或重新规划 |
 | `planning_finalize` | 汇总完成、取消或失败结果 |
+| `supervisor_finalize` | 记录专用 Agent 委派完成和 handoff 轨迹 |
 
 简化后的构图代码如下：
 
@@ -445,7 +479,11 @@ print(result["messages"][-1].content)
 workflow = StateGraph(AgentState)
 
 workflow.add_node("sync_context", sync_context_node)
+workflow.add_node("memory_reasoner", memory_reasoner_node)
 workflow.add_node("task_router", task_router_node)
+workflow.add_node("clarification", clarification_node)
+workflow.add_node("device_query_subgraph", parallel_query_node)
+workflow.add_node("knowledge_rag", knowledge_rag_node)
 workflow.add_node("compact_context", compact_context_node)
 workflow.add_node("agent", agent_node)
 workflow.add_node("approval", approval_node)
@@ -456,21 +494,31 @@ workflow.add_node("plan_approval", plan_approval_node)
 workflow.add_node("executor", executor_node)
 workflow.add_node("verifier", verifier_node)
 workflow.add_node("planning_finalize", planning_finalize_node)
+workflow.add_node("supervisor_finalize", supervisor_finalize_node)
 
 workflow.set_entry_point("sync_context")
-workflow.add_edge("sync_context", "task_router")
+workflow.add_edge("sync_context", "memory_reasoner")
+workflow.add_edge("memory_reasoner", "task_router")
 
 workflow.add_conditional_edges("task_router", route_task, {
     "planner": "planner",
     "compact_context": "compact_context",
+    "clarification": "clarification",
+    "device_query_subgraph": "device_query_subgraph",
+    "knowledge_rag": "knowledge_rag",
 })
+workflow.add_edge("clarification", END)
+workflow.add_edge("device_query_subgraph", END)
+workflow.add_edge("knowledge_rag", END)
 workflow.add_edge("compact_context", "agent")
 
 workflow.add_conditional_edges("agent", router, {
     "approval": "approval",
     "tools": "tools",
+    "supervisor_finalize": "supervisor_finalize",
     "__end__": END,
 })
+workflow.add_edge("supervisor_finalize", END)
 
 workflow.add_conditional_edges("approval", route_after_approval, {
     "tools": "tools",
@@ -606,6 +654,7 @@ Command(resume={"approved": True})
 | `/status` | 查看所有设备状态 |
 | `/scenes` | 列出可用场景模式 |
 | `/reset`  | 重置对话记忆 |
+| `/history` | 查看当前会话最近的 Checkpoint 状态历史 |
 | `/help`   | 显示使用指南 |
 | `/quit`   | 退出 |
 
@@ -637,28 +686,30 @@ python -m src.mcp.server --transport sse --port 8765
 使用项目现有的 `langgraph` Conda 环境运行：
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py" -v
+python -m pytest -q
+
+# 只运行某个阶段，例如阶段十二
+python -m pytest -q tests/test_phase_twelve.py
 ```
 
-当前测试覆盖阶段一至阶段七，共 50 个测试。Human-in-the-loop 相关测试位于 `tests/test_phase_six.py`，重点验证：
+当前测试覆盖阶段一至阶段十二，共 68 个测试。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
 
-1. 中断返回时，批量场景尚未修改设备；
-2. `approved=True` 后才执行真实场景；
-3. `approved=False` 后设备保持原状；
-4. 拒绝路径产生匹配工具调用 ID 的 `ToolMessage`；
-5. 普通单设备工具不会触发中断；
-6. SQLite Checkpoint 关闭并重新构建图后，仍可使用相同 `thread_id` 恢复。
+| 测试文件 | 主要验证内容 |
+| --- | --- |
+| `test_phase_one.py` | 可信请求上下文、住宅归属校验、稳定会话和 Checkpoint 模式 |
+| `test_phase_two.py` | 长期记忆作用域、权限隔离、持久化和 Agent 工具上下文 |
+| `test_phase_three.py` | 上下文压缩、滚动摘要、TTL 清理和会话结束策略 |
+| `test_phase_four.py` | 记忆候选、确认、冲突、置信度衰减和行为观察 |
+| `test_phase_five.py` | 自然语言抽取、混合排序、访问次数、版本与有效时间 |
+| `test_phase_six.py` | Human-in-the-loop 批准、拒绝、无副作用中断和恢复 |
+| `test_phase_seven.py` | Planner–Executor–Verifier、重试、重新规划和计划恢复 |
+| `test_phase_eight.py` | 结构化意图、低置信度澄清和确定性回退分类 |
+| `test_phase_nine.py` | 设备查询子图、动态 `Send` 并行和稳定结果聚合 |
+| `test_phase_ten.py` | Supervisor 委派、专用 Agent 能力边界和工具隔离 |
+| `test_phase_eleven.py` | 显式记忆决策、Checkpoint 时间旅行和自定义进度事件 |
+| `test_phase_twelve.py` | Agentic RAG 型号过滤、引用、拒答和轨迹评测指标 |
 
-Planner–Executor–Verifier 相关测试位于 `tests/test_phase_seven.py`，重点验证：
-
-1. 复杂任务路由不会影响单设备和预定义场景；
-2. 计划需要批准后才开始执行；
-3. Executor 按步骤调用现有工具；
-4. Verifier 根据真实设备状态判断结果；
-5. 单步失败能够有限重试；
-6. 重试耗尽后能够重新规划并再次确认；
-7. SQLite Checkpoint 能在图重建后恢复已暂停的计划；
-8. 重试和重新规划额度全部耗尽后任务会明确停止。
+测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 68 是阶段十二提交时的基线。
 
 ---
 
@@ -1393,16 +1444,19 @@ Agent：已取消操作，设备状态没有变化。
 
 #### 6.5.2 显式意图识别与条件路由
 
-阶段八已经在 `sync_context` 后增加结构化意图路由。Router 先识别请求属于哪类业务，再决定进入普通 ReAct、阶段七 Planner 或澄清节点；具体工具仍由后续节点选择：
+阶段八已经增加结构化意图路由，阶段九至十二又在此基础上接入并行查询、Supervisor 和知识 RAG。当前 `task_router` 位于 `memory_reasoner` 之后：它先识别请求属于哪类业务，再生成 `intent_route` 和 `delegated_agent`，具体工具仍由后续节点选择。
 
 ```text
 sync_context
   ↓
-intent_router
+memory_reasoner
+  ↓
+task_router
   ├── device_query       → 设备查询分支
   ├── device_control     → 设备控制分支
   ├── scene_control      → 场景分支
   ├── memory_management  → 记忆分支
+  ├── device_knowledge   → 设备知识 RAG 分支
   ├── general_chat       → 通用对话分支
   └── clarification      → 澄清分支
 ```
@@ -1416,6 +1470,7 @@ class IntentResult(BaseModel):
         "device_control",
         "scene_control",
         "memory_management",
+        "device_knowledge",
         "general_chat",
         "clarification",
     ]
@@ -1423,19 +1478,18 @@ class IntentResult(BaseModel):
     reason: str
 ```
 
-然后由条件边根据 `state["intent"]` 选择下一个节点：
+Router 的意图结果会进一步映射为图真正使用的执行路径。条件边依据 `state["intent_route"]` 选择下一个节点：
 
 ```python
 workflow.add_conditional_edges(
-    "intent_router",
-    route_by_intent,
+    "task_router",
+    route_task,
     {
-        "device_query": "device_query_agent",
-        "device_control": "device_control_agent",
-        "scene_control": "scene_agent",
-        "memory_management": "memory_agent",
-        "general_chat": "chat_agent",
-        "clarification": "clarification_node",
+        "planner": "planner",
+        "compact_context": "compact_context",
+        "device_query_subgraph": "device_query_subgraph",
+        "knowledge_rag": "knowledge_rag",
+        "clarification": "clarification",
     },
 )
 ```
@@ -1470,20 +1524,25 @@ workflow.add_conditional_edges(
 intent: str
 intent_confidence: float
 intent_reason: str
-intent_route: Literal["react", "planner", "clarification"]
+intent_route: Literal[
+    "react", "planner", "clarification", "parallel_query", "knowledge_rag"
+]
+delegated_agent: Literal["device", "scene", "memory", "knowledge", "chat"]
 ```
 
 正常运行时使用 `llm.with_structured_output(IntentResult)`。如果模型不支持结构化输出或调用异常，系统会回退到保守的关键词分类器，避免路由故障导致整个图不可用。低于 `ROUTING_CONFIDENCE_THRESHOLD`（默认 `0.6`）或明确分类为 `clarification` 的请求会直接询问用户补充设备、房间或动作，不会调用工具。
 
-阶段八没有为六种意图立即创建六套 Agent。当前业务映射是：
+阶段八最初没有为每种意图创建一套 Agent，后续阶段在保持路由与执行解耦的基础上逐步增加了稳定分支。当前业务映射是：
 
 ```text
 复杂多动作 device_control → Planner–Executor–Verifier
-低置信度 / clarification   → clarification_node
-其余已识别意图             → 现有 ReAct Agent
+多目标 device_query        → 设备查询子图与动态并行
+device_knowledge           → Agentic RAG 子图
+低置信度 / clarification   → clarification 节点
+其余已识别意图             → ReAct；启用多智能体时使用对应专用工具集
 ```
 
-这样先把“识别意图”和“执行工具”拆开，同时保留阶段六场景确认、阶段七规划循环和已有记忆工具。下一阶段再把稳定的业务流程封装成子图。
+这样既保留阶段六场景确认和阶段七规划循环，也让阶段九的子图、阶段十的 Supervisor 与阶段十二的 RAG 共用同一份结构化路由结果。
 
 路由器采用保守规则，只有检测到多个动作，并且涉及多种设备或明显连接词时才启用 Planner。这样可以避免所有请求都额外调用一次规划模型。
 
@@ -1566,7 +1625,7 @@ Planner 可以生成：
 - 每一步默认最多重试 1 次；
 - 整个任务默认最多重新规划 1 次；
 - 重新规划产生新计划后，需要再次经过用户确认；
-- 当前按顺序执行，阶段八再研究并行步骤。
+- Planner 中的有副作用控制步骤仍按顺序执行；阶段九的动态并行目前只用于相互独立、无副作用的多设备状态查询。
 
 配置项位于 `.env`：
 
@@ -1633,9 +1692,9 @@ Planner 根据反馈生成修订版计划，`plan_revision` 加一，并再次�
 
 目前 Reflection 主要体现在确定性的状态验证和失败反馈中。对于“环境是否舒适”“观影氛围是否合适”这类主观目标，后续可以再增加模型型 Verifier，但不应替代当前可验证设备状态检查。
 
-#### 6.5.5 Evaluator–Optimizer：生成后评分并改进
+#### 6.5.5 Evaluator–Optimizer：生成后评分并改进（扩展方向）
 
-Verifier 主要判断操作是否成功，Evaluator–Optimizer 更适合评价计划或最终回答的质量。例如场景计划生成后，可以在执行前检查：
+当前项目尚未增加独立的生成质量优化循环。Verifier 主要判断操作是否成功，Evaluator–Optimizer 更适合评价计划或最终回答的质量。例如场景计划生成后，可以在执行前检查：
 
 - 是否覆盖了用户提出的全部目标；
 - 是否选择了正确的房间和设备；
@@ -1943,7 +2002,7 @@ rag_device_model: str | None
 
 #### 6.5.13 推荐的进阶学习顺序
 
-这些方向不建议一次全部加入当前图。可以按照对 LangGraph 核心能力的依赖关系分阶段学习：
+下面阶段六至十二的能力目前都已进入项目，但学习时仍不建议一次全部展开。可以按照它们对 LangGraph 核心能力的依赖关系分阶段理解：
 
 ```text
 阶段六：人在回路与可恢复执行（已实现）
@@ -1968,10 +2027,7 @@ rag_device_model: str | None
   知识检索、来源路由、执行轨迹比较
 ```
 
-这里的阶段编号是学习路线编号，不等同于仓库中的历史迭代编号。当前项目已经完成：
-
-- 阶段六：Human-in-the-loop（对应 6.5.1）；
-- 阶段七：Planner–Executor，以及确定性的 Verifier、重试和重新规划（对应 6.5.3 和 6.5.4）。
+这里的阶段编号是教程中的 Agent 学习路线编号，不等同于 `docs/iterations/` 文件名前缀。章节对应关系为：阶段六对应 6.5.1；阶段七对应 6.5.3 和 6.5.4；阶段八至十二依次对应 6.5.2、6.5.6–6.5.7、6.5.8、6.5.9–6.5.11 和 6.5.12。6.5.5 的独立 Evaluator–Optimizer 循环仍是扩展方向。
 
 阶段六至阶段十二均已完成。项目现在覆盖人在回路、规划验证、结构化路由、子图并行、Supervisor 多智能体、显式记忆推理、时间旅行、进度事件以及带来源的 Agentic RAG。下一步更适合从评测数据出发补齐薄弱场景，或进入 6.6 的家居领域 SFT、LoRA 与偏好优化路线，而不是继续无目标增加节点。
 
@@ -2607,24 +2663,24 @@ training/
 训练/验证/测试划分规则
 ```
 
-#### 6.6.22 推荐的实践阶段
+#### 6.6.22 推荐的模型训练步骤
 
-可以把模型训练路线安排为：
+为避免与阶段六至十二的 Agent 开发路线重名，模型训练使用步骤字母编号：
 
 ```text
-阶段十一：家居 SFT 数据集
+训练步骤 A：家居 SFT 数据集
   统一 Schema、人工种子、模板扩充、难例、独立评测集
         ↓
-阶段十二：LoRA/QLoRA 监督微调
+训练步骤 B：LoRA/QLoRA 监督微调
   工具调用、参数生成、澄清、结果总结、对照评测
         ↓
-阶段十三：偏好优化
+训练步骤 C：偏好优化
   chosen/rejected、安全偏好、DPO、困难负例
         ↓
-阶段十四：模拟环境强化学习
+训练步骤 D：模拟环境强化学习
   环境随机化、可验证奖励、轨迹采样、奖励投机分析
         ↓
-阶段十五：Agent 联合评测
+训练步骤 E：Agent 联合评测
   基础模型、SFT、DPO、RL 模型在同一 LangGraph 中比较
 ```
 
