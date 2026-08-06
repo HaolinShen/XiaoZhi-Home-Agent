@@ -235,6 +235,15 @@ python -m src.mcp.server --transport sse --port 8765
 }
 ```
 
+项目还内置了一个无需 API Key 的 Open-Meteo 天气 MCP。`.env.example` 默认通过当前 Python 环境启动它：
+
+```dotenv
+EXTERNAL_MCP_SERVERS=[{"name":"weather","transport":"stdio","command":"python","args":["-m","src.mcp.weather_server"]}]
+WEATHER_DEFAULT_LOCATION=杭州
+```
+
+启动主 Agent 后可以询问“杭州今天天气怎么样”或“北京未来三天天气如何”。天气 MCP 只提供实时天气和预报查询，不拥有任何设备控制权限。
+
 ---
 
 ## 📁 项目结构
@@ -319,6 +328,8 @@ langgraph/
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 | `MCP_SERVER_ENABLED` | `true` | 是否内置启动 MCP 服务器 |
 | `MCP_SERVER_PORT` | `8765` | MCP SSE 模式端口 |
+| `EXTERNAL_MCP_SERVERS` | 天气 MCP 配置 | 启动时发现并加载外部 MCP 工具 |
+| `WEATHER_DEFAULT_LOCATION` | 空 | 天气查询未提供城市时使用的默认城市 |
 | `CHECKPOINT_DB_PATH` | `data/checkpoints.db` | 记忆持久化路径（留空=内存模式） |
 | `ENABLE_LONG_TERM_MEMORY` | `true` | 是否启用结构化长期记忆 |
 | `CHECKPOINT_LONG_TERM_DB_PATH` | `data/memories.db` | 长期记忆 SQLite 路径 |

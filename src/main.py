@@ -47,6 +47,7 @@ from loguru import logger
 from src.config import get_settings, Settings
 from src.devices import DeviceRegistry, SimulatorBackend
 from src.tools import set_registry as set_tools_registry
+from src.mcp import load_external_tools
 from src.agent import (
     AgentContext,
     SessionManager,
@@ -355,7 +356,8 @@ def chat(
     # ---- 构建 Agent 图 ----
     console.print("[dim]正在初始化 Agent...[/dim]")
     try:
-        graph = build_graph(registry, settings, space_directory)
+        external_tools = load_external_tools(settings.external_mcp_servers)
+        graph = build_graph(registry, settings, space_directory, external_tools=external_tools)
         sessions = SessionManager(
             space_directory,
             graph.checkpointer,
@@ -392,7 +394,8 @@ def chat(
         "[bold]打开客厅灯[/bold] / "
         "[bold]空调调到25度[/bold] / "
         "[bold]我要睡觉了[/bold] / "
-        "[bold]现在家里什么状态?[/bold]"
+        "[bold]现在家里什么状态?[/bold] / "
+        "[bold]杭州今天天气怎么样?[/bold]"
     )
     console.print("[dim]输入 /help 查看更多用法，/quit 退出[/dim]")
 

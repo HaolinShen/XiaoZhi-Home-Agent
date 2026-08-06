@@ -1,260 +1,205 @@
-"""
-MCP 客户端
-==========
-连接外部 MCP 服务，将其工具集成到智能家居 Agent 中。
+"""External MCP client adapters for LangChain/LangGraph.
 
-这是"消费侧"的 MCP 集成。通过连接外部 MCP 服务（如天气、日历、新闻等），
-Agent 的能力可以从"家居控制"扩展到"生活助理"。
-
-工作流程:
-  1. 读取配置中的外部 MCP 服务列表
-  2. 为每个服务建立 MCP 连接
-  3. 列出服务提供的工具
-  4. 将 MCP 工具转换为 LangChain Tool
-  5. 合并到 Agent 的工具列表中
-
-支持的传输方式:
-  - stdio: 启动子进程，通过标准输入/输出通信
-  - sse:   通过 HTTP SSE 连接到远程服务
-
-配置方式 (.env 文件):
-  EXTERNAL_MCP_SERVERS=
-    {"name":"weather","transport":"stdio","command":"python","args":["weather_server.py"]},
-    {"name":"calendar","transport":"sse","url":"http://localhost:8766/sse"}
-
-注意:
-  - MCP 客户端是异步的，需要 asyncio 事件循环
-  - 如果外部服务不可用，Agent 会优雅降级（仅使用内置工具）
+The project CLI is synchronous, while the MCP Python SDK is asynchronous.
+This module discovers MCP tools during startup and creates LangChain tools
+that support both synchronous and asynchronous invocation. Each invocation
+opens a short-lived MCP session, which keeps stdio subprocess lifecycle
+management predictable and avoids leaking event-loop resources.
 """
 
-import json
+from __future__ import annotations
+
 import asyncio
-from typing import Optional
-from loguru import logger
+import json
+import re
+import sys
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Optional
 
 from langchain_core.tools import StructuredTool
+from loguru import logger
+from pydantic import BaseModel, Field, create_model
 
 
-# ============================================================
-# 外部 MCP 服务配置模型
-# ============================================================
-
+@dataclass(slots=True)
 class ExternalMCPService:
-    """
-    单个外部 MCP 服务的连接配置。
+    """Connection settings for one external MCP server."""
 
-    stdio 模式示例:
-      ExternalMCPService(
-          name="weather",
-          transport="stdio",
-          command="python",
-          args=["weather_mcp_server.py"],
-      )
+    name: str = "unknown"
+    transport: str = "stdio"
+    command: Optional[str] = None
+    args: list[str] = field(default_factory=list)
+    url: Optional[str] = None
+    cwd: Optional[str] = None
+    env: Optional[dict[str, str]] = None
 
-    sse 模式示例:
-      ExternalMCPService(
-          name="calendar",
-          transport="sse",
-          url="http://localhost:8766/sse",
-      )
-    """
-    name: str
-    transport: str  # "stdio" 或 "sse"
-    command: Optional[str] = None     # stdio 模式: 启动命令
-    args: Optional[list[str]] = None  # stdio 模式: 命令行参数
-    url: Optional[str] = None         # sse 模式: 服务 URL
-
-    def __init__(self, **kwargs):
-        self.name = kwargs.get("name", "unknown")
-        self.transport = kwargs.get("transport", "stdio")
-        self.command = kwargs.get("command")
-        self.args = kwargs.get("args", [])
-        self.url = kwargs.get("url")
-
-
-# ============================================================
-# MCP 客户端管理
-# ============================================================
-
-class MCPClientManager:
-    """
-    管理多个外部 MCP 服务的连接和工具发现。
-
-    使用方式:
-      manager = MCPClientManager()
-      await manager.connect_all(services_config)
-      external_tools = await manager.list_all_tools()
-      # 将这些工具合并到 Agent 的工具列表中
-    """
-
-    def __init__(self):
-        self._sessions: dict[str, any] = {}  # name -> ClientSession
-        self._tools: list = []
-
-    async def connect_all(self, services: list[ExternalMCPService]) -> int:
-        """
-        连接到所有配置的外部 MCP 服务。
-
-        参数:
-          services: 外部 MCP 服务列表
-
-        返回:
-          成功连接的服务数量
-        """
-        from mcp.client.stdio import stdio_client
-        from mcp.client.sse import sse_client
-        from mcp import ClientSession
-
-        connected = 0
-
-        for service in services:
-            try:
-                logger.info(f"连接外部 MCP 服务 | name={service.name} | transport={service.transport}")
-
-                if service.transport == "stdio":
-                    # stdio 模式: 启动子进程
-                    transport = stdio_client(
-                        command=service.command,
-                        args=service.args or [],
-                    )
-                elif service.transport == "sse":
-                    # SSE 模式: 连接 HTTP 端点
-                    transport = sse_client(service.url)
-                else:
-                    logger.warning(f"不支持的传输模式: {service.transport}")
-                    continue
-
-                # 建立 MCP 会话
-                session = await ClientSession(transport)
-                await session.initialize()
-                self._sessions[service.name] = session
-                connected += 1
-
-                # 列出该服务提供的工具
-                tools_result = await session.list_tools()
-                logger.info(
-                    f"MCP 服务已连接 | name={service.name} | "
-                    f"工具数={len(tools_result.tools)}"
-                )
-
-            except Exception as e:
-                logger.warning(
-                    f"MCP 服务连接失败 | name={service.name} | error={e}"
-                )
-
-        logger.info(f"MCP 客户端: {connected}/{len(services)} 个服务连接成功")
-        return connected
-
-    async def list_all_tools(self) -> list:
-        """
-        获取所有外部 MCP 服务提供的工具列表。
-
-        返回:
-          LangChain 兼容的工具列表（可合并到 Agent 的工具中）
-        """
-        tools = []
-
-        for name, session in self._sessions.items():
-            try:
-                mcp_tools = await session.list_tools()
-                for mcp_tool in mcp_tools.tools:
-                    # 将 MCP 工具包装为 LangChain StructuredTool
-                    langchain_tool = self._convert_to_langchain_tool(
-                        name, session, mcp_tool
-                    )
-                    tools.append(langchain_tool)
-            except Exception as e:
-                logger.warning(f"获取工具列表失败 | service={name} | error={e}")
-
-        self._tools = tools
-        logger.info(f"共发现 {len(tools)} 个外部 MCP 工具")
-        return tools
-
-    def _convert_to_langchain_tool(
-        self, service_name: str, session, mcp_tool
-    ) -> StructuredTool:
-        """
-        将 MCP 工具转换为 LangChain 可用的 StructuredTool。
-
-        这是桥梁代码 —— 让 MCP 工具在 LangChain/LangGraph 生态中无缝工作。
-        """
-        async def _call_tool(**kwargs) -> str:
-            """实际调用远程 MCP 工具"""
-            result = await session.call_tool(mcp_tool.name, kwargs)
-            return str(result.content[0].text) if result.content else str(result)
-
-        return StructuredTool(
-            name=f"{service_name}__{mcp_tool.name}",
-            description=mcp_tool.description or f"来自 {service_name} 的外部工具",
-            coroutine=_call_tool,  # type: ignore[arg-type]
-        )
-
-    async def close_all(self):
-        """关闭所有 MCP 连接"""
-        for name, session in self._sessions.items():
-            try:
-                await session.close()
-                logger.debug(f"MCP 会话已关闭 | name={name}")
-            except Exception:
-                pass
-        self._sessions.clear()
-
-
-# ============================================================
-# 工具函数: 解析配置并连接
-# ============================================================
 
 def parse_services_config(config_str: str) -> list[ExternalMCPService]:
-    """
-    解析 .env 中的外部 MCP 服务配置。
-
-    参数:
-      config_str: JSON 格式的服务配置字符串
-                 多个服务用逗号分隔
-
-    返回:
-      ExternalMCPService 列表
-
-    示例输入:
-      '{"name":"weather","transport":"stdio","command":"python","args":["w.py"]}'
-    """
+    """Parse one JSON object or a JSON array from ``EXTERNAL_MCP_SERVERS``."""
     if not config_str or not config_str.strip():
         return []
-
-    services = []
-    # 支持多个配置（逗号分隔的 JSON 对象）
-    # 先尝试整体解析，再尝试分段解析
     try:
         data = json.loads(config_str)
-        if isinstance(data, list):
-            for item in data:
-                services.append(ExternalMCPService(**item))
-        else:
-            services.append(ExternalMCPService(**data))
-    except json.JSONDecodeError:
-        logger.warning(f"外部 MCP 服务配置解析失败: {config_str[:100]}...")
+    except json.JSONDecodeError as exc:
+        logger.warning(f"外部 MCP 服务配置解析失败: {exc}")
+        return []
 
+    items = data if isinstance(data, list) else [data]
+    services: list[ExternalMCPService] = []
+    for item in items:
+        if not isinstance(item, dict):
+            logger.warning("外部 MCP 服务配置项必须是 JSON 对象")
+            continue
+        try:
+            service = ExternalMCPService(**item)
+        except TypeError as exc:
+            logger.warning(f"外部 MCP 服务配置字段无效: {exc}")
+            continue
+        if service.transport == "stdio" and not service.command:
+            logger.warning(f"stdio MCP 服务缺少 command | name={service.name}")
+            continue
+        if service.transport in {"sse", "streamable_http"} and not service.url:
+            logger.warning(f"远程 MCP 服务缺少 url | name={service.name}")
+            continue
+        services.append(service)
     return services
 
 
-async def connect_external_tools(config_str: str) -> list:
-    """
-    一站式函数: 解析配置 → 连接服务 → 返回外部工具列表。
+@asynccontextmanager
+async def _open_session(service: ExternalMCPService) -> AsyncIterator[Any]:
+    """Open and initialize an MCP session for any supported transport."""
+    from mcp import ClientSession
 
-    这是 main.py 调用的便捷入口。
+    if service.transport == "stdio":
+        from mcp.client.stdio import StdioServerParameters, stdio_client
 
-    参数:
-      config_str: .env 中的 EXTERNAL_MCP_SERVERS 值
+        command = service.command or "python"
+        if command in {"python", "python3", "{python}"}:
+            command = sys.executable
+        parameters = StdioServerParameters(
+            command=command,
+            args=service.args,
+            env=service.env,
+            cwd=service.cwd,
+            encoding="utf-8",
+            encoding_error_handler="replace",
+        )
+        async with stdio_client(parameters) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                yield session
+        return
 
-    返回:
-      LangChain 兼容的外部工具列表
-    """
+    if service.transport == "sse":
+        from mcp.client.sse import sse_client
+
+        async with sse_client(service.url or "") as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                yield session
+        return
+
+    if service.transport == "streamable_http":
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async with streamablehttp_client(service.url or "") as streams:
+            read_stream, write_stream = streams[0], streams[1]
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                yield session
+        return
+
+    raise ValueError(f"不支持的 MCP 传输模式: {service.transport}")
+
+
+def _python_type(schema: dict[str, Any]) -> type:
+    schema_type = schema.get("type", "string")
+    return {
+        "string": str,
+        "integer": int,
+        "number": float,
+        "boolean": bool,
+        "array": list,
+        "object": dict,
+    }.get(schema_type, Any)
+
+
+def _args_model(service_name: str, tool_name: str, schema: dict[str, Any]) -> type[BaseModel]:
+    """Convert the common subset of MCP JSON Schema into a Pydantic model."""
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    fields: dict[str, tuple[Any, Any]] = {}
+    for name, property_schema in properties.items():
+        python_type = _python_type(property_schema)
+        description = property_schema.get("description", "")
+        if name in required:
+            fields[name] = (python_type, Field(..., description=description))
+        else:
+            default = property_schema.get("default", None)
+            fields[name] = (Optional[python_type], Field(default, description=description))
+
+    model_name = re.sub(r"\W+", "_", f"{service_name}_{tool_name}_Input")
+    return create_model(model_name, **fields)
+
+
+def _format_result(result: Any) -> str:
+    texts = [getattr(block, "text", "") for block in getattr(result, "content", [])]
+    text = "\n".join(item for item in texts if item)
+    if getattr(result, "isError", False):
+        return f"MCP 工具调用失败：{text or result}"
+    return text or str(result)
+
+
+async def _call_remote_tool(
+    service: ExternalMCPService, tool_name: str, arguments: dict[str, Any]
+) -> str:
+    async with _open_session(service) as session:
+        result = await session.call_tool(tool_name, arguments)
+        return _format_result(result)
+
+
+def _build_langchain_tool(service: ExternalMCPService, mcp_tool: Any) -> StructuredTool:
+    args_schema = _args_model(service.name, mcp_tool.name, mcp_tool.inputSchema)
+
+    async def call_async(**kwargs: Any) -> str:
+        return await _call_remote_tool(service, mcp_tool.name, kwargs)
+
+    def call_sync(**kwargs: Any) -> str:
+        return asyncio.run(call_async(**kwargs))
+
+    return StructuredTool.from_function(
+        func=call_sync,
+        coroutine=call_async,
+        name=f"{service.name}__{mcp_tool.name}",
+        description=mcp_tool.description or f"来自 {service.name} 的外部 MCP 工具",
+        args_schema=args_schema,
+    )
+
+
+async def _discover_service_tools(service: ExternalMCPService) -> list[StructuredTool]:
+    async with _open_session(service) as session:
+        result = await session.list_tools()
+        return [_build_langchain_tool(service, tool) for tool in result.tools]
+
+
+async def connect_external_tools(config_str: str) -> list[StructuredTool]:
+    """Discover configured MCP tools without keeping sessions open."""
+    tools: list[StructuredTool] = []
     services = parse_services_config(config_str)
-    if not services:
+    for service in services:
+        try:
+            discovered = await _discover_service_tools(service)
+            tools.extend(discovered)
+            logger.info(f"MCP 服务已连接 | name={service.name} | 工具数={len(discovered)}")
+        except Exception as exc:
+            logger.warning(f"MCP 服务连接失败 | name={service.name} | error={exc}")
+    return tools
+
+
+def load_external_tools(config_str: str) -> list[StructuredTool]:
+    """Synchronous startup helper used by the Typer CLI."""
+    if not config_str or not config_str.strip():
         logger.info("未配置外部 MCP 服务，仅使用内置工具")
         return []
-
-    manager = MCPClientManager()
-    await manager.connect_all(services)
-    tools = await manager.list_all_tools()
-    return tools
+    return asyncio.run(connect_external_tools(config_str))

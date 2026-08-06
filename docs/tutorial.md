@@ -180,7 +180,8 @@ langgraph/
 │   ├── mcp/                  # MCP 层
 │   │   ├── __init__.py
 │   │   ├── server.py         # MCP 服务器 (暴露工具给外部 AI)
-│   │   └── client.py         # MCP 客户端 (消费外部 MCP 服务)
+│   │   ├── client.py         # MCP 客户端 (消费外部 MCP 服务)
+│   │   └── weather_server.py  # Open-Meteo 天气 MCP（无需 API Key）
 │   │
 │   ├── memory/               # 记忆层
 │   │   ├── __init__.py
@@ -216,7 +217,8 @@ langgraph/
 │   ├── test_phase_nine.py    # 子图与动态并行测试
 │   ├── test_phase_ten.py     # Supervisor 多智能体测试
 │   ├── test_phase_eleven.py  # 记忆推理、时间旅行与事件测试
-│   └── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
+│   ├── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
+│   └── test_weather_mcp.py   # 天气 MCP 发现、调用与结果格式测试
 │
 ├── docs/                     # 文档
 │   ├── tutorial.md           # 本教程
@@ -593,12 +595,22 @@ python -m src.mcp.server --transport sse --port 8765
 # }
 ```
 
-**MCP Client** (`mcp/client.py`): 消费外部 MCP 服务（天气、日历等）
+**MCP Client** (`mcp/client.py`): 启动时发现外部 MCP 工具，并将其转换为 LangChain 工具交给 Agent。当前项目附带一个基于 Open-Meteo 的天气 MCP：
 
 ```python
-# .env 中配置
-EXTERNAL_MCP_SERVERS={"name":"weather","transport":"stdio","command":"python","args":["weather_mcp.py"]}
+# .env.example 已提供此配置；python 会自动使用当前解释器
+EXTERNAL_MCP_SERVERS=[{"name":"weather","transport":"stdio","command":"python","args":["-m","src.mcp.weather_server"]}]
+WEATHER_DEFAULT_LOCATION=杭州
 ```
+
+启动后可直接询问：
+
+```text
+杭州现在天气怎么样？
+北京未来三天天气如何？
+```
+
+天气 MCP 提供 `weather__current_weather` 和 `weather__weather_forecast` 两个只读工具，数据来自 Open-Meteo，不需要天气服务 API Key。网络不可用时工具会返回可解释的暂时不可用信息，不会伪造天气结果。
 
 ---
 
@@ -692,7 +704,7 @@ python -m pytest -q
 python -m pytest -q tests/test_phase_twelve.py
 ```
 
-当前测试覆盖阶段一至阶段十二，共 68 个测试。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
+当前共 72 个测试，覆盖阶段一至阶段十二以及天气 MCP。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
 
 | 测试文件 | 主要验证内容 |
 | --- | --- |
@@ -708,8 +720,9 @@ python -m pytest -q tests/test_phase_twelve.py
 | `test_phase_ten.py` | Supervisor 委派、专用 Agent 能力边界和工具隔离 |
 | `test_phase_eleven.py` | 显式记忆决策、Checkpoint 时间旅行和自定义进度事件 |
 | `test_phase_twelve.py` | Agentic RAG 型号过滤、引用、拒答和轨迹评测指标 |
+| `test_weather_mcp.py` | 天气 MCP 配置解析、stdio 工具发现、同步调用和天气结果格式 |
 
-测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 68 是阶段十二提交时的基线。
+测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 72 是天气 MCP 接入后的基线。
 
 ---
 
@@ -2724,16 +2737,18 @@ training/
 
 配置后，Claude Desktop 会自动发现 6 个智能家居工具。
 
-### 7.3 连接外部 MCP 服务
+### 7.3 配置本项目附带的天气 MCP
 
-在 `.env` 中配置：
+复制 `.env.example` 后，保留或填写：
 
 ```ini
-# 连接天气 MCP 服务
-EXTERNAL_MCP_SERVERS={"name":"weather","transport":"stdio","command":"python","args":["weather_mcp.py"]}
+EXTERNAL_MCP_SERVERS=[{"name":"weather","transport":"stdio","command":"python","args":["-m","src.mcp.weather_server"]}]
+WEATHER_DEFAULT_LOCATION=杭州
 ```
 
-Agent 会自动发现外部工具并在对话中使用。
+运行 `python -m src.main` 时，Agent 会自动发现天气工具并把它们加入普通聊天 Agent。设备控制、场景、记忆和知识 RAG Agent 不会获得天气工具，避免职责混用。
+
+如果要接入其他天气、日历或新闻 MCP，只需将 `EXTERNAL_MCP_SERVERS` 改成 JSON 数组；支持 `stdio`、`sse` 和 `streamable_http` 三种传输方式。外部服务连接失败会记录 warning，主 Agent 仍可使用内置能力。
 
 ---
 

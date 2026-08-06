@@ -16,7 +16,7 @@ LangGraph Agent 工作流
   4. 支持升级为 SqliteSaver 实现持久化记忆
 """
 
-from typing import Literal
+from typing import Literal, Sequence
 from loguru import logger
 
 from langgraph.graph import StateGraph, END
@@ -91,6 +91,7 @@ def build_graph(
     registry: DeviceRegistry,
     settings: Settings,
     space_directory: SpaceDirectory | None = None,
+    external_tools: Sequence | None = None,
 ) -> StateGraph:
     """
     构建 LangGraph Agent 工作流图。
@@ -113,7 +114,8 @@ def build_graph(
     llm = build_llm(settings)
 
     # ---- 第 2 步: 获取工具列表并绑定到 LLM ----
-    tools = get_all_tools()
+    external_tools = list(external_tools or [])
+    tools = [*get_all_tools(), *external_tools]
     tools_by_name = {tool.name: tool for tool in tools}
     llm_with_tools = llm.bind_tools(tools)
     device_tool_names = {
@@ -130,12 +132,21 @@ def build_graph(
         "scene": llm.bind_tools([tool for tool in tools if tool.name in scene_tool_names]),
         "memory": llm.bind_tools([tool for tool in tools if tool.name in memory_tool_names]),
         "knowledge": llm,
-        "chat": llm,
+        "chat": llm.bind_tools(external_tools) if external_tools else llm,
     }
     logger.info(f"已绑定 {len(tools)} 个工具到 LLM")
 
     # ---- 第 3 步: 生成系统提示词 ----
     system_prompt = build_system_prompt(registry)
+    if external_tools:
+        external_descriptions = "\n".join(
+            f"- {tool.name}: {tool.description}" for tool in external_tools
+        )
+        system_prompt += (
+            "\n\n## 外部 MCP 工具\n"
+            "以下工具用于天气等只读生活信息查询。需要实时信息时应调用工具，"
+            "不要依据模型记忆猜测：\n" + external_descriptions
+        )
     memory_service = None
     memory_repository = None
     if settings.memory.enable_long_term:
