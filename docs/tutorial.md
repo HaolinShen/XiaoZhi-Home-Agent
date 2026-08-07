@@ -314,9 +314,9 @@ print(light.to_status_text())
 
 **Registry Pattern** — 设备查找和操作的中心枢纽：
 
-#### `devices` 目录中的类关系
+#### 4.3.1 先看整体：五层分别解决什么问题
 
-设备模块可以按“模型 → 后端 → 注册中心 → 工具”的方向理解：
+设备模块可以按“模型 → 后端 → 注册中心 → 工具 → Agent”的方向理解。每层只解决一种问题：
 
 ```
 models.py
@@ -324,7 +324,8 @@ models.py
        ├─ LightDevice
        ├─ ACDevice
        ├─ TVDevice
-       └─ CurtainDevice
+       ├─ CurtainDevice
+       └─ HumidifierDevice
               │  (AnyDevice 联合类型)
               ▼
 DeviceBackend (抽象接口)
@@ -337,13 +338,231 @@ DeviceRegistry (查找、筛选、更新、状态摘要)
 tools/devices.py 的 @tool 函数
   └─ control_light / control_ac / control_tv / control_curtain / control_humidifier
      get_device_status
+              │
+              ▼
+LangGraph Agent / ToolNode（决定调用哪个工具并组织最终回复）
 ```
 
-- **设备模型**（`BaseDevice` 及五个子类）只描述设备数据和状态文本。`device_id` 是程序内部的稳定标识，`name` 是用户输入时使用的中文名称，`device_type` 用 `DeviceType` 枚举区分类型。
-- **`DeviceBackend`** 是抽象协议，统一定义 `get`、`get_all`、`get_by_type`、`update` 和 `get_status_summary`。上层不依赖具体存储方式。
-- **`SimulatorBackend`** 实现该协议，用 `_devices: dict[str, AnyDevice]` 保存设备。更新时合并旧状态并通过 Pydantic `model_validate(...)` 重新验证；进程重启后状态恢复为默认值。
-- **`DeviceRegistry`** 持有一个 backend，负责精确 ID 查找、按类型筛选、中文名称模糊匹配，并把更新和状态查询委托给 backend。它是工具层与具体设备后端之间的唯一入口。
-- **工具层** 在启动时由 `main.py` 调用 `set_registry(registry)` 注入同一个注册中心。工具先用 `registry.find()` 找设备，再用 `registry.update()` 修改状态，因此工具和 Agent 不需要知道设备存在哪里。
+可以先用一句话记住各层：
+
+| 层 | 回答的问题 | 不负责什么 |
+| --- | --- | --- |
+| 设备模型 | “一台设备有哪些字段，字段是否合法？” | 不保存全部设备，不连接硬件 |
+| Backend | “设备状态实际保存在哪里，怎样读取和写入？” | 不理解用户自然语言 |
+| Registry | “上层怎样用统一入口查找和操作设备？” | 不决定用户想调用哪个工具 |
+| Tool | “一个明确动作怎样转换为设备操作？” | 不负责任务路由和多轮推理 |
+| Agent / LangGraph | “用户想做什么，应该调用哪个工具？” | 不直接操作 `_devices` 或真实硬件 |
+
+这种拆分的核心目的，是避免把“理解用户”“寻找设备”“保存状态”“连接硬件”全部写在一个函数里。
+
+#### 4.3.2 第一层：设备模型是数据契约
+
+`BaseDevice` 和各个子类位于 `src/models.py`。模型描述的是“一台设备现在长什么样”，例如所有设备都有：
+
+```python
+device_id: str       # 程序内部稳定 ID，例如 living_room_humidifier
+name: str            # 用户可读名称，例如 客厅加湿器
+device_type: DeviceType
+power: bool
+location: str
+```
+
+具体设备再增加自己的字段：
+
+```text
+LightDevice       → brightness、color
+ACDevice          → temperature、mode、fan_speed
+TVDevice          → volume、muted、channel
+CurtainDevice     → position
+HumidifierDevice  → target_humidity、mist_level、water_level
+```
+
+这里最重要的是“数据契约”四个字。Pydantic 会在创建或重新验证对象时保证字段满足约束，例如加湿器目标湿度只能是 30–80%。`to_status_text()` 则负责把结构化状态转换为适合用户或 LLM 阅读的文字。
+
+设备模型本身不保存家庭中的全部设备，也不知道 Home Assistant、MQTT 或米家平台。下面的代码只是在内存中创建一个普通 Python 对象：
+
+```python
+device = HumidifierDevice(
+    device_id="living_room_humidifier",
+    name="客厅加湿器",
+    location="客厅",
+    target_humidity=60,
+    water_level=100,
+)
+```
+
+`AnyDevice` 是联合类型：
+
+```python
+AnyDevice = Union[
+    LightDevice,
+    ACDevice,
+    TVDevice,
+    CurtainDevice,
+    HumidifierDevice,
+]
+```
+
+它主要帮助类型检查器表达“这个位置可以存放任意一种受支持设备”，并不是一个可以直接实例化的新设备类。
+
+#### 4.3.3 第二层：Backend 决定状态保存在哪里
+
+`DeviceBackend` 是抽象接口，也可以理解为设备存储和控制协议。它规定所有后端都必须提供相同的方法：
+
+```python
+class DeviceBackend(ABC):
+    def get(self, device_id: str) -> Optional[AnyDevice]: ...
+    def get_all(self) -> dict[str, AnyDevice]: ...
+    def get_by_type(self, device_type: DeviceType) -> dict[str, AnyDevice]: ...
+    def update(self, device_id: str, **kwargs) -> bool: ...
+    def get_status_summary(self) -> str: ...
+```
+
+抽象接口只说明“必须能做什么”，不规定“具体怎样做”。当前的 `SimulatorBackend` 使用：
+
+```python
+self._devices: dict[str, AnyDevice]
+```
+
+保存九台模拟设备，因此：
+
+- `get()` 是从字典按 ID 读取；
+- `get_by_type()` 是按 `device_type` 过滤；
+- `update()` 是合并旧状态，重新经过 Pydantic 验证，再替换字典中的对象；
+- `get_status_summary()` 是按灯光、空调、电视、窗帘和加湿器分组生成状态文本。
+
+模拟器只存在于当前 Python 进程中。程序退出后状态会恢复默认值。如果以后接入 Home Assistant，可以实现：
+
+```python
+class HomeAssistantBackend(DeviceBackend):
+    def get(self, device_id):
+        # 调用 Home Assistant API
+        ...
+
+    def update(self, device_id, **kwargs):
+        # 向 Home Assistant 发送真实控制请求
+        ...
+```
+
+只要新后端遵守同一组方法，上层代码就不需要关心状态来自字典、数据库还是实际硬件。
+
+#### 4.3.4 第三层：Registry 是稳定的业务入口
+
+`DeviceRegistry` 容易被误解成“设备数据库”，但它自己并不保存设备字典。它只持有一个 Backend：
+
+```python
+class DeviceRegistry:
+    def __init__(self, backend: DeviceBackend):
+        self._backend = backend
+```
+
+Registry 的作用类似门面（Facade）：把底层 Backend 的能力整理成上层更容易使用的接口。
+
+它提供两类查找方式：
+
+```python
+# 精确 ID 查找：代码已经知道稳定 ID
+registry.get("living_room_humidifier")
+
+# 面向用户表达的查找：名称可能不完全一致
+registry.find("客厅的加湿器", DeviceType.HUMIDIFIER)
+```
+
+`find()` 当前会依次尝试：
+
+1. 中文设备名精确匹配；
+2. 名称字符匹配；
+3. “灯”“空调”“加湿器”等类型关键词匹配；
+4. 如果同类型设备存在多个且无法确定房间，返回 `None`，让 Agent 澄清而不是随便选择。
+
+Registry 的更新方法本身不修改字典，而是继续委托 Backend：
+
+```python
+def update(self, device_id: str, **kwargs) -> bool:
+    return self._backend.update(device_id, **kwargs)
+```
+
+这样做看似多了一层，实际上提供了稳定边界。以后可以在 Registry 中统一增加权限检查、设备能力判断、审计日志或名称解析，而不需要修改每个工具。
+
+#### 4.3.5 第四层：Tool 把明确动作翻译成 Registry 操作
+
+工具层位于 `src/tools/devices.py`。工具不是存储层，也不是设备对象；它是 LLM 可以调用的业务函数。例如：
+
+```python
+@tool
+def control_humidifier(
+    device_name: str,
+    action: str,
+    target_humidity: int = 60,
+    mist_level: str = "auto",
+) -> str:
+    registry = _get_registry()
+    device = registry.find(device_name, DeviceType.HUMIDIFIER)
+    if device is None:
+        return "❌ 找不到指定的加湿器设备"
+
+    if action == "set_humidity":
+        registry.update(
+            device.device_id,
+            target_humidity=target_humidity,
+            power=True,
+        )
+        return f"✅ {device.name}目标湿度已设置"
+```
+
+工具主要负责：
+
+- 定义 LLM 可见的参数 Schema；
+- 将 `device_name` 定位为稳定 `device_id`；
+- 校验 `action` 是否支持；
+- 做必要的业务保护，例如水箱为空时禁止开启加湿器；
+- 调用 Registry；
+- 返回可以成为 `ToolMessage` 的执行结果。
+
+工具不应该直接写 `_devices[device_id]`，否则它会与 `SimulatorBackend` 强绑定，未来换成真实平台时所有工具都要重写。
+
+#### 4.3.6 第五层：Agent 决定使用哪个工具
+
+Agent 并不会直接调用 `registry.update()`。构图时，工具通过 `llm.bind_tools(...)` 暴露给模型；模型根据用户请求生成结构化 `tool_calls`，再由 LangGraph 的 `ToolNode` 执行对应工具。
+
+这意味着各层的输入逐渐从模糊变得明确：
+
+```text
+用户自然语言：“把客厅加湿器湿度设为 65%”
+        ↓ Agent / LLM
+结构化工具调用：control_humidifier(
+    device_name="客厅加湿器",
+    action="set_humidity",
+    target_humidity=65,
+)
+        ↓ Tool
+稳定设备操作：registry.update(
+    "living_room_humidifier",
+    target_humidity=65,
+    power=True,
+)
+        ↓ Backend
+保存或发送真实设备状态
+```
+
+#### 4.3.7 完整示例：“打开客厅加湿器”发生了什么
+
+一次控制请求会经过下面的步骤：
+
+1. 用户消息进入 LangGraph；
+2. `task_router` 将它识别为 `device_control`；
+3. Device Agent 得到设备控制工具列表；
+4. LLM 产生 `control_humidifier(device_name="客厅加湿器", action="on")`；
+5. `ToolNode` 调用 `control_humidifier`；
+6. 工具通过 `_get_registry()` 得到启动时注入的 Registry；
+7. `registry.find()` 委托 Backend 获取加湿器候选并完成名称匹配；
+8. 工具检查水箱是否为空；
+9. `registry.update()` 将更新委托给 `SimulatorBackend`；
+10. Backend 重新验证 `HumidifierDevice` 并替换内存状态；
+11. 工具返回“加湿器已开启”；
+12. 结果作为 `ToolMessage` 回到 Agent，Agent 再生成最终自然语言回复。
+
+对应调用链可以压缩为：
 
 运行时调用链如下：
 
@@ -354,6 +573,19 @@ tools/devices.py 的 @tool 函数
          → 工具返回文本 → Agent 生成最终回复
 ```
 
+查询请求也遵循同一边界，只是不修改状态：
+
+```text
+“查看所有设备状态”
+  → get_device_status
+  → registry.get_status_summary()
+  → backend.get_status_summary()
+  → 每台设备.to_status_text()
+  → 返回分组后的状态报告
+```
+
+#### 4.3.8 启动时为什么要注入 Registry
+
 启动时的组装代码位于 `main.py`：
 
 ```python
@@ -362,7 +594,11 @@ registry = DeviceRegistry(backend)
 set_tools_registry(registry)       # 所有设备工具共享此实例
 ```
 
-因此，替换真实设备平台时只需实现新的 `DeviceBackend` 子类，并在启动入口替换 backend；设备模型、注册中心、工具层和 Agent 的调用方式保持不变。
+这叫依赖注入：工具没有在模块导入时偷偷创建另一个模拟器，而是由启动入口明确告诉工具“本次运行使用这个 Registry”。因此 CLI、测试和 MCP Server 都可以传入不同实例，并控制它们是否共享状态。
+
+如果每个工具各自创建一个 `SimulatorBackend()`，就会出现“打开灯使用一个字典，查询状态却读取另一个字典”的问题。共享同一个 Registry 可以保证所有工具看到的是同一份设备状态。
+
+#### 4.3.9 可以直接使用 Registry 做什么
 
 ```python
 from src.devices import DeviceRegistry, SimulatorBackend
@@ -385,8 +621,31 @@ registry.update("living_room_light", power=True, brightness=70)
 print(registry.get_status_summary())
 ```
 
-**依赖倒置**: `DeviceBackend` 是抽象接口，`SimulatorBackend` 是内存实现。  
-后续对接 Home Assistant 只需创建 `HomeAssistantBackend(DeviceBackend)`，工具层和 Agent 零修改。
+#### 4.3.10 常见误解
+
+**Registry 是数据库吗？**
+
+不是。Registry 是访问入口；当前真正保存状态的是 `SimulatorBackend._devices`。如果换成真实平台，状态可能保存在 Home Assistant 中。
+
+**设备模型会控制真实硬件吗？**
+
+不会。模型只保存和验证数据。真实硬件调用应该由 Backend 实现。
+
+**为什么工具不直接调用 Home Assistant？**
+
+如果工具直接依赖某个平台，就无法复用于模拟器和其他 IoT 平台。工具依赖 Registry，Registry 再依赖抽象 Backend，替换成本更低。
+
+**为什么查找需要同时传名称和设备类型？**
+
+设备类型可以缩小候选范围，避免“客厅设备”“打开一下”等模糊文字错误匹配到另一类设备。
+
+**为什么更新要返回 `bool`？**
+
+Backend 可能遇到设备不存在、字段不合法、设备离线或平台请求失败。布尔结果让 Registry 和工具有机会把失败转换为明确的业务反馈。
+
+**依赖倒置是什么意思？**
+
+高层的工具和 Agent 依赖 `DeviceBackend` 这套抽象能力，而不是依赖 `SimulatorBackend` 的内存字典。后续对接 Home Assistant 时，只需创建 `HomeAssistantBackend(DeviceBackend)` 并在启动入口替换 Backend；工具调用方式和 Agent 图可以保持不变。
 
 ### 4.4 工具层 (`tools/`)
 
