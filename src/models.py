@@ -53,6 +53,7 @@ class DeviceType(str, Enum):
     AC = "ac"             # 空调设备 (Air Conditioner)
     TV = "tv"             # 电视设备
     CURTAIN = "curtain"   # 窗帘设备
+    HUMIDIFIER = "humidifier"  # 加湿器
 
     # ═══════════════════════════════════════════════════════
     # @property 是什么意思？
@@ -94,6 +95,7 @@ class DeviceType(str, Enum):
             "ac": "空调",
             "tv": "电视",
             "curtain": "窗帘",
+            "humidifier": "加湿器",
         }
         # dict.get(key, default) 的安全之处：
         #   如果 key 存在 → 返回对应的中文名
@@ -366,7 +368,30 @@ class CurtainDevice(BaseDevice):
         return f"{self.name} ({self.device_id}): {pos_text}"
 
 
+class HumidifierDevice(BaseDevice):
+    """
+    加湿器设备模型。
+
+    属性:
+      target_humidity: 目标湿度 30-80%
+      mist_level: 雾量档位，自动、低、中、高
+      water_level: 水箱余量 0-100%
+    """
+    device_type: DeviceType = Field(default=DeviceType.HUMIDIFIER, frozen=True)
+    target_humidity: int = Field(default=60, ge=30, le=80, description="目标湿度 30-80%")
+    mist_level: FanSpeed = Field(default=FanSpeed.AUTO, description="雾量档位")
+    water_level: int = Field(default=60, ge=0, le=100, description="水箱余量 0-100%")
+
+    def to_status_text(self) -> str:
+        status = "🟢 开启" if self.power else "🔴 关闭"
+        return (
+            f"{self.name} ({self.device_id}): {status} | "
+            f"目标湿度: {self.target_humidity}% | "
+            f"雾量: {self.mist_level.label_cn} | 水箱: {self.water_level}%"
+        )
+
+
 # ============================================================
 # 类型别名（方便联合类型使用）
 # ============================================================
-AnyDevice = Union[LightDevice, ACDevice, TVDevice, CurtainDevice]
+AnyDevice = Union[LightDevice, ACDevice, TVDevice, CurtainDevice, HumidifierDevice]

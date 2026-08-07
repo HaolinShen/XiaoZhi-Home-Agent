@@ -34,6 +34,7 @@ from ..models import (
     CurtainDevice,
     ACMode,
     FanSpeed,
+    HumidifierDevice,
 )
 
 
@@ -72,9 +73,11 @@ class SimulatorBackend(DeviceBackend):
         if device is None:
             return False
 
-        # 使用 Pydantic 的 model_copy + update 确保类型验证
+        # 合并旧状态后重新构造模型，确保所有字段约束仍然生效。
         try:
-            updated = device.model_copy(update=kwargs)
+            data = device.model_dump()
+            data.update(kwargs)
+            updated = type(device).model_validate(data)
             self._devices[device_id] = updated
             logger.debug(f"设备已更新 | {device_id}: {kwargs}")
             return True
@@ -91,6 +94,7 @@ class SimulatorBackend(DeviceBackend):
             (DeviceType.AC, "❄️ 空调"),
             (DeviceType.TV, "📺 电视"),
             (DeviceType.CURTAIN, "🪟 窗帘"),
+            (DeviceType.HUMIDIFIER, "💧 加湿器"),
         ]
 
         for dev_type, label in type_order:
@@ -170,6 +174,16 @@ class SimulatorBackend(DeviceBackend):
                 name="卧室窗帘",
                 location="卧室",
                 position=0,
+            ),
+
+            # ===== 加湿器 =====
+            HumidifierDevice(
+                device_id="living_room_humidifier",
+                name="客厅加湿器",
+                location="客厅",
+                target_humidity=60,
+                mist_level=FanSpeed.AUTO,
+                water_level=100,
             ),
         ]
 

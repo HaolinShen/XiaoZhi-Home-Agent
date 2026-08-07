@@ -42,7 +42,11 @@ class PhaseNineSubgraphParallelTests(unittest.TestCase):
 
     def test_target_extraction_and_parallel_decision(self):
         targets = extract_query_targets("查询客厅和卧室的设备状态", self.registry)
-        self.assertEqual(targets, ["living_room_light", "bedroom_light", "living_room_ac", "bedroom_ac", "living_room_tv", "living_room_curtain", "bedroom_curtain"])
+        self.assertEqual(targets, [
+            "living_room_light", "bedroom_light", "living_room_ac", "bedroom_ac",
+            "living_room_tv", "living_room_curtain", "bedroom_curtain",
+            "living_room_humidifier",
+        ])
         self.assertTrue(should_use_parallel_query("查询客厅和卧室的设备状态", self.registry))
         self.assertFalse(should_use_parallel_query("查询客厅灯状态", self.registry))
 

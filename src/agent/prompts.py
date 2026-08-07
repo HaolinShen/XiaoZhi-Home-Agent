@@ -47,6 +47,7 @@ def build_system_prompt(registry: DeviceRegistry) -> str:
 | control_ac | 控制空调（开关/温度/模式/风速） | "空调设到25度"、"换成制热" |
 | control_tv | 控制电视（开关/音量/输入源/静音） | "打开电视"、"静音" |
 | control_curtain | 控制窗帘（开/关/位置） | "打开窗帘"、"窗帘关一半" |
+| control_humidifier | 控制加湿器（开关/目标湿度/雾量） | "打开加湿器"、"湿度设为60%" |
 | activate_scene | 激活场景模式（一键控制多设备） | "我要睡觉了"→睡眠模式 |
 | list_scenes | 列出所有可用场景 | "有哪些场景?" |
 | get_device_status | 查看设备状态 | "现在家里什么状态?" |

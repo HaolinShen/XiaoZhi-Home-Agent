@@ -158,6 +158,7 @@ class DeviceRegistry:
             DeviceType.AC: ["空调", "冷气", "暖气", "制冷", "制热"],
             DeviceType.TV: ["电视", "电视机"],
             DeviceType.CURTAIN: ["窗帘", "帘", "遮阳"],
+            DeviceType.HUMIDIFIER: ["加湿器", "加湿", "雾化器"],
         }
         keywords = keywords_map.get(device_type, [])
         for kw in keywords:

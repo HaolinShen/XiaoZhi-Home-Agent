@@ -5,6 +5,7 @@ from .devices import (
     control_ac,
     control_tv,
     control_curtain,
+    control_humidifier,
     get_device_status,
     set_registry as set_device_tools_registry,
 )
@@ -40,6 +41,7 @@ def get_all_tools() -> list:
         control_ac,
         control_tv,
         control_curtain,
+        control_humidifier,
         activate_scene,
         list_scenes,
         get_device_status,
@@ -62,6 +64,7 @@ __all__ = [
     "control_ac",
     "control_tv",
     "control_curtain",
+    "control_humidifier",
     "activate_scene",
     "list_scenes",
     "get_device_status",

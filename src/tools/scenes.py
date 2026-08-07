@@ -50,7 +50,7 @@ SCENE_META = {
         "emoji": "🏠",
     },
     "离家模式": {
-        "description": "关闭所有灯光、空调、电视，关闭所有窗帘，确保安全节能",
+        "description": "关闭所有灯光、空调、电视和加湿器，关闭所有窗帘，确保安全节能",
         "emoji": "👋",
     },
     "睡眠模式": {
@@ -119,13 +119,18 @@ def activate_scene(scene_name: str) -> str:
     elif scene_name == "离家模式":
         all_devices = registry.get_all()
         for dev_id, dev in all_devices.items():
-            if dev.device_type in (DeviceType.LIGHT, DeviceType.AC, DeviceType.TV):
+            if dev.device_type in (
+                DeviceType.LIGHT,
+                DeviceType.AC,
+                DeviceType.TV,
+                DeviceType.HUMIDIFIER,
+            ):
                 registry.update(dev_id, power=False)
             elif dev.device_type == DeviceType.CURTAIN:
                 registry.update(dev_id, position=0)
         results = [
             "✅ 已激活「👋 离家模式」",
-            "  · 所有灯光、空调、电视已关闭",
+            "  · 所有灯光、空调、电视和加湿器已关闭",
             "  · 所有窗帘已关闭",
             "👋 再见，所有设备已安全关闭！",
         ]
@@ -140,6 +145,8 @@ def activate_scene(scene_name: str) -> str:
                 registry.update(dev_id, power=False)
             elif dev.device_type == DeviceType.TV:
                 registry.update(dev_id, power=False)
+            elif dev.device_type == DeviceType.HUMIDIFIER:
+                registry.update(dev_id, power=False)
             elif dev.device_type == DeviceType.CURTAIN:
                 registry.update(dev_id, position=0)
         # 卧室空调特殊设置
@@ -147,7 +154,7 @@ def activate_scene(scene_name: str) -> str:
         registry.update("living_room_ac", power=False)
         results = [
             "✅ 已激活「🌙 睡眠模式」",
-            "  · 所有灯光和电视已关闭",
+            "  · 所有灯光、电视和加湿器已关闭",
             "  · 所有窗帘已关闭",
             "  · 卧室空调已设为 26°C 低风速制冷",
             "  · 客厅空调已关闭",

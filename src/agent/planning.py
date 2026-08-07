@@ -16,6 +16,7 @@ PLANNING_TOOL_NAMES = (
     "control_ac",
     "control_tv",
     "control_curtain",
+    "control_humidifier",
 )
 
 
@@ -25,7 +26,8 @@ class PlanStep(BaseModel):
     step_id: int = Field(ge=1)
     description: str = Field(min_length=1)
     tool_name: Literal[
-        "control_light", "control_ac", "control_tv", "control_curtain"
+        "control_light", "control_ac", "control_tv", "control_curtain",
+        "control_humidifier",
     ]
     arguments: dict[str, Any]
 
@@ -77,7 +79,7 @@ def should_use_planner(text: str) -> bool:
     )
     action_count = sum(len(re.findall(pattern, normalized)) for pattern in action_patterns)
     device_kinds = sum(
-        1 for keyword in ("灯", "空调", "电视", "窗帘") if keyword in normalized
+        1 for keyword in ("灯", "空调", "电视", "窗帘", "加湿器") if keyword in normalized
     )
     connectors = any(
         connector in normalized
@@ -142,6 +144,7 @@ def expected_state_for_step(
         "control_ac": DeviceType.AC,
         "control_tv": DeviceType.TV,
         "control_curtain": DeviceType.CURTAIN,
+        "control_humidifier": DeviceType.HUMIDIFIER,
     }
     device_type = mapping.get(tool_name)
     if device_type is None:
@@ -193,7 +196,7 @@ def expected_state_for_step(
             expected = {"power": True, "channel": args.get("channel", "HDMI 1")}
         else:
             return device.device_id, {}, f"unsupported action: {action}"
-    else:
+    elif tool_name == "control_curtain":
         if action == "open":
             expected = {"position": 100}
         elif action == "close":
@@ -202,6 +205,22 @@ def expected_state_for_step(
             expected = {"position": max(0, min(100, int(args.get("percentage", 100))))}
         else:
             return device.device_id, {}, f"unsupported action: {action}"
+    elif tool_name == "control_humidifier":
+        if action == "on":
+            expected = {"power": True}
+        elif action == "off":
+            expected = {"power": False}
+        elif action == "set_humidity":
+            expected = {
+                "power": True,
+                "target_humidity": max(30, min(80, int(args.get("target_humidity", 60)))),
+            }
+        elif action == "set_mist_level":
+            expected = {"power": True, "mist_level": args.get("mist_level", "auto")}
+        else:
+            return device.device_id, {}, f"unsupported action: {action}"
+    else:
+        return device.device_id, {}, f"unsupported tool: {tool_name}"
     return device.device_id, expected, None
 
 

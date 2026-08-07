@@ -358,6 +358,75 @@ def control_curtain(
 
 
 # ============================================================
+# 加湿器控制工具
+# ============================================================
+
+@tool
+def control_humidifier(
+    device_name: str,
+    action: str,
+    target_humidity: int = 60,
+    mist_level: str = "auto",
+    config: RunnableConfig = None,
+) -> str:
+    """控制加湿器的开关、目标湿度和雾量档位。
+
+    参数:
+        device_name: 设备名称，如“客厅加湿器”
+        action: on / off / set_humidity / set_mist_level
+        target_humidity: 目标湿度 30-80%，仅 set_humidity 时使用
+        mist_level: auto / low / mid / high，仅 set_mist_level 时使用
+    """
+    registry = _get_registry()
+    device = registry.find(device_name, DeviceType.HUMIDIFIER)
+    if device is None:
+        return "❌ 找不到指定的加湿器设备。当前可用的加湿器有: 客厅加湿器。"
+
+    if action in {"on", "set_humidity", "set_mist_level"} and device.water_level <= 0:
+        return f"❌ {device.name}水箱已空，请加水后再开启。"
+
+    if action == "on":
+        registry.update(device.device_id, power=True)
+        return (
+            f"✅ {device.name}已开启，目标湿度 {device.target_humidity}%，"
+            f"雾量{device.mist_level.label_cn}。"
+        )
+
+    if action == "off":
+        registry.update(device.device_id, power=False)
+        return f"✅ {device.name}已关闭。"
+
+    if action == "set_humidity":
+        target_humidity = max(30, min(80, target_humidity))
+        registry.update(device.device_id, target_humidity=target_humidity, power=True)
+        if config is not None:
+            record_preference_operation(
+                config,
+                device.device_id,
+                "humidifier.target_humidity",
+                {"target_humidity": target_humidity},
+            )
+        return f"✅ {device.name}目标湿度已设为 {target_humidity}%。"
+
+    if action == "set_mist_level":
+        valid_levels = {"auto", "low", "mid", "high"}
+        if mist_level not in valid_levels:
+            return "❌ 无效的雾量档位。支持: auto(自动), low(低), mid(中), high(高)"
+        registry.update(device.device_id, mist_level=mist_level, power=True)
+        if config is not None:
+            record_preference_operation(
+                config,
+                device.device_id,
+                "humidifier.mist_level",
+                {"mist_level": mist_level},
+            )
+        level_cn = {"auto": "自动", "low": "低", "mid": "中", "high": "高"}
+        return f"✅ {device.name}雾量已设为{level_cn[mist_level]}。"
+
+    return "❌ 不支持的操作。加湿器支持: on / off / set_humidity / set_mist_level"
+
+
+# ============================================================
 # 设备状态查询工具
 # ============================================================
 

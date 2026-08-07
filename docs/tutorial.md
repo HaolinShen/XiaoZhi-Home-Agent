@@ -30,7 +30,7 @@
 
 当前项目已经具备：
 
-- 灯光、空调、电视、窗帘等模拟设备控制；
+- 灯光、空调、电视、窗帘、加湿器等模拟设备控制；
 - 回家、离家、睡眠、观影、起床等多设备场景；
 - LangGraph ReAct 工具调用循环；
 - 基于 `thread_id` 的短期会话记忆；
@@ -218,7 +218,8 @@ langgraph/
 │   ├── test_phase_ten.py     # Supervisor 多智能体测试
 │   ├── test_phase_eleven.py  # 记忆推理、时间旅行与事件测试
 │   ├── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
-│   └── test_weather_mcp.py   # 天气 MCP 发现、调用与结果格式测试
+│   ├── test_weather_mcp.py   # 天气 MCP 发现、调用与结果格式测试
+│   └── test_humidifier.py    # 加湿器模型、工具、Planner 与状态测试
 │
 ├── docs/                     # 文档
 │   ├── tutorial.md           # 本教程
@@ -327,20 +328,20 @@ models.py
               │  (AnyDevice 联合类型)
               ▼
 DeviceBackend (抽象接口)
-  └─ SimulatorBackend (内存字典实现，创建 8 个默认设备)
+  └─ SimulatorBackend (内存字典实现，创建 9 个默认设备)
               │
               ▼
 DeviceRegistry (查找、筛选、更新、状态摘要)
               │
               ▼
 tools/devices.py 的 @tool 函数
-  └─ control_light / control_ac / control_tv / control_curtain
+  └─ control_light / control_ac / control_tv / control_curtain / control_humidifier
      get_device_status
 ```
 
-- **设备模型**（`BaseDevice` 及四个子类）只描述设备数据和状态文本。`device_id` 是程序内部的稳定标识，`name` 是用户输入时使用的中文名称，`device_type` 用 `DeviceType` 枚举区分类型。
+- **设备模型**（`BaseDevice` 及五个子类）只描述设备数据和状态文本。`device_id` 是程序内部的稳定标识，`name` 是用户输入时使用的中文名称，`device_type` 用 `DeviceType` 枚举区分类型。
 - **`DeviceBackend`** 是抽象协议，统一定义 `get`、`get_all`、`get_by_type`、`update` 和 `get_status_summary`。上层不依赖具体存储方式。
-- **`SimulatorBackend`** 实现该协议，用 `_devices: dict[str, AnyDevice]` 保存设备。更新时通过 Pydantic `model_copy(update=...)` 生成经过类型校验的新对象；进程重启后状态恢复为默认值。
+- **`SimulatorBackend`** 实现该协议，用 `_devices: dict[str, AnyDevice]` 保存设备。更新时合并旧状态并通过 Pydantic `model_validate(...)` 重新验证；进程重启后状态恢复为默认值。
 - **`DeviceRegistry`** 持有一个 backend，负责精确 ID 查找、按类型筛选、中文名称模糊匹配，并把更新和状态查询委托给 backend。它是工具层与具体设备后端之间的唯一入口。
 - **工具层** 在启动时由 `main.py` 调用 `set_registry(registry)` 注入同一个注册中心。工具先用 `registry.find()` 找设备，再用 `registry.update()` 修改状态，因此工具和 Agent 不需要知道设备存在哪里。
 
@@ -704,7 +705,7 @@ python -m pytest -q
 python -m pytest -q tests/test_phase_twelve.py
 ```
 
-当前共 72 个测试，覆盖阶段一至阶段十二以及天气 MCP。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
+当前共 78 个测试，覆盖阶段一至阶段十二、天气 MCP 和加湿器设备闭环。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
 
 | 测试文件 | 主要验证内容 |
 | --- | --- |
@@ -721,8 +722,9 @@ python -m pytest -q tests/test_phase_twelve.py
 | `test_phase_eleven.py` | 显式记忆决策、Checkpoint 时间旅行和自定义进度事件 |
 | `test_phase_twelve.py` | Agentic RAG 型号过滤、引用、拒答和轨迹评测指标 |
 | `test_weather_mcp.py` | 天气 MCP 配置解析、stdio 工具发现、同步调用和天气结果格式 |
+| `test_humidifier.py` | 加湿器字段约束、状态汇总、控制工具、空水箱保护、场景关闭和 Planner 预期状态 |
 
-测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 72 是天气 MCP 接入后的基线。
+测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 78 是加湿器完整接入后的基线。
 
 ---
 
@@ -730,15 +732,19 @@ python -m pytest -q tests/test_phase_twelve.py
 
 ### 6.1 添加新设备类型
 
-以 **加湿器 (Humidifier)** 为例：
+当前项目已经完整接入 **加湿器 (Humidifier)**。新增设备不能只定义 Pydantic 模型，还要贯通状态展示、工具、规划验证和 MCP。
 
 **第一步**: 在 `src/models.py` 中添加模型：
 
 ```python
 class HumidifierDevice(BaseDevice):
     device_type: DeviceType = Field(default=DeviceType.HUMIDIFIER, frozen=True)
-    humidity_target: int = Field(default=60, ge=30, le=90)
+    target_humidity: int = Field(default=60, ge=30, le=80)
+    mist_level: FanSpeed = Field(default=FanSpeed.AUTO)
     water_level: int = Field(default=100, ge=0, le=100)
+
+    def to_status_text(self) -> str:
+        ...
 
 # 在 DeviceType 枚举中添加
 class DeviceType(str, Enum):
@@ -753,6 +759,9 @@ HumidifierDevice(
     device_id="living_room_humidifier",
     name="客厅加湿器",
     location="客厅",
+    target_humidity=60,
+    mist_level=FanSpeed.AUTO,
+    water_level=100,
 ),
 ```
 
@@ -760,12 +769,21 @@ HumidifierDevice(
 
 ```python
 @tool
-def control_humidifier(device_name: str, action: str, humidity_target: int = 60) -> str:
-    """控制加湿器..."""
+def control_humidifier(
+    device_name: str,
+    action: str,
+    target_humidity: int = 60,
+    mist_level: str = "auto",
+) -> str:
+    """支持 on、off、set_humidity 和 set_mist_level。"""
     # 实现逻辑
 ```
 
-**第四步**: 在 `src/tools/__init__.py` 中注册。
+**第四步**: 在 `src/tools/__init__.py` 和 `agent/graph.py` 中注册，使普通 ReAct 与 Device Agent 都能获得工具。
+
+**第五步**: 如果允许复杂任务规划，还要把工具加入 `agent/planning.py`，并定义每个 action 对应的可验证期望状态。
+
+**第六步**: 在 `mcp/server.py` 暴露 MCP 工具，并用自动化测试验证状态变化，而不只是检查返回文字。
 
 ### 6.2 对接真实 IoT 平台
 
@@ -1584,7 +1602,8 @@ class PlanStep(BaseModel):
     step_id: int
     description: str
     tool_name: Literal[
-        "control_light", "control_ac", "control_tv", "control_curtain"
+        "control_light", "control_ac", "control_tv", "control_curtain",
+        "control_humidifier"
     ]
     arguments: dict
 
@@ -1601,7 +1620,7 @@ structured_planner = llm.with_structured_output(ExecutionPlan)
 plan = structured_planner.invoke(planner_prompt)
 ```
 
-模型只能生成计划，不能在 Planner 节点中执行工具。工具名也被限制为四个原子设备工具，不允许在自定义计划中嵌套 `activate_scene`。
+模型只能生成计划，不能在 Planner 节点中执行工具。工具名也被限制为五个原子设备工具，不允许在自定义计划中嵌套 `activate_scene`。
 
 `AgentState` 已增加：
 
@@ -2735,7 +2754,7 @@ training/
 }
 ```
 
-配置后，Claude Desktop 会自动发现 6 个智能家居工具。
+配置后，Claude Desktop 会自动发现 7 个智能家居工具，其中包括加湿器控制。
 
 ### 7.3 配置本项目附带的天气 MCP
 

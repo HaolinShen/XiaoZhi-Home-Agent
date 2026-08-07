@@ -119,7 +119,8 @@ def build_graph(
     tools_by_name = {tool.name: tool for tool in tools}
     llm_with_tools = llm.bind_tools(tools)
     device_tool_names = {
-        "control_light", "control_ac", "control_tv", "control_curtain", "get_device_status"
+        "control_light", "control_ac", "control_tv", "control_curtain",
+        "control_humidifier", "get_device_status",
     }
     scene_tool_names = {"activate_scene", "list_scenes"}
     memory_tool_names = {

@@ -200,6 +200,45 @@ def create_mcp_server(
         return f"✅ {device.name}操作成功"
 
     @mcp.tool()
+    async def control_humidifier_mcp(
+        device_name: str,
+        action: str,
+        target_humidity: int = 60,
+        mist_level: str = "auto",
+    ) -> str:
+        """控制加湿器。支持开关、目标湿度和雾量档位。
+
+        :param device_name: 设备名称，如“客厅加湿器”
+        :param action: on, off, set_humidity, set_mist_level
+        :param target_humidity: 目标湿度 30-80%
+        :param mist_level: auto, low, mid, high
+        """
+        device = registry.find(device_name, DeviceType.HUMIDIFIER)
+        if device is None:
+            return f"❌ 找不到加湿器设备「{device_name}」"
+
+        if action in {"on", "set_humidity", "set_mist_level"} and device.water_level <= 0:
+            return f"❌ {device.name}水箱已空，请加水后再开启。"
+
+        if action == "on":
+            registry.update(device.device_id, power=True)
+        elif action == "off":
+            registry.update(device.device_id, power=False)
+        elif action == "set_humidity":
+            registry.update(
+                device.device_id,
+                target_humidity=max(30, min(80, target_humidity)),
+                power=True,
+            )
+        elif action == "set_mist_level":
+            if mist_level not in {"auto", "low", "mid", "high"}:
+                return f"❌ 无效的雾量档位: {mist_level}"
+            registry.update(device.device_id, mist_level=mist_level, power=True)
+        else:
+            return f"❌ 不支持的操作: {action}"
+        return f"✅ {device.name}操作成功"
+
+    @mcp.tool()
     async def get_device_status_mcp() -> str:
         """查询所有智能家居设备的当前状态"""
         return registry.get_status_summary()
@@ -214,7 +253,7 @@ def create_mcp_server(
         from ..tools.scenes import activate_scene as scene_fn
         return scene_fn.invoke({"name": "activate_scene", "arguments": {"scene_name": scene_name}})
 
-    logger.info(f"MCP 服务器已创建 | name={server_name} | 工具数=6")
+    logger.info(f"MCP 服务器已创建 | name={server_name} | 工具数=7")
     return mcp
 
 
