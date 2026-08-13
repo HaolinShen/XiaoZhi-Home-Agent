@@ -55,6 +55,14 @@ class DeviceType(str, Enum):
     CURTAIN = "curtain"   # 窗帘设备
     HUMIDIFIER = "humidifier"  # 加湿器
 
+    # ---- 只读传感器 ----
+    # 上面 5 种都是"执行器"：Agent 下命令、设备改状态。
+    # 下面 2 种是"传感器"：Agent 只能读，读到的是环境的真实反馈。
+    # 这个区别在工具层很重要——传感器没有 control_xxx 工具，
+    # 也不会出现在场景模式的批量开关里。
+    TEMP_HUMIDITY_SENSOR = "temp_humidity_sensor"  # 温湿度传感器
+    PRESENCE_SENSOR = "presence_sensor"            # 人体存在传感器
+
     # ═══════════════════════════════════════════════════════
     # @property 是什么意思？
     # ═══════════════════════════════════════════════════════
@@ -96,6 +104,8 @@ class DeviceType(str, Enum):
             "tv": "电视",
             "curtain": "窗帘",
             "humidifier": "加湿器",
+            "temp_humidity_sensor": "温湿度传感器",
+            "presence_sensor": "人体存在传感器",
         }
         # dict.get(key, default) 的安全之处：
         #   如果 key 存在 → 返回对应的中文名
@@ -392,6 +402,113 @@ class HumidifierDevice(BaseDevice):
 
 
 # ============================================================
+# 传感器模型（只读设备）
+# ============================================================
+#
+# 传感器和上面的执行器有一个本质区别：
+#
+#   执行器: Agent 说"开到 26 度" → 设备状态就是 26 度。
+#           验证时读回来必然是 26 度，本质上是"自证"。
+#   传感器: Agent 说不了话，只能读。读到的值来自环境，
+#           不受 Agent 控制，所以它才是真正的"外部反馈"。
+#
+# 这个区别决定了传感器在架构里的位置：
+#   · 没有 control_xxx 工具（改不了），只有 read_sensor（读得到）
+#   · 不进 PLANNING_TOOL_NAMES（计划步骤不能"执行"一次读取）
+#   · 不进场景模式的批量开关（离家模式不该"关掉"温湿度计）
+#   · power 字段在这里表示"传感器在线"，不是"开关"
+#
+# 有了传感器，Agent 才能从"你说什么我做什么"变成
+# "我先看看情况，再决定做什么、做到什么程度"。
+
+
+class TempHumiditySensor(BaseDevice):
+    """
+    温湿度传感器模型（只读）。
+
+    属性:
+      temperature: 实测温度 °C，允许小数
+      humidity:    实测相对湿度 0-100%
+      battery:     电量 0-100%
+    """
+    device_type: DeviceType = Field(
+        default=DeviceType.TEMP_HUMIDITY_SENSOR, frozen=True
+    )
+    power: bool = Field(default=True, description="传感器是否在线")
+    temperature: float = Field(
+        default=24.0, ge=-40.0, le=80.0, description="实测温度 °C"
+    )
+    humidity: int = Field(
+        default=50, ge=0, le=100, description="实测相对湿度 0-100%"
+    )
+    battery: int = Field(default=100, ge=0, le=100, description="电量 0-100%")
+
+    def to_status_text(self) -> str:
+        if not self.power:
+            return f"{self.name} ({self.device_id}): ⚠️ 离线"
+        return (
+            f"{self.name} ({self.device_id}): "
+            f"温度 {self.temperature:.1f}°C | 湿度 {self.humidity}% | "
+            f"电量 {self.battery}%"
+        )
+
+
+class PresenceSensor(BaseDevice):
+    """
+    人体存在传感器模型（只读）。
+
+    属性:
+      occupied:        当前是否检测到人
+      last_motion_at:  最近一次检测到活动的时间（ISO 8601 字符串，None 表示从未）
+      timeout_minutes: 多久没有活动就判定为无人
+      battery:         电量 0-100%
+
+    为什么要 timeout_minutes？
+      真实的人体传感器只能感知"活动"，不能感知"静止的人"。
+      业界做法是：检测到活动 → 置为有人；超过 N 分钟没有新活动 → 回落为无人。
+      模拟器按这个规则从 last_motion_at 推算 occupied，而不是随机生成，
+      这样测试可以通过设置 last_motion_at 精确控制传感器行为。
+    """
+    device_type: DeviceType = Field(
+        default=DeviceType.PRESENCE_SENSOR, frozen=True
+    )
+    power: bool = Field(default=True, description="传感器是否在线")
+    occupied: bool = Field(default=False, description="当前是否检测到人")
+    last_motion_at: Optional[str] = Field(
+        default=None, description="最近一次检测到活动的 ISO 8601 时间，None 表示从未"
+    )
+    timeout_minutes: int = Field(
+        default=15, ge=1, le=240, description="多久没有活动就判定为无人（分钟）"
+    )
+    battery: int = Field(default=100, ge=0, le=100, description="电量 0-100%")
+
+    def to_status_text(self) -> str:
+        if not self.power:
+            return f"{self.name} ({self.device_id}): ⚠️ 离线"
+        state = "🚶 有人" if self.occupied else "🕳️ 无人"
+        detail = f" | 最近活动 {self.last_motion_at}" if self.last_motion_at else ""
+        return (
+            f"{self.name} ({self.device_id}): {state}"
+            f"{detail} | 电量 {self.battery}%"
+        )
+
+
+# ============================================================
 # 类型别名（方便联合类型使用）
 # ============================================================
-AnyDevice = Union[LightDevice, ACDevice, TVDevice, CurtainDevice, HumidifierDevice]
+AnyDevice = Union[
+    LightDevice,
+    ACDevice,
+    TVDevice,
+    CurtainDevice,
+    HumidifierDevice,
+    TempHumiditySensor,
+    PresenceSensor,
+]
+
+# 只读传感器类型集合。工具层和场景层用它来判断"这台设备不能被控制"，
+# 避免每处都硬编码一遍类型列表。
+SENSOR_DEVICE_TYPES = frozenset({
+    DeviceType.TEMP_HUMIDITY_SENSOR,
+    DeviceType.PRESENCE_SENSOR,
+})

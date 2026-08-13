@@ -42,6 +42,11 @@ def should_use_parallel_query(query: str, registry: DeviceRegistry) -> bool:
 def build_device_query_subgraph(registry: DeviceRegistry):
     """Build a reusable subgraph: prepare → Send fan-out → aggregate."""
     def dispatch_node(state: QueryState):
+        # 这是一次显式的"看一眼环境"入口，和 get_device_status 同类，
+        # 所以在扇出之前推演一次，让传感器读数反映执行器的当前状态。
+        # 放在 dispatch 而不是 query_device 里，是为了保证一次查询只推演一次，
+        # 否则并行分支数量会直接改变读数。
+        registry.tick_environment()
         return {}
 
     def fan_out(state: QueryState):

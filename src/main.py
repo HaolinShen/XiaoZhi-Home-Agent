@@ -102,6 +102,7 @@ def _print_help() -> None:
     help_table.add_row("❄️ 空调", "打开客厅空调 / 空调调到25度 / 空调切到制热 / 风速调高")
     help_table.add_row("📺 电视", "打开电视 / 电视音量调到50 / 静音 / 切换到HDMI 2")
     help_table.add_row("🪟 窗帘", "打开窗帘 / 关上窗帘 / 窗帘打开一半")
+    help_table.add_row("🌡️ 传感器", "屋里多少度 / 客厅湿度怎么样 / 家里有人吗 / 有点干（会先读数再决定）")
     help_table.add_row("🎬 场景", "我回来了 / 我要睡了 / 看电影 / 起床了 / 我出门了")
     help_table.add_row("📊 状态", "现在家里什么状态? / 灯开着吗?")
 

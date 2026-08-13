@@ -120,9 +120,10 @@ def build_graph(
     llm_with_tools = llm.bind_tools(tools)
     device_tool_names = {
         "control_light", "control_ac", "control_tv", "control_curtain",
-        "control_humidifier", "get_device_status",
+        "control_humidifier", "read_sensor", "get_device_status",
     }
-    scene_tool_names = {"activate_scene", "list_scenes"}
+    # 场景分支也要能读传感器：离家模式前需要先确认家里没人。
+    scene_tool_names = {"activate_scene", "list_scenes", "read_sensor"}
     memory_tool_names = {
         "save_personal_memory", "save_home_rule", "list_personal_memories",
         "update_personal_memory", "delete_personal_memory", "list_preference_candidates",

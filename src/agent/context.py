@@ -145,5 +145,6 @@ def location_to_room_id(location: str) -> str:
         "客厅": "living_room",
         "卧室": "bedroom",
         "厨房": "kitchen",
+        "玄关": "entryway",
     }
     return aliases.get(location, location.strip().lower().replace(" ", "_"))

@@ -14,6 +14,11 @@
   2. 在 devices/simulator.py 中注册默认设备
   3. 在此文件中添加对应的 @tool 函数
   4. 在 get_all_tools() 中注册
+
+执行器 vs 传感器:
+  执行器（灯/空调/电视/窗帘/加湿器）→ control_xxx 工具，可读可写
+  传感器（温湿度/人体存在）        → read_sensor 工具，只读
+  传感器故意不做成 control_xxx，这样 LLM 从工具名就知道它改不了状态。
 """
 
 from typing import Optional
@@ -427,13 +432,91 @@ def control_humidifier(
 
 
 # ============================================================
+# 传感器读取工具（只读）
+# ============================================================
+#
+# 传感器只有"读"这一个动作，所以不做成 control_xxx，而是单独一个
+# read_sensor。这样 LLM 从工具名就能看出它改不了任何东西，
+# 也不会误以为可以"打开温湿度传感器"。
+
+@tool
+def read_sensor(sensor_type: str, location: str = "") -> str:
+    """
+    读取环境传感器的当前数值。控制设备前先用它了解实际情况。
+
+    使用场景:
+      "现在屋里多少度"          → sensor_type="temp_humidity"
+      "客厅湿度怎么样"          → sensor_type="temp_humidity", location="客厅"
+      "家里有人吗"              → sensor_type="presence"
+      "玄关有人经过吗"          → sensor_type="presence", location="玄关"
+
+    什么时候应该主动调用:
+      · 用户说"有点干"、"有点热"这类主观感受 → 先读数值再决定开什么、开多大
+      · 执行离家模式这类批量操作前 → 先确认家里没人
+      · 用户问"要不要开加湿器" → 先读湿度再给建议
+
+    参数:
+        sensor_type: 传感器类型:
+                     - "temp_humidity": 温湿度传感器（温度和湿度）
+                     - "presence": 人体存在传感器（有人/无人）
+        location: 可选房间名，如"客厅"、"卧室"、"玄关"。留空则返回该类型全部传感器
+
+    返回:
+        传感器读数的文本描述。传感器不存在时返回可用房间提示。
+    """
+    registry = _get_registry()
+
+    type_map = {
+        "temp_humidity": DeviceType.TEMP_HUMIDITY_SENSOR,
+        "presence": DeviceType.PRESENCE_SENSOR,
+    }
+    device_type = type_map.get(sensor_type)
+    if device_type is None:
+        return (
+            f"❌ 不支持的传感器类型「{sensor_type}」。"
+            f"支持: temp_humidity(温湿度), presence(人体存在)"
+        )
+
+    # 读取前推进一次环境推演，让读数反映执行器的当前状态。
+    # 只有"读环境"的入口才该这么做（这里、get_device_status、并行查询子图的
+    # dispatch）；控制和计划验证路径都不该触发它，否则同一次对话里读到的值
+    # 会随调用次数漂移。
+    registry.tick_environment()
+
+    sensors = registry.get_by_type(device_type)
+    if not sensors:
+        return f"❌ 家里没有安装{device_type.label_cn}。"
+
+    wanted = location.strip()
+    if wanted:
+        sensors = {
+            dev_id: dev for dev_id, dev in sensors.items()
+            if wanted in dev.location or wanted in dev.name
+        }
+        if not sensors:
+            available = "、".join(
+                dev.location or dev.name
+                for dev in registry.get_by_type(device_type).values()
+            )
+            return (
+                f"❌ 「{wanted}」没有{device_type.label_cn}。"
+                f"已安装的位置: {available}。"
+            )
+
+    logger.debug(f"读取传感器 | type={sensor_type} | location={location}")
+    lines = [f"📡 **{device_type.label_cn}读数:**"]
+    lines.extend(f"  · {dev.to_status_text()}" for dev in sensors.values())
+    return "\n".join(lines)
+
+
+# ============================================================
 # 设备状态查询工具
 # ============================================================
 
 @tool
 def get_device_status(query: str = "") -> str:
     """
-    查询所有智能家居设备的当前状态。
+    查询所有智能家居设备的当前状态（含传感器读数）。
 
     无需指定参数即可查看全部设备状态。
     也可以指定类型关键词来筛选，如"灯光"、"空调"。
@@ -446,5 +529,7 @@ def get_device_status(query: str = "") -> str:
     """
     registry = _get_registry()
     _ = query  # 保留参数给未来扩展（按类型筛选）
+    # 这是一次显式的"看一眼环境"，所以先推演传感器读数。
+    registry.tick_environment()
     logger.debug(f"查询设备状态 | query={query}")
     return registry.get_status_summary()

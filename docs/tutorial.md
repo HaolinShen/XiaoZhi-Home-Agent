@@ -31,6 +31,7 @@
 当前项目已经具备：
 
 - 灯光、空调、电视、窗帘、加湿器等模拟设备控制；
+- 温湿度与人体存在传感器（只读），读数会跟随执行器状态变化；
 - 回家、离家、睡眠、观影、起床等多设备场景；
 - LangGraph ReAct 工具调用循环；
 - 基于 `thread_id` 的短期会话记忆；
@@ -148,16 +149,16 @@ langgraph/
 ├── src/                      # ★ 源代码
 │   ├── __init__.py           # 包入口，版本声明
 │   ├── config.py             # pydantic-settings 配置管理
-│   ├── models.py             # Pydantic 设备数据模型
+│   ├── models.py             # Pydantic 设备数据模型（执行器 + 只读传感器）
 │   │
 │   ├── devices/              # 设备层
 │   │   ├── __init__.py
 │   │   ├── base.py           # 抽象后端接口 + 设备注册中心
-│   │   └── simulator.py      # 内存模拟器后端
+│   │   └── simulator.py      # 内存模拟器后端（含确定性环境推演）
 │   │
 │   ├── tools/                # 工具层
 │   │   ├── __init__.py       # 工具注册 & 导出
-│   │   ├── devices.py        # 设备控制工具 (control_light, ac, tv, curtain)
+│   │   ├── devices.py        # 设备控制工具 (control_light/ac/tv/curtain/humidifier) + read_sensor
 │   │   ├── scenes.py         # 场景模式工具 (activate_scene, list_scenes)
 │   │   └── memory.py         # 长期记忆管理工具
 │   │
@@ -205,7 +206,7 @@ langgraph/
 │   │
 │   └── main.py               # ★ CLI 主入口 (typer + rich)
 │
-├── tests/                    # 阶段一至阶段十二自动化测试
+├── tests/                    # 阶段一至阶段十二 + 设备扩展自动化测试
 │   ├── test_phase_one.py
 │   ├── test_phase_two.py
 │   ├── test_phase_three.py
@@ -219,7 +220,8 @@ langgraph/
 │   ├── test_phase_eleven.py  # 记忆推理、时间旅行与事件测试
 │   ├── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
 │   ├── test_weather_mcp.py   # 天气 MCP 发现、调用与结果格式测试
-│   └── test_humidifier.py    # 加湿器模型、工具、Planner 与状态测试
+│   ├── test_humidifier.py    # 加湿器模型、工具、Planner 与状态测试
+│   └── test_sensors.py       # 传感器模型、环境推演、read_sensor 与只读约束测试
 │
 ├── docs/                     # 文档
 │   ├── tutorial.md           # 本教程
@@ -310,6 +312,11 @@ print(light.to_status_text())
 4. 在 `tools/devices.py` 中创建 `control_humidifier` 工具
 5. 在 `tools/__init__.py` 中注册
 
+如果新增的是**只读传感器**，第 4 步不一样：不写 `control_xxx`，而是在
+`read_sensor` 的类型映射里加一项；同时要把新类型加进 `SENSOR_DEVICE_TYPES`，
+这样场景批量开关和规划器的工具白名单会自动把它排除在外。判断标准很简单——
+这台设备的状态是我们命令出来的，还是环境本来就是那样。前者是执行器，后者是传感器。
+
 ### 4.3 设备注册中心 (`devices/base.py`)
 
 **Registry Pattern** — 设备查找和操作的中心枢纽：
@@ -321,27 +328,33 @@ print(light.to_status_text())
 ```
 models.py
   └─ BaseDevice
-       ├─ LightDevice
-       ├─ ACDevice
-       ├─ TVDevice
-       ├─ CurtainDevice
-       └─ HumidifierDevice
+       ├─ LightDevice          ┐
+       ├─ ACDevice             │
+       ├─ TVDevice             ├─ 执行器：可读可写
+       ├─ CurtainDevice        │
+       ├─ HumidifierDevice     ┘
+       ├─ TempHumiditySensor   ┐
+       └─ PresenceSensor       ┘─ 传感器：只读
               │  (AnyDevice 联合类型)
               ▼
 DeviceBackend (抽象接口)
-  └─ SimulatorBackend (内存字典实现，创建 9 个默认设备)
+  └─ SimulatorBackend (内存字典实现，创建 13 个默认设备)
               │
               ▼
-DeviceRegistry (查找、筛选、更新、状态摘要)
+DeviceRegistry (查找、筛选、更新、状态摘要、环境推演)
               │
               ▼
 tools/devices.py 的 @tool 函数
   └─ control_light / control_ac / control_tv / control_curtain / control_humidifier
-     get_device_status
+     read_sensor / get_device_status
               │
               ▼
 LangGraph Agent / ToolNode（决定调用哪个工具并组织最终回复）
 ```
+
+注意工具名的不对称：五个执行器各有 `control_xxx`，两个传感器只有一个 `read_sensor`。
+这不是偷懒，而是让 LLM 从工具名就知道传感器改不了状态——它没有
+`control_temp_humidity_sensor` 可用，也就不会试图“打开温湿度传感器”。
 
 可以先用一句话记住各层：
 
@@ -370,12 +383,24 @@ location: str
 具体设备再增加自己的字段：
 
 ```text
-LightDevice       → brightness、color
-ACDevice          → temperature、mode、fan_speed
-TVDevice          → volume、muted、channel
-CurtainDevice     → position
-HumidifierDevice  → target_humidity、mist_level、water_level
+LightDevice        → brightness、color
+ACDevice           → temperature、mode、fan_speed
+TVDevice           → volume、muted、channel
+CurtainDevice      → position
+HumidifierDevice   → target_humidity、mist_level、water_level
+TempHumiditySensor → temperature、humidity、battery
+PresenceSensor     → occupied、last_motion_at、timeout_minutes、battery
 ```
+
+传感器这两行里的字段名值得多看一眼：它们记录的是**实测值**，
+而执行器的 `temperature` 记录的是**目标值**。`ACDevice.temperature=24` 表示
+“我要 24 度”，`TempHumiditySensor.temperature=27.0` 表示“现在实际 27 度”。
+两者不一致是正常状态，正是这个差值让空调有事可做、让验证器有东西可验。
+
+`PresenceSensor` 的 `occupied` 不是直接写入的，而是由 `last_motion_at` 加
+`timeout_minutes` 推算出来的。原因是真实人体传感器只能感知“活动”，感知不到
+静止不动的人，业界通用做法就是检测到活动置为有人、超过 N 分钟无新活动回落为无人。
+把规则写进模拟器而不是随机生成，测试就能靠写一个时间戳精确控制传感器行为。
 
 这里最重要的是“数据契约”四个字。Pydantic 会在创建或重新验证对象时保证字段满足约束，例如加湿器目标湿度只能是 30–80%。`to_status_text()` 则负责把结构化状态转换为适合用户或 LLM 阅读的文字。
 
@@ -400,10 +425,24 @@ AnyDevice = Union[
     TVDevice,
     CurtainDevice,
     HumidifierDevice,
+    TempHumiditySensor,
+    PresenceSensor,
 ]
 ```
 
 它主要帮助类型检查器表达“这个位置可以存放任意一种受支持设备”，并不是一个可以直接实例化的新设备类。
+
+同一个文件里还有一个 frozenset：
+
+```python
+SENSOR_DEVICE_TYPES = frozenset({
+    DeviceType.TEMP_HUMIDITY_SENSOR,
+    DeviceType.PRESENCE_SENSOR,
+})
+```
+
+“这台设备不能被控制”这个判断在提示词生成、场景执行等多处都要用到。
+集中定义一次，以后新增传感器只改这一处，不必去每个文件里补一遍类型列表。
 
 #### 4.3.3 第二层：Backend 决定状态保存在哪里
 
@@ -416,7 +455,17 @@ class DeviceBackend(ABC):
     def get_by_type(self, device_type: DeviceType) -> dict[str, AnyDevice]: ...
     def update(self, device_id: str, **kwargs) -> bool: ...
     def get_status_summary(self) -> str: ...
+
+    # 注意：这一个不是 @abstractmethod
+    def tick_environment(self) -> None:
+        return None
 ```
+
+前五个方法是 `@abstractmethod`，任何后端都必须实现。最后一个 `tick_environment()`
+是带默认空实现的普通方法，原因在“新增后端要不要被迫改代码”上：模拟器需要按执行器
+状态推算传感器读数，所以会覆盖它；而真实后端（Home Assistant / MQTT）的传感器由硬件
+自行上报，根本不需要推演，直接继承空实现即可。如果把它写成 `@abstractmethod`，
+以后每个新后端都要写一个毫无意义的 `pass`。
 
 抽象接口只说明“必须能做什么”，不规定“具体怎样做”。当前的 `SimulatorBackend` 使用：
 
@@ -424,12 +473,13 @@ class DeviceBackend(ABC):
 self._devices: dict[str, AnyDevice]
 ```
 
-保存九台模拟设备，因此：
+保存十三台模拟设备（九个执行器 + 四个传感器），因此：
 
 - `get()` 是从字典按 ID 读取；
 - `get_by_type()` 是按 `device_type` 过滤；
 - `update()` 是合并旧状态，重新经过 Pydantic 验证，再替换字典中的对象；
-- `get_status_summary()` 是按灯光、空调、电视、窗帘和加湿器分组生成状态文本。
+- `get_status_summary()` 是按灯光、空调、电视、窗帘、加湿器、温湿度和人体存在分组生成状态文本；
+- `tick_environment()` 按同房间执行器的状态推演一次传感器读数。
 
 模拟器只存在于当前 Python 进程中。程序退出后状态会恢复默认值。如果以后接入 Home Assistant，可以实现：
 
@@ -472,8 +522,14 @@ registry.find("客厅的加湿器", DeviceType.HUMIDIFIER)
 
 1. 中文设备名精确匹配；
 2. 名称字符匹配；
-3. “灯”“空调”“加湿器”等类型关键词匹配；
+3. “灯”“空调”“加湿器”“温湿度”“人体感应”等类型关键词匹配；
 4. 如果同类型设备存在多个且无法确定房间，返回 `None`，让 Agent 澄清而不是随便选择。
+
+策略 2 比看上去更宽松，值得留意：它检查的是“输入里的每个字都出现在设备名中”，
+所以 `find("湿度", TEMP_HUMIDITY_SENSOR)` 会命中`客厅温湿度传感器`——“湿”和“度”
+都在里面。这不算错，但也说明它不适合承担指标类问题的解析。
+`read_sensor` 因此完全不走 `find()`，改用 `get_by_type` + `location` 筛选：
+“客厅湿度多少”里的“湿度”问的是一个指标，不是某台设备的名字。
 
 Registry 的更新方法本身不修改字典，而是继续委托 Backend：
 
@@ -483,6 +539,70 @@ def update(self, device_id: str, **kwargs) -> bool:
 ```
 
 这样做看似多了一层，实际上提供了稳定边界。以后可以在 Registry 中统一增加权限检查、设备能力判断、审计日志或名称解析，而不需要修改每个工具。
+
+Registry 还额外承担两件和传感器相关的事。第一是把环境推演转发给 Backend：
+
+```python
+def tick_environment(self) -> None:
+    self._backend.tick_environment()
+```
+
+第二是在生成设备清单提示词时把执行器和传感器分成两组：
+
+```text
+可控制的设备列表:
+  · 客厅灯（ID: living_room_light，类型: light）
+  · 卧室灯（ID: bedroom_light，类型: light）
+  ...
+  · 客厅加湿器（ID: living_room_humidifier，类型: humidifier）
+只读传感器列表（只能读取，不能控制）:
+  · 客厅温湿度传感器（ID: living_room_th_sensor，类型: temp_humidity_sensor）
+  · 卧室温湿度传感器（ID: bedroom_th_sensor，类型: temp_humidity_sensor）
+  · 客厅人体传感器（ID: living_room_presence，类型: presence_sensor）
+  · 玄关人体传感器（ID: entryway_presence，类型: presence_sensor）
+```
+
+分组之前这些设备混在一张清单里，规划器会理所当然地给温湿度传感器排一步“打开”。
+清单里的一行字，比在提示词里反复叮嘱“不要控制传感器”有效得多——因为前者是模型
+读到的事实，后者只是一句要求。
+
+#### 4.3.4b 传感器读数为什么必须显式推演
+
+传感器接进来以后，模拟器面临一个新问题：读数什么时候更新？
+
+最省事的写法是在 `get()` / `get_all()` 里顺手推演一次，读的时候永远是最新值。
+这个项目**没有**这样做，因为 `get()` 和 `get_all()` 被场景执行、计划验证等路径
+大量调用。如果读取本身会改状态，“读一下看看”就变成了“读一下顺便改了”：
+验证器多读一次，环境值就多走一步，读到的数字取决于代码里调了几次 `get()`。
+这类 bug 极难复现，也极难解释。
+
+所以 `tick_environment()` 是一个显式的公开方法，只有三个“读环境”入口会调用它：
+
+| 入口 | 为什么它该推演 |
+| --- | --- |
+| `read_sensor` | 用户明确在问环境读数 |
+| `get_device_status` | 一次显式的“看一眼家里现在什么状态” |
+| 并行查询子图的 `dispatch` 节点 | 同上，且放在扇出**之前**——放进每个分支就会让并行度直接改变读数 |
+
+设备控制、场景激活、计划验证一律不调用它。这条规则有测试守着：反复调用
+`get_status_summary()`、`get()`、`get_all()` 之后，湿度必须仍然停在初始的 42%。
+
+推演逻辑本身是确定性的，没有任何随机数：
+
+```python
+_TEMP_STEP = 0.5         # °C，空调把室温朝目标拉近的速度
+_HUMIDITY_STEP = 2       # %，加湿器把湿度朝目标拉近的速度
+_DRY_DRIFT = 1           # %，没有加湿器工作时湿度自然回落的速度
+_BASELINE_HUMIDITY = 45  # %，无人工干预时房间的湿度基线
+```
+
+制冷把温度朝目标拉低、制热拉高、都不会越过目标；加湿器工作时湿度朝目标推进，
+不工作时朝 45% 基线回落。固定步长的代价是不够“真实”，换来的是测试可以断言
+精确值——`tick` 二十次之后湿度必须正好等于 60，而不是“大概接近 60”。
+
+几个边界情况也是刻意处理的：水箱空了不加湿、`power=False` 的传感器完全跳过、
+`last_motion_at` 格式非法时保留原状并打一条警告而不是抛异常。传感器离线时
+`to_status_text()` 只报“⚠️ 离线”，不报最后那个可能已经过期很久的数值。
 
 #### 4.3.5 第四层：Tool 把明确动作翻译成 Registry 操作
 
@@ -520,6 +640,39 @@ def control_humidifier(
 - 返回可以成为 `ToolMessage` 的执行结果。
 
 工具不应该直接写 `_devices[device_id]`，否则它会与 `SimulatorBackend` 强绑定，未来换成真实平台时所有工具都要重写。
+
+传感器的工具长得明显不一样。它不叫 `control_temp_humidity_sensor`，而是一个统一的
+`read_sensor`，两种传感器共用：
+
+```python
+@tool
+def read_sensor(sensor_type: str, location: str = "") -> str:
+    """读取环境传感器的当前数值。控制设备前先用它了解实际情况。"""
+    registry = _get_registry()
+    device_type = {
+        "temp_humidity": DeviceType.TEMP_HUMIDITY_SENSOR,
+        "presence": DeviceType.PRESENCE_SENSOR,
+    }.get(sensor_type)
+    if device_type is None:
+        return f"❌ 不支持的传感器类型「{sensor_type}」。支持: temp_humidity, presence"
+
+    registry.tick_environment()          # 读之前推演一次
+    sensors = registry.get_by_type(device_type)
+    ...
+```
+
+三点和 `control_xxx` 不同，都是有意的：
+
+- **没有 `action` 参数**：读取只有一个动作，多给一个参数就是多给一次出错机会；
+- **不走 `find()`**：按 `get_by_type` + `location` 筛选。“客厅湿度多少”里的“湿度”
+  问的是指标而不是某台设备，用名称模糊匹配去解析它是错的方向；
+- **参数错误也返回可用选项**：类型写成 `"co2"` 会得到一条列出两种合法类型的
+  ❌ 文本，房间写成“书房”会得到已安装传感器的房间列表。工具的错误返回是模型
+  的下一轮输入，把可选项写清楚，模型能自己纠正；只回一句“不支持”，它只能猜。
+
+docstring 里还专门写了“什么时候应该主动调用”：用户说“有点干”“有点热”这类主观
+感受时先读数、执行离家模式前先确认没人。这类提示放在工具的 docstring 里比放在
+系统提示词里更有效——它出现在模型正在挑工具的那一刻。
 
 #### 4.3.6 第五层：Agent 决定使用哪个工具
 
@@ -578,11 +731,27 @@ Agent 并不会直接调用 `registry.update()`。构图时，工具通过 `llm.
 ```text
 “查看所有设备状态”
   → get_device_status
+  → registry.tick_environment()        ← 显式推演一次传感器读数
   → registry.get_status_summary()
   → backend.get_status_summary()
   → 每台设备.to_status_text()
   → 返回分组后的状态报告
 ```
+
+还有一条闭环值得单独看，它是传感器存在的主要理由：
+
+```text
+“有点干”
+  → read_sensor(sensor_type="temp_humidity", location="客厅")   # 先看数据
+  → “温度 27.0°C，湿度 42%”
+  → control_humidifier(device_name="客厅加湿器", action="set_humidity",
+                       target_humidity=60)                      # 再动手
+  → 下一次 read_sensor → 湿度 44% → 46% → …                     # 环境确实在变
+```
+
+没有传感器时，Agent 只能读到自己刚写下的目标值——“我设了 60，所以是 60”，
+这种自证式的验证发现不了任何问题。有了传感器，验证读的是环境，
+这是整条链路里唯一一处真正来自外部的反馈。
 
 #### 4.3.8 启动时为什么要注入 Registry
 
@@ -617,8 +786,19 @@ device = registry.find("卧室的空调", DeviceType.AC)     # → bedroom_ac
 # 更新设备
 registry.update("living_room_light", power=True, brightness=70)
 
+# 传感器：先推演环境，再读值
+registry.tick_environment()
+sensor = registry.get("living_room_th_sensor")
+print(sensor.temperature, sensor.humidity)      # → 27.0 42
+
+# 按类型取一组传感器（read_sensor 走的就是这条路）
+registry.get_by_type(DeviceType.PRESENCE_SENSOR)
+
 # 生成状态报告（给 LLM 看）
 print(registry.get_status_summary())
+
+# 生成设备清单提示词（执行器与只读传感器分成两组）
+print(registry.get_device_list_prompt())
 ```
 
 #### 4.3.10 常见误解
@@ -646,6 +826,22 @@ Backend 可能遇到设备不存在、字段不合法、设备离线或平台请
 **依赖倒置是什么意思？**
 
 高层的工具和 Agent 依赖 `DeviceBackend` 这套抽象能力，而不是依赖 `SimulatorBackend` 的内存字典。后续对接 Home Assistant 时，只需创建 `HomeAssistantBackend(DeviceBackend)` 并在启动入口替换 Backend；工具调用方式和 Agent 图可以保持不变。
+
+**空调设了 24 度，为什么温湿度传感器读出来是 27 度？**
+
+因为两个字段含义不同。`ACDevice.temperature` 是目标值（“我要 24 度”），
+`TempHumiditySensor.temperature` 是实测值（“现在实际 27 度”）。两者不一致是正常
+状态，正是这个差值让空调有事可做、让验证器有东西可验。
+
+**为什么传感器没有 `control_temp_humidity_sensor`？**
+
+因为真实传感器没有可写状态。给它造一个控制工具，只会让模型以为可以“把湿度调到
+60%”——那实际上要控制的是加湿器。工具名本身就是给模型的约束。
+
+**能不能在 `get()` 里自动推演传感器读数？**
+
+不建议。`get()` 被控制、场景、验证等路径大量调用，一旦读取会改状态，读到的数字
+就取决于代码里调了几次 `get()`，bug 无法复现。详见 4.3.4b。
 
 ### 4.4 工具层 (`tools/`)
 
@@ -692,6 +888,22 @@ def control_light(device_name: str, action: str, brightness: int = 50) -> str:
   → 用户批准后 ToolNode 才执行场景
   → 用户拒绝则生成取消 ToolMessage，不执行场景
 ```
+
+只读工具走的还是第一条路径，但一次对话里往往会出现两轮：
+
+```text
+用户：“有点干”
+  → LLM 生成 read_sensor(sensor_type="temp_humidity", location="客厅")
+  → 风险判断：只读操作，不需要确认
+  → ToolNode 执行 read_sensor（内部先 tick_environment 再读）
+  → ToolMessage 返回“湿度 42%”
+  → LLM 拿到数值，这一轮才生成 control_humidifier 调用
+  → ToolNode 执行控制
+  → LLM 生成最终回复
+```
+
+这就是 ReAct 循环真正发挥作用的形态：第一次工具调用的结果决定了第二次调什么。
+如果没有传感器，模型面对“有点干”只能直接猜一个湿度值去设置。
 
 ### 4.5 Agent 图 (`agent/graph.py`)
 
@@ -920,6 +1132,42 @@ Command(resume={"approved": True})
 
 因此模型不会重新生成计划，LangGraph 会从原来的 `approval` 节点继续。
 
+传感器让“先看数据再动手”这类对话成立。同一个会话里接着说：
+
+```
+👤 你: 有点干
+
+🤖 小智: 我先看一下客厅的湿度。
+[调用 read_sensor(sensor_type="temp_humidity", location="客厅")]
+📡 **温湿度传感器读数:**
+  · 客厅温湿度传感器 (living_room_th_sensor): 温度 27.0°C | 湿度 42% | 电量 100%
+
+🤖 小智: 客厅湿度只有 42%，确实偏干（舒适区间是 40-60%，偏下限）。
+已帮你把加湿器目标湿度设为 60%。
+✅ 客厅加湿器目标湿度已设为 60%。
+
+👤 你: 现在呢
+
+🤖 小智: 📡 **温湿度传感器读数:**
+  · 客厅温湿度传感器 (living_room_th_sensor): 温度 27.0°C | 湿度 48% | 电量 100%
+湿度已经从 42% 升到 48%，在朝 60% 走。
+```
+
+值得注意的是第二次读到的 48% 不是模型编的，也不是它把自己刚设的 60 念了一遍——
+是模拟器按“加湿器正在工作”推演出来的中间值。这个数字来自环境而不是来自 Agent
+自己的命令，所以它是整条链路里唯一能真正证明“操作生效了”的证据。
+
+“家里有人吗”这类问题走同一个工具的另一个分支：
+
+```
+👤 你: 家里有人吗
+
+🤖 小智: 📡 **人体存在传感器读数:**
+  · 客厅人体传感器 (living_room_presence): 🕳️ 无人 | 电量 100%
+  · 玄关人体传感器 (entryway_presence): 🕳️ 无人 | 电量 100%
+客厅和玄关都没检测到活动。
+```
+
 ### 5.2 常用命令
 
 | 命令 | 说明 |
@@ -965,7 +1213,7 @@ python -m pytest -q
 python -m pytest -q tests/test_phase_twelve.py
 ```
 
-当前共 78 个测试，覆盖阶段一至阶段十二、天气 MCP 和加湿器设备闭环。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
+当前共 113 个测试，覆盖阶段一至阶段十二、天气 MCP、加湿器设备闭环和环境传感器。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
 
 | 测试文件 | 主要验证内容 |
 | --- | --- |
@@ -983,8 +1231,26 @@ python -m pytest -q tests/test_phase_twelve.py
 | `test_phase_twelve.py` | Agentic RAG 型号过滤、引用、拒答和轨迹评测指标 |
 | `test_weather_mcp.py` | 天气 MCP 配置解析、stdio 工具发现、同步调用和天气结果格式 |
 | `test_humidifier.py` | 加湿器字段约束、状态汇总、控制工具、空水箱保护、场景关闭和 Planner 预期状态 |
+| `test_sensors.py` | 传感器字段约束与离线展示、环境推演的确定性、`read_sensor` 的筛选与错误提示、只读约束不被场景与规划绕过 |
 
-测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 78 是加湿器完整接入后的基线。
+测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 113 是环境传感器完整接入后的基线。
+
+`test_sensors.py` 的结构值得单独说一下，它按四层组织，正好对应“新设备接进来要担心
+哪四件事”：
+
+1. **模型层**：湿度 120% 被拒、温度 99°C 被拒、离线传感器只报“离线”而不是上一次
+   的旧读数；
+2. **模拟器层**：环境推演必须确定性——`tick` 二十次湿度正好是 60，制冷正好停在
+   24.0 不越过目标，空调只影响同房间的传感器，水箱空了不加湿，非法时间戳不抛异常；
+3. **工具层**：`read_sensor` 的类型筛选、房间筛选、两种错误提示，以及一条完整闭环
+   （开加湿器 → 反复读 → 湿度确实升到 60）；
+4. **架构约束**：离家模式不会关掉传感器，`PlanStep(tool_name="read_sensor")` 直接
+   被 Pydantic 拒绝，设备清单提示词里传感器只出现在只读那一组。
+
+第 2 层和第 4 层是这批改动里最容易悄悄坏掉的部分。确定性一旦丢失（比如有人给推演
+加了随机抖动），测试会从“断言精确值”退化成“断言大概范围”，然后就再也发现不了
+偏差；只读约束一旦漏掉一处（比如新场景直接遍历所有设备做批量关闭），传感器就会
+被关掉，而这种 bug 在对话里表现为“Agent 说家里没人”，很难联想到根因。
 
 ---
 
@@ -1045,6 +1311,36 @@ def control_humidifier(
 
 **第六步**: 在 `mcp/server.py` 暴露 MCP 工具，并用自动化测试验证状态变化，而不只是检查返回文字。
 
+#### 6.1b 如果新设备是只读传感器
+
+项目已经完整接入 **温湿度传感器** 和 **人体存在传感器**。它们走的是另一条路径，
+差别集中在三步：
+
+| 步骤 | 执行器（加湿器） | 只读传感器（温湿度） |
+| --- | --- | --- |
+| 模型 | 定义可写字段 + `DeviceType` 枚举项 | 同上，另外把类型加进 `SENSOR_DEVICE_TYPES` |
+| 工具 | 新写一个 `control_xxx` | 在 `read_sensor` 的类型映射里加一项，**不写** `control_xxx` |
+| 规划 | 加进 `PLANNING_TOOL_NAMES` 并定义期望状态 | **跳过**——读取不改状态，无法验证，也不该成为计划的一步 |
+| 场景 | 需要考虑批量开关时怎么处理 | 无需处理，`SENSOR_DEVICE_TYPES` 已把它排除 |
+| 模拟器 | 注册默认设备即可 | 注册默认设备，并在 `_tick_*` 里定义读数如何随执行器变化 |
+
+只有传感器需要多写“读数怎么变”这一段。这段代码是可选的——完全可以让传感器返回
+常量，但那样“开加湿器 → 湿度上升 → 验证通过”这条闭环就演示不出来，验证器读到的
+永远是同一个数，等于没验。写这段推演时唯一的硬要求是**确定性**：固定步长、
+不用随机数，否则测试只能断言范围，也就再也守不住行为。
+
+`SENSOR_DEVICE_TYPES` 这个 frozenset 是这套区分的落点：
+
+```python
+SENSOR_DEVICE_TYPES = frozenset({
+    DeviceType.TEMP_HUMIDITY_SENSOR,
+    DeviceType.PRESENCE_SENSOR,
+})
+```
+
+场景层、设备清单提示词和状态汇总都查它。加一个新传感器时忘了往这里加，症状是
+离家模式会把它一起关掉、规划器会试图“打开”它——都不会报错，只会行为诡异。
+
 ### 6.2 对接真实 IoT 平台
 
 替换 `SimulatorBackend` 为真实后端：
@@ -1073,6 +1369,20 @@ backend = HomeAssistantBackend(     # 新: 真实设备
 )
 registry = DeviceRegistry(backend)
 ```
+
+注意 `tick_environment()` 在 `DeviceBackend` 里**不是** `@abstractmethod`，
+而是一个返回 `None` 的具体方法：
+
+```python
+def tick_environment(self) -> None:
+    """推演环境读数。真实后端不需要覆写。"""
+    return None
+```
+
+这不是偷懒。环境推演是模拟器特有的问题——真实传感器自己会上报读数，
+`HomeAssistantBackend` 无事可做。如果把它写成抽象方法，每个新后端都被迫写一个
+毫无意义的 `pass`，而且那个 `pass` 会让读代码的人以为“这里本来应该做点什么”。
+默认实现返回 `None` 表达的是“不需要做任何事”，语义准确。
 
 ### 6.3 添加自定义中间件
 
@@ -2888,6 +3198,15 @@ plan = structured_planner.invoke(planner_prompt)
 
 模型只能生成计划，不能在 Planner 节点中执行工具。工具名也被限制为五个原子设备工具，不允许在自定义计划中嵌套 `activate_scene`。
 
+这个 `Literal` 里没有 `read_sensor`，同样是刻意的。计划的每一步都要能被 Verifier
+验证，而验证的方式是比对“执行后的状态”和“期望状态”。读取不改变任何状态，
+也就没有期望状态可比——把它排成一步，Verifier 只能空转通过，等于在计划里插了一个
+永远成功的步骤。传感器该出现的位置是 ReAct 循环：模型想看数据就随时读，
+读完再决定计划里放什么。
+
+这条约束在类型层面就生效了，`PlanStep(tool_name="read_sensor", ...)` 会直接被
+Pydantic 拒绝，不需要靠提示词提醒模型别这么干。测试里也有一条守着它。
+
 `AgentState` 已增加：
 
 ```python
@@ -2980,6 +3299,22 @@ Verifier 推导期望值：
 
 然后读取 `registry.get(device_id)`，只有真实状态匹配时才判定成功。工具文字声称成功但设备状态没有改变时，会得到 `state_mismatch`，触发重试。
 
+这里有一个必须说清楚的界限：Verifier 读的是**执行器自己的字段**，不是传感器读数。
+上面那个例子里 `temperature: 25` 是空调的目标温度，验证它等于确认“命令写进去了”。
+它不能验证“房间真的到了 25 度”——那要看温湿度传感器，而空调需要几分钟才能把
+室温拉过去，当场去读只会一直 `state_mismatch`。
+
+所以两种“验证”是分开的：
+
+| | 验证对象 | 时效 | 谁在做 |
+| --- | --- | --- | --- |
+| 命令是否生效 | 执行器字段（目标值） | 立即 | `verifier_node`，确定性比对 |
+| 环境是否达标 | 传感器读数（实测值） | 需要时间 | 模型在 ReAct 循环里隔一会儿再读一次 |
+
+把第二种塞进 Verifier 会让计划因为“物理世界还没跟上”而误判失败并重试，
+而重试的动作（再设一次 25 度）对结果毫无帮助。传感器该做的是给模型提供事实，
+不是给计划提供通过条件——这也是 `read_sensor` 不进 `PLANNING_TOOL_NAMES` 的另一个理由。
+
 当同一步骤重试耗尽时，Planner 会收到类似反馈：
 
 ```text
@@ -3053,6 +3388,25 @@ planner → evaluator
 智能家居任务经常包含多个互不依赖的操作。例如用户要求查询客厅、卧室和书房温度，可以并行分发：
 
 当前阶段九实现的是无副作用的多设备状态查询。查询目标在运行时从设备名称或房间名称中解析，每个目标通过 `Send("query_device", ...)` 分发；`parallel_results` 使用 `Annotated[list[dict], operator.add]` reducer 合并，最后按设备 ID 排序后生成稳定回复。
+
+传感器接进来后，这里多了一处需要小心的地方。`extract_query_targets` 按“设备名或
+房间名出现在句子里”匹配，所以“查询客厅和卧室的设备状态”会同时命中两个房间的
+执行器**和**传感器——这是对的，读数本来就属于“状态”的一部分，而且读取是只读操作。
+但环境推演必须放在 `dispatch` 节点，也就是扇出**之前**：
+
+```python
+def dispatch_node(state: QueryState):
+    registry.tick_environment()      # 一次查询只推演一次
+    return {}
+
+def fan_out(state: QueryState):
+    return [Send("query_device", {"device_id": d}) for d in state["targets"]]
+```
+
+如果把 `tick_environment()` 写进 `query_device`，每个并行分支都会推演一次，
+于是“查两个房间”和“查所有设备”读到的湿度会不一样——**并行度直接改变了读数**。
+这类 bug 在单设备测试里永远不会出现，只在扇出宽度变化时才显形，
+是并行改造里很容易踩的一脚。
 
 动态并行通常放在路由和子图之后学习：先由结构化路由确定“这是设备查询还是设备控制”，再由对应子图决定哪些步骤可以并行。它们之间是推荐的分层关系，而不是严格的 API 依赖关系。真正决定能否并行的是任务之间是否相互独立，以及状态是否可以安全聚合。
 
@@ -4020,7 +4374,9 @@ training/
 }
 ```
 
-配置后，Claude Desktop 会自动发现 7 个智能家居工具，其中包括加湿器控制。
+配置后，Claude Desktop 会自动发现 8 个智能家居工具：五个执行器控制（灯光、空调、
+电视、窗帘、加湿器）、传感器读取、状态查询和场景激活。注意暴露给外部的也是
+`read_sensor` 而不是某个传感器控制工具——只读约束在协议边界上同样成立。
 
 ### 7.3 配置本项目附带的天气 MCP
 

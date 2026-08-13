@@ -239,6 +239,35 @@ def create_mcp_server(
         return f"✅ {device.name}操作成功"
 
     @mcp.tool()
+    async def read_sensor_mcp(sensor_type: str, location: str = "") -> str:
+        """读取环境传感器数值（只读）。控制设备前可先用它了解实际情况。
+
+        :param sensor_type: temp_humidity(温湿度) 或 presence(人体存在)
+        :param location: 可选房间名，如“客厅”“玄关”。留空返回全部
+        """
+        type_map = {
+            "temp_humidity": DeviceType.TEMP_HUMIDITY_SENSOR,
+            "presence": DeviceType.PRESENCE_SENSOR,
+        }
+        device_type = type_map.get(sensor_type)
+        if device_type is None:
+            return f"❌ 不支持的传感器类型: {sensor_type}"
+
+        # 读取前推演一次，让读数反映执行器当前状态。
+        registry.tick_environment()
+
+        sensors = registry.get_by_type(device_type)
+        wanted = location.strip()
+        if wanted:
+            sensors = {
+                dev_id: dev for dev_id, dev in sensors.items()
+                if wanted in dev.location or wanted in dev.name
+            }
+        if not sensors:
+            return f"❌ 找不到{device_type.label_cn}"
+        return "\n".join(dev.to_status_text() for dev in sensors.values())
+
+    @mcp.tool()
     async def get_device_status_mcp() -> str:
         """查询所有智能家居设备的当前状态"""
         return registry.get_status_summary()
@@ -253,7 +282,7 @@ def create_mcp_server(
         from ..tools.scenes import activate_scene as scene_fn
         return scene_fn.invoke({"name": "activate_scene", "arguments": {"scene_name": scene_name}})
 
-    logger.info(f"MCP 服务器已创建 | name={server_name} | 工具数=7")
+    logger.info(f"MCP 服务器已创建 | name={server_name} | 工具数=8")
     return mcp
 
 

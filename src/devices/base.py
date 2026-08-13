@@ -26,6 +26,7 @@ from ..models import (
     ACDevice,
     TVDevice,
     CurtainDevice,
+    SENSOR_DEVICE_TYPES,
 )
 
 
@@ -76,6 +77,17 @@ class DeviceBackend(ABC):
     def get_status_summary(self) -> str:
         """生成所有设备状态的摘要文本（给 LLM 阅读）"""
         ...
+
+    def tick_environment(self) -> None:
+        """
+        推进一次环境推演（可选实现）。
+
+        模拟器需要按执行器状态推算传感器读数，所以会覆盖这个方法。
+        真实后端（Home Assistant / MQTT）的传感器由硬件自行上报，
+        不需要任何推演，直接继承这个空实现即可——所以它是普通方法
+        而不是 @abstractmethod，新增后端不会因此被强制改代码。
+        """
+        return None
 
 
 # ============================================================
@@ -170,6 +182,14 @@ class DeviceRegistry:
             DeviceType.TV: ["电视", "电视机"],
             DeviceType.CURTAIN: ["窗帘", "帘", "遮阳"],
             DeviceType.HUMIDIFIER: ["加湿器", "加湿", "雾化器"],
+            DeviceType.TEMP_HUMIDITY_SENSOR: [
+                "温湿度传感器", "温湿度计", "温湿度", "温度计", "湿度计",
+                "温度", "湿度",
+            ],
+            DeviceType.PRESENCE_SENSOR: [
+                "人体传感器", "人体存在传感器", "存在传感器", "人体感应",
+                "人体", "有没有人", "有人",
+            ],
         }
         keywords = keywords_map.get(device_type, [])
         for kw in keywords:
@@ -199,14 +219,34 @@ class DeviceRegistry:
         """获取所有设备状态的文本摘要"""
         return self._backend.get_status_summary()
 
+    def tick_environment(self) -> None:
+        """
+        推进一次环境推演，让传感器读数反映执行器的当前状态。
+
+        只应该由传感器读取工具调用。设备控制、场景激活和计划验证
+        都不该触发它——否则同一次对话里读到的环境值会随调用次数漂移。
+        """
+        self._backend.tick_environment()
+
     def get_device_list_prompt(self) -> str:
         """
         生成可用设备列表（用于系统提示词）。
-        告诉 LLM 有哪些设备可以控制。
+
+        执行器和传感器分开列出，因为它们对 LLM 的含义完全不同：
+        执行器可以被 control_xxx 控制，传感器只能被 read_sensor 读取。
+        如果混在一张清单里，规划器会试图给温湿度传感器下"打开"指令。
         """
-        lines = ["可控制的设备列表:"]
+        controllable: list[str] = []
+        readonly: list[str] = []
         for dev_id, dev in self._backend.get_all().items():
-            lines.append(
-                f"  · {dev.name}（ID: {dev_id}，类型: {dev.device_type.value}）"
-            )
+            entry = f"  · {dev.name}（ID: {dev_id}，类型: {dev.device_type.value}）"
+            if dev.device_type in SENSOR_DEVICE_TYPES:
+                readonly.append(entry)
+            else:
+                controllable.append(entry)
+
+        lines = ["可控制的设备列表:", *controllable]
+        if readonly:
+            lines.append("只读传感器列表（只能读取，不能控制）:")
+            lines.extend(readonly)
         return "\n".join(lines)

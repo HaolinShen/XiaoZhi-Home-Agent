@@ -42,10 +42,13 @@ class PhaseNineSubgraphParallelTests(unittest.TestCase):
 
     def test_target_extraction_and_parallel_decision(self):
         targets = extract_query_targets("查询客厅和卧室的设备状态", self.registry)
+        # 传感器也在结果里：查"状态"时读数属于状态的一部分，且读取是只读操作。
+        # 玄关人体传感器不在其中，因为用户没有提到玄关。
         self.assertEqual(targets, [
             "living_room_light", "bedroom_light", "living_room_ac", "bedroom_ac",
             "living_room_tv", "living_room_curtain", "bedroom_curtain",
             "living_room_humidifier",
+            "living_room_th_sensor", "bedroom_th_sensor", "living_room_presence",
         ])
         self.assertTrue(should_use_parallel_query("查询客厅和卧室的设备状态", self.registry))
         self.assertFalse(should_use_parallel_query("查询客厅灯状态", self.registry))
