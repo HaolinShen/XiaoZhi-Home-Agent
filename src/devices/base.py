@@ -182,6 +182,9 @@ class DeviceRegistry:
             DeviceType.TV: ["电视", "电视机"],
             DeviceType.CURTAIN: ["窗帘", "帘", "遮阳"],
             DeviceType.HUMIDIFIER: ["加湿器", "加湿", "雾化器"],
+            DeviceType.WATER_HEATER: ["热水器", "电热水器", "洗澡"],
+            DeviceType.LOCK: ["门锁", "锁", "大门", "门"],
+            DeviceType.KETTLE: ["烧水壶", "热水壶", "水壶", "烧水"],
             DeviceType.TEMP_HUMIDITY_SENSOR: [
                 "温湿度传感器", "温湿度计", "温湿度", "温度计", "湿度计",
                 "温度", "湿度",

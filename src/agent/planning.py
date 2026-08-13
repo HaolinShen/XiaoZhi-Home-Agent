@@ -17,6 +17,9 @@ PLANNING_TOOL_NAMES = (
     "control_tv",
     "control_curtain",
     "control_humidifier",
+    "control_water_heater",
+    "control_lock",
+    "control_kettle",
 )
 
 # 每个工具的合法 action 及其附带参数。
@@ -40,6 +43,11 @@ TOOL_ACTIONS: dict[str, str] = {
     "control_humidifier": (
         "on / off / set_humidity(target_humidity) / set_mist_level(mist_level)"
     ),
+    "control_water_heater": (
+        "on / off / set_temp(target_temp)"
+    ),
+    "control_lock": "lock / unlock",
+    "control_kettle": "on / off / set_temp(target_temp) / boil",
 }
 
 
@@ -50,7 +58,8 @@ class PlanStep(BaseModel):
     description: str = Field(min_length=1)
     tool_name: Literal[
         "control_light", "control_ac", "control_tv", "control_curtain",
-        "control_humidifier",
+        "control_humidifier", "control_water_heater", "control_lock",
+        "control_kettle",
     ]
     arguments: dict[str, Any]
 
@@ -102,7 +111,8 @@ def should_use_planner(text: str) -> bool:
     )
     action_count = sum(len(re.findall(pattern, normalized)) for pattern in action_patterns)
     device_kinds = sum(
-        1 for keyword in ("灯", "空调", "电视", "窗帘", "加湿器") if keyword in normalized
+        1 for keyword in ("灯", "空调", "电视", "窗帘", "加湿器", "热水器", "门锁", "烧水壶")
+        if keyword in normalized
     )
     connectors = any(
         connector in normalized
@@ -184,6 +194,9 @@ def expected_state_for_step(
         "control_tv": DeviceType.TV,
         "control_curtain": DeviceType.CURTAIN,
         "control_humidifier": DeviceType.HUMIDIFIER,
+        "control_water_heater": DeviceType.WATER_HEATER,
+        "control_lock": DeviceType.LOCK,
+        "control_kettle": DeviceType.KETTLE,
     }
     device_type = mapping.get(tool_name)
     if device_type is None:
@@ -256,6 +269,39 @@ def expected_state_for_step(
             }
         elif action == "set_mist_level":
             expected = {"power": True, "mist_level": args.get("mist_level", "auto")}
+        else:
+            return device.device_id, {}, _unsupported_action(tool_name, action)
+    elif tool_name == "control_water_heater":
+        if action == "on":
+            expected = {"power": True}
+        elif action == "off":
+            expected = {"power": False}
+        elif action == "set_temp":
+            expected = {
+                "power": True,
+                "target_temp": max(35, min(75, int(args.get("target_temp", 45)))),
+            }
+        else:
+            return device.device_id, {}, _unsupported_action(tool_name, action)
+    elif tool_name == "control_lock":
+        if action == "lock":
+            expected = {"locked": True}
+        elif action == "unlock":
+            expected = {"locked": False}
+        else:
+            return device.device_id, {}, _unsupported_action(tool_name, action)
+    elif tool_name == "control_kettle":
+        if action == "on":
+            expected = {"power": True}
+        elif action == "off":
+            expected = {"power": False}
+        elif action == "set_temp":
+            expected = {
+                "power": True,
+                "target_temp": max(40, min(100, int(args.get("target_temp", 100)))),
+            }
+        elif action == "boil":
+            expected = {"power": True, "target_temp": 100}
         else:
             return device.device_id, {}, _unsupported_action(tool_name, action)
     else:

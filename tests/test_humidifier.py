@@ -89,7 +89,7 @@ class HumidifierDeviceTests(unittest.TestCase):
     def test_leaving_scene_turns_humidifier_off(self):
         self.assertTrue(self.registry.update("living_room_humidifier", power=True))
         result = activate_scene.invoke({"scene_name": "离家模式"})
-        self.assertIn("加湿器已关闭", result)
+        self.assertIn("加湿器、热水器和烧水壶已关闭", result)
         self.assertFalse(self.registry.get("living_room_humidifier").power)
 
     def test_planner_can_prepare_verifiable_humidifier_step(self):

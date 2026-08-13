@@ -53,7 +53,7 @@ SCENE_META = {
         "emoji": "🏠",
     },
     "离家模式": {
-        "description": "关闭所有灯光、空调、电视和加湿器，关闭所有窗帘，确保安全节能",
+        "description": "关闭所有灯光、空调、电视、加湿器、热水器和烧水壶，关闭所有窗帘并锁好门锁，确保安全节能",
         "emoji": "👋",
     },
     "睡眠模式": {
@@ -127,14 +127,21 @@ def activate_scene(scene_name: str) -> str:
                 DeviceType.AC,
                 DeviceType.TV,
                 DeviceType.HUMIDIFIER,
+                DeviceType.WATER_HEATER,
+                DeviceType.KETTLE,
             ):
                 registry.update(dev_id, power=False)
             elif dev.device_type == DeviceType.CURTAIN:
                 registry.update(dev_id, position=0)
+        # 门锁单独处理：离家要"上锁"而不是"关闭"（power 表示在线，必须保持）。
+        for dev_id, dev in all_devices.items():
+            if dev.device_type == DeviceType.LOCK:
+                registry.update(dev_id, locked=True)
         results = [
             "✅ 已激活「👋 离家模式」",
-            "  · 所有灯光、空调、电视和加湿器已关闭",
+            "  · 所有灯光、空调、电视、加湿器、热水器和烧水壶已关闭",
             "  · 所有窗帘已关闭",
+            "  · 所有门锁已上锁",
             "👋 再见，所有设备已安全关闭！",
         ]
 

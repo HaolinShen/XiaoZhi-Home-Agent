@@ -239,6 +239,89 @@ def create_mcp_server(
         return f"✅ {device.name}操作成功"
 
     @mcp.tool()
+    async def control_water_heater_mcp(
+        device_name: str,
+        action: str,
+        target_temp: int = 45,
+    ) -> str:
+        """控制电热水器。支持开关和目标水温调节。
+
+        :param device_name: 设备名称，如“卫生间电热水器”
+        :param action: on, off, set_temp
+        :param target_temp: 目标水温 35-75°C
+        """
+        device = registry.find(device_name, DeviceType.WATER_HEATER)
+        if device is None:
+            return f"❌ 找不到电热水器设备「{device_name}」"
+
+        if action == "on":
+            registry.update(device.device_id, power=True)
+        elif action == "off":
+            registry.update(device.device_id, power=False)
+        elif action == "set_temp":
+            registry.update(
+                device.device_id,
+                target_temp=max(35, min(75, target_temp)),
+                power=True,
+            )
+        else:
+            return f"❌ 不支持的操作: {action}"
+        return f"✅ {device.name}操作成功"
+
+    @mcp.tool()
+    async def control_lock_mcp(device_name: str, action: str) -> str:
+        """控制智能门锁上锁与解锁（解锁属于敏感动作）。
+
+        :param device_name: 设备名称，如“玄关门锁”
+        :param action: lock(上锁), unlock(解锁)
+        """
+        device = registry.find(device_name, DeviceType.LOCK)
+        if device is None:
+            return f"❌ 找不到门锁设备「{device_name}」"
+        if not device.power:
+            return f"❌ {device.name}离线，无法操作"
+
+        if action == "lock":
+            registry.update(device.device_id, locked=True)
+        elif action == "unlock":
+            registry.update(device.device_id, locked=False)
+        else:
+            return f"❌ 不支持的操作: {action}"
+        return f"✅ {device.name}操作成功"
+
+    @mcp.tool()
+    async def control_kettle_mcp(
+        device_name: str,
+        action: str,
+        target_temp: int = 100,
+    ) -> str:
+        """控制电热水壶。支持开关、目标水温和一键烧开。
+
+        :param device_name: 设备名称，如“厨房烧水壶”
+        :param action: on, off, set_temp, boil
+        :param target_temp: 目标水温 40-100°C
+        """
+        device = registry.find(device_name, DeviceType.KETTLE)
+        if device is None:
+            return f"❌ 找不到电热水壶设备「{device_name}」"
+
+        if action == "boil":
+            registry.update(device.device_id, power=True, target_temp=100)
+        elif action == "on":
+            registry.update(device.device_id, power=True)
+        elif action == "off":
+            registry.update(device.device_id, power=False)
+        elif action == "set_temp":
+            registry.update(
+                device.device_id,
+                target_temp=max(40, min(100, target_temp)),
+                power=True,
+            )
+        else:
+            return f"❌ 不支持的操作: {action}"
+        return f"✅ {device.name}操作成功"
+
+    @mcp.tool()
     async def read_sensor_mcp(sensor_type: str, location: str = "") -> str:
         """读取环境传感器数值（只读）。控制设备前可先用它了解实际情况。
 
@@ -282,7 +365,7 @@ def create_mcp_server(
         from ..tools.scenes import activate_scene as scene_fn
         return scene_fn.invoke({"name": "activate_scene", "arguments": {"scene_name": scene_name}})
 
-    logger.info(f"MCP 服务器已创建 | name={server_name} | 工具数=8")
+    logger.info(f"MCP 服务器已创建 | name={server_name} | 工具数=11")
     return mcp
 
 

@@ -54,6 +54,9 @@ class DeviceType(str, Enum):
     TV = "tv"             # 电视设备
     CURTAIN = "curtain"   # 窗帘设备
     HUMIDIFIER = "humidifier"  # 加湿器
+    WATER_HEATER = "water_heater"  # 电热水器（洗澡用）
+    LOCK = "lock"         # 智能门锁
+    KETTLE = "kettle"     # 电热水壶
 
     # ---- 只读传感器 ----
     # 上面 5 种都是"执行器"：Agent 下命令、设备改状态。
@@ -104,6 +107,9 @@ class DeviceType(str, Enum):
             "tv": "电视",
             "curtain": "窗帘",
             "humidifier": "加湿器",
+            "water_heater": "电热水器",
+            "lock": "门锁",
+            "kettle": "电热水壶",
             "temp_humidity_sensor": "温湿度传感器",
             "presence_sensor": "人体存在传感器",
         }
@@ -401,6 +407,84 @@ class HumidifierDevice(BaseDevice):
         )
 
 
+class WaterHeaterDevice(BaseDevice):
+    """
+    电热水器设备模型（洗澡用）。
+
+    属性:
+      target_temp: 目标水温 35-75°C（洗澡水温区间，clamp）
+    """
+    device_type: DeviceType = Field(default=DeviceType.WATER_HEATER, frozen=True)
+    target_temp: int = Field(default=45, ge=35, le=75, description="目标水温 35-75°C")
+
+    @field_validator("target_temp")
+    @classmethod
+    def clamp_target_temp(cls, v: int) -> int:
+        """确保水温在 35-75°C 范围内"""
+        return max(35, min(75, v))
+
+    def to_status_text(self) -> str:
+        status = "🟢 加热中" if self.power else "🔴 关闭"
+        return (
+            f"{self.name} ({self.device_id}): {status} | "
+            f"目标水温: {self.target_temp}°C"
+        )
+
+
+class KettleDevice(BaseDevice):
+    """
+    电热水壶设备模型。
+
+    属性:
+      target_temp: 目标水温 40-100°C（clamp）。boil 动作会拉到 100°C。
+
+    为什么保留一个独特的 boil 动作？
+      加湿器、热水器都是 on/off/set_xxx 的老三样，烧水壶的"烧开"是它天然的
+      语义动作——一步开机并加热到 100°C。保留它让新增设备不只是复制模板，
+      也给 Planner 的 action 词表演示了"带业务语义的复合动作"。
+    """
+    device_type: DeviceType = Field(default=DeviceType.KETTLE, frozen=True)
+    target_temp: int = Field(default=100, ge=40, le=100, description="目标水温 40-100°C")
+
+    @field_validator("target_temp")
+    @classmethod
+    def clamp_target_temp(cls, v: int) -> int:
+        """确保水温在 40-100°C 范围内"""
+        return max(40, min(100, v))
+
+    def to_status_text(self) -> str:
+        status = "🟢 加热中" if self.power else "🔴 关闭"
+        return (
+            f"{self.name} ({self.device_id}): {status} | "
+            f"目标水温: {self.target_temp}°C"
+        )
+
+
+class LockDevice(BaseDevice):
+    """
+    智能门锁设备模型。
+
+    属性:
+      locked:  是否已上锁（默认 True，出厂即锁）
+      battery: 电量 0-100%
+
+    为什么用 locked 而不是 power 表达锁态？
+      门锁的"开/关"指的是锁舌的开合，语义上是 locked；power 沿用基类，
+      表示门锁本身在线（有电、能联网）。把锁态塞进 power 会和其他执行器的
+      "开机/关机"语义打架，验证器读期望状态时也会误判。
+    """
+    device_type: DeviceType = Field(default=DeviceType.LOCK, frozen=True)
+    power: bool = Field(default=True, description="门锁是否在线")
+    locked: bool = Field(default=True, description="是否已上锁: True=锁上, False=解锁")
+    battery: int = Field(default=100, ge=0, le=100, description="电量 0-100%")
+
+    def to_status_text(self) -> str:
+        if not self.power:
+            return f"{self.name} ({self.device_id}): ⚠️ 离线"
+        state = "🔒 已上锁" if self.locked else "🔓 已解锁"
+        return f"{self.name} ({self.device_id}): {state} | 电量 {self.battery}%"
+
+
 # ============================================================
 # 传感器模型（只读设备）
 # ============================================================
@@ -502,6 +586,9 @@ AnyDevice = Union[
     TVDevice,
     CurtainDevice,
     HumidifierDevice,
+    WaterHeaterDevice,
+    KettleDevice,
+    LockDevice,
     TempHumiditySensor,
     PresenceSensor,
 ]

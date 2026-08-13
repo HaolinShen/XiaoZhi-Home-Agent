@@ -140,6 +140,9 @@ class PhaseSevenPlannerExecutorVerifierTests(unittest.TestCase):
             "control_tv": "客厅电视",
             "control_curtain": "客厅窗帘",
             "control_humidifier": "客厅加湿器",
+            "control_water_heater": "卫生间电热水器",
+            "control_lock": "玄关门锁",
+            "control_kettle": "厨房烧水壶",
         }
         for tool_name, spec in TOOL_ACTIONS.items():
             # spec 形如 "on / off / set_temp(temperature) / ..."；按 " / " 切段，

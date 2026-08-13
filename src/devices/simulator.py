@@ -20,6 +20,9 @@
   - 1 个电视: 客厅电视
   - 2 个窗帘: 客厅窗帘、卧室窗帘
   - 1 个加湿器: 客厅加湿器
+  - 1 个电热水器: 卫生间电热水器
+  - 1 个门锁: 玄关门锁
+  - 1 个电热水壶: 厨房烧水壶
   - 2 个温湿度传感器: 客厅温湿度传感器、卧室温湿度传感器
   - 2 个人体存在传感器: 客厅人体传感器、玄关人体传感器
 
@@ -49,6 +52,9 @@ from ..models import (
     ACMode,
     FanSpeed,
     HumidifierDevice,
+    WaterHeaterDevice,
+    KettleDevice,
+    LockDevice,
     TempHumiditySensor,
     PresenceSensor,
 )
@@ -119,6 +125,9 @@ class SimulatorBackend(DeviceBackend):
             (DeviceType.TV, "📺 电视"),
             (DeviceType.CURTAIN, "🪟 窗帘"),
             (DeviceType.HUMIDIFIER, "💧 加湿器"),
+            (DeviceType.WATER_HEATER, "🚿 电热水器"),
+            (DeviceType.LOCK, "🔒 门锁"),
+            (DeviceType.KETTLE, "☕ 电热水壶"),
             (DeviceType.TEMP_HUMIDITY_SENSOR, "🌡️ 温湿度传感器"),
             (DeviceType.PRESENCE_SENSOR, "👤 人体存在传感器"),
         ]
@@ -306,6 +315,34 @@ class SimulatorBackend(DeviceBackend):
                 target_humidity=60,
                 mist_level=FanSpeed.AUTO,
                 water_level=100,
+            ),
+
+            # ===== 电热水器（洗澡用）=====
+            WaterHeaterDevice(
+                device_id="bathroom_water_heater",
+                name="卫生间电热水器",
+                location="卫生间",
+                power=False,
+                target_temp=45,
+            ),
+
+            # ===== 智能门锁 =====
+            # 出厂即锁（locked=True），解锁是对外动作，会走人工审批。
+            LockDevice(
+                device_id="entryway_lock",
+                name="玄关门锁",
+                location="玄关",
+                locked=True,
+                battery=90,
+            ),
+
+            # ===== 电热水壶 =====
+            KettleDevice(
+                device_id="kitchen_kettle",
+                name="厨房烧水壶",
+                location="厨房",
+                power=False,
+                target_temp=100,
             ),
 
             # ===== 温湿度传感器（只读）=====

@@ -432,6 +432,144 @@ def control_humidifier(
 
 
 # ============================================================
+# 电热水器控制工具
+# ============================================================
+
+@tool
+def control_water_heater(
+    device_name: str,
+    action: str,
+    target_temp: int = 45,
+    config: RunnableConfig = None,
+) -> str:
+    """控制电热水器的开关和目标水温。
+
+    使用场景:
+      "打开热水器"        → device_name="卫生间电热水器", action="on"
+      "把热水器调到50度"  → action="set_temp", target_temp=50
+      "关掉热水器"        → action="off"
+
+    参数:
+        device_name: 设备名称，如"卫生间电热水器"
+        action: on / off / set_temp
+        target_temp: 目标水温 35-75°C，仅 set_temp 或 on 时使用
+    """
+    registry = _get_registry()
+    device = registry.find(device_name, DeviceType.WATER_HEATER)
+    if device is None:
+        return "❌ 找不到指定的电热水器。当前可用的电热水器有: 卫生间电热水器。"
+
+    if action == "on":
+        registry.update(device.device_id, power=True)
+        return f"✅ {device.name}已开启，目标水温 {device.target_temp}°C。"
+    elif action == "off":
+        registry.update(device.device_id, power=False)
+        return f"✅ {device.name}已关闭。"
+    elif action == "set_temp":
+        target_temp = max(35, min(75, target_temp))
+        registry.update(device.device_id, target_temp=target_temp, power=True)
+        if config is not None:
+            record_preference_operation(
+                config,
+                device.device_id,
+                "water_heater.target_temp",
+                {"target_temp": target_temp},
+            )
+        return f"✅ {device.name}目标水温已设为 {target_temp}°C。"
+    return "❌ 不支持的操作。电热水器支持: on / off / set_temp"
+
+
+# ============================================================
+# 智能门锁控制工具
+# ============================================================
+
+@tool
+def control_lock(
+    device_name: str,
+    action: str,
+    config: RunnableConfig = None,
+) -> str:
+    """控制智能门锁的上锁与解锁。
+
+    安全提示: 解锁属于对外敏感动作，会触发人工确认，需要用户批准后才真正执行。
+
+    使用场景:
+      "把门锁上"      → device_name="玄关门锁", action="lock"
+      "解锁门锁"      → action="unlock"（需人工审批）
+
+    参数:
+        device_name: 设备名称，如"玄关门锁"
+        action: lock(上锁) / unlock(解锁)
+    """
+    registry = _get_registry()
+    device = registry.find(device_name, DeviceType.LOCK)
+    if device is None:
+        return "❌ 找不到指定的门锁。当前可用的门锁有: 玄关门锁。"
+    if not device.power:
+        return f"❌ {device.name}离线，无法操作。"
+
+    if action == "lock":
+        registry.update(device.device_id, locked=True)
+        return f"✅ {device.name}已上锁。"
+    elif action == "unlock":
+        registry.update(device.device_id, locked=False)
+        return f"✅ {device.name}已解锁。"
+    return "❌ 不支持的操作。门锁支持: lock / unlock"
+
+
+# ============================================================
+# 电热水壶控制工具
+# ============================================================
+
+@tool
+def control_kettle(
+    device_name: str,
+    action: str,
+    target_temp: int = 100,
+    config: RunnableConfig = None,
+) -> str:
+    """控制电热水壶的开关、目标水温和"烧开"动作。
+
+    使用场景:
+      "把水烧开"      → action="boil"
+      "烧水到80度"    → action="set_temp", target_temp=80
+      "打开烧水壶"    → action="on"
+      "关掉烧水壶"    → action="off"
+
+    参数:
+        device_name: 设备名称，如"厨房烧水壶"
+        action: on / off / set_temp / boil（boil 一键开机并加热到 100°C）
+        target_temp: 目标水温 40-100°C
+    """
+    registry = _get_registry()
+    device = registry.find(device_name, DeviceType.KETTLE)
+    if device is None:
+        return "❌ 找不到指定的电热水壶。当前可用的烧水壶有: 厨房烧水壶。"
+
+    if action == "boil":
+        registry.update(device.device_id, power=True, target_temp=100)
+        return f"✅ {device.name}已开始烧水，加热至 100°C。"
+    elif action == "on":
+        registry.update(device.device_id, power=True)
+        return f"✅ {device.name}已开启，目标水温 {device.target_temp}°C。"
+    elif action == "off":
+        registry.update(device.device_id, power=False)
+        return f"✅ {device.name}已关闭。"
+    elif action == "set_temp":
+        target_temp = max(40, min(100, target_temp))
+        registry.update(device.device_id, target_temp=target_temp, power=True)
+        if config is not None:
+            record_preference_operation(
+                config,
+                device.device_id,
+                "kettle.target_temp",
+                {"target_temp": target_temp},
+            )
+        return f"✅ {device.name}目标水温已设为 {target_temp}°C。"
+    return "❌ 不支持的操作。烧水壶支持: on / off / set_temp / boil"
+
+
+# ============================================================
 # 传感器读取工具（只读）
 # ============================================================
 #

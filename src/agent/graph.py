@@ -670,7 +670,7 @@ def build_graph(
         decision = interrupt(request)
         approved = approval_is_granted(decision)
         logger.info(
-            "批量设备操作确认结果 | approved={} | tools={}",
+            "人工审批结果 | approved={} | tools={}",
             approved,
             [call.get("name") for call in tool_calls],
         )
