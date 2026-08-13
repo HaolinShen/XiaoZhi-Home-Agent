@@ -204,6 +204,7 @@ langgraph/
 │   │   ├── __init__.py
 │   │   └── interceptors.py   # 日志拦截器 + 重试拦截器
 │   │
+│   ├── progress_view.py      # 进度事件 → 终端渲染（Planner/Executor/Verifier 过程）
 │   └── main.py               # ★ CLI 主入口 (typer + rich)
 │
 ├── tests/                    # 阶段一至阶段十二 + 设备扩展自动化测试
@@ -221,7 +222,8 @@ langgraph/
 │   ├── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
 │   ├── test_weather_mcp.py   # 天气 MCP 发现、调用与结果格式测试
 │   ├── test_humidifier.py    # 加湿器模型、工具、Planner 与状态测试
-│   └── test_sensors.py       # 传感器模型、环境推演、read_sensor 与只读约束测试
+│   ├── test_sensors.py       # 传感器模型、环境推演、read_sensor 与只读约束测试
+│   └── test_planning_progress.py  # 规划进度事件与终端渲染测试
 │
 ├── docs/                     # 文档
 │   ├── tutorial.md           # 本教程
@@ -1176,6 +1178,7 @@ Command(resume={"approved": True})
 | `/scenes` | 列出可用场景模式 |
 | `/reset`  | 重置对话记忆 |
 | `/history` | 查看当前会话最近的 Checkpoint 状态历史 |
+| `/plan` | 复盘最近一次多步骤计划：Planner 产出 + 逐步验证轨迹 |
 | `/help`   | 显示使用指南 |
 | `/quit`   | 退出 |
 
@@ -1187,6 +1190,9 @@ python -m src.main --model qwen-max
 
 # 调试模式（显示详细日志）
 python -m src.main --debug
+
+# 额外显示路由 / 记忆判断等诊断事件（规划过程默认就会显示）
+python -m src.main --trace
 
 # 快速查看设备状态（不启动对话）
 python -m src.main status
@@ -1213,7 +1219,7 @@ python -m pytest -q
 python -m pytest -q tests/test_phase_twelve.py
 ```
 
-当前共 113 个测试，覆盖阶段一至阶段十二、天气 MCP、加湿器设备闭环和环境传感器。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
+当前共 123 个测试，覆盖阶段一至阶段十二、天气 MCP、加湿器设备闭环、环境传感器和规划过程可视化。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
 
 | 测试文件 | 主要验证内容 |
 | --- | --- |
@@ -1232,8 +1238,9 @@ python -m pytest -q tests/test_phase_twelve.py
 | `test_weather_mcp.py` | 天气 MCP 配置解析、stdio 工具发现、同步调用和天气结果格式 |
 | `test_humidifier.py` | 加湿器字段约束、状态汇总、控制工具、空水箱保护、场景关闭和 Planner 预期状态 |
 | `test_sensors.py` | 传感器字段约束与离线展示、环境推演的确定性、`read_sensor` 的筛选与错误提示、只读约束不被场景与规划绕过 |
+| `test_planning_progress.py` | 规划事件的发出顺序（计划先于执行、执行先于验证）、重试与重新规划事件、`PlanProgressView` 的渲染与容错 |
 
-测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 113 是环境传感器完整接入后的基线。
+测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 123 是规划过程可视化接入后的基线。
 
 `test_sensors.py` 的结构值得单独说一下，它按四层组织，正好对应“新设备接进来要担心
 哪四件事”：
@@ -3583,13 +3590,52 @@ Checkpoint 不只是保存聊天记录，还可以支持查看过去状态并从
 
 阶段十一已经在关键节点中通过 `get_stream_writer` 发出 `custom` 事件。调用方可以使用 `graph.stream(input, config, stream_mode="custom")` 获取上下文同步、记忆判断、Supervisor 路由、规划、步骤执行、验证、并行查询和 Agent 完成事件。
 
-```text
-正在识别房间和设备……
-已找到客厅的 3 盏灯
-正在执行关闭操作……
-2 台成功，1 台离线
-正在检查最终状态……
+这里有一个容易踩的坑，它同时也是“为什么规划过程一度完全看不见”的答案：`get_stream_writer()` 只有在 `stream` 模式下才拿到真正的写入器；用 `graph.invoke()` 跑图时 LangGraph 会给节点一个空写入器，于是每一次 `emit_progress` 都被静默丢弃，不报错、不警告。CLI 早期就是用 `invoke` 消费图的，所以 Planner / Executor / Verifier 明明是三个独立节点，用户看到的却只有“已生成 N 步执行计划”和最后一句“任务已完成”。
+
+修好它的关键不是往图里加日志，而是换消费方式并补一个渲染层：
+
+```python
+# src/main.py —— 同时要进度事件和中断，所以传一个列表
+for mode, chunk in graph.stream(payload, config, stream_mode=["custom", "updates"]):
+    if mode == "custom":
+        view.handle(chunk)                    # 进度事件 → 终端
+    elif mode == "updates":
+        interrupts = chunk.get("__interrupt__")
+        if interrupts:
+            pending = interrupts[0].value     # 审批中断照旧工作
 ```
+
+多模式 `stream` 产出的是 `(mode, chunk)` 二元组；中断以 `updates` 分支里的 `{"__interrupt__": (Interrupt(...),)}` 形式到达，所以人在回路的审批不受影响。事件已经边跑边打印，最终状态就不必再从返回值里取，直接 `graph.get_state(config).values` 读 Checkpoint 更可靠。
+
+分层上刻意分成三处，谁都不越界：
+
+| 位置 | 职责 | 依赖 |
+| --- | --- | --- |
+| `src/agent/observability.py` | 声明事件名（`PLANNING_EVENTS` / `TRACE_EVENTS`）并发出事件 | 只依赖 LangGraph |
+| `src/agent/graph.py` | 在节点里按阶段发事件 | 不知道有终端 |
+| `src/progress_view.py` | 把事件渲染成表格和彩色行 | 依赖 rich，不知道有图 |
+
+事件的字段划分也照抄 Executor / Verifier 的职责边界：`step_executed` 只报告“工具说了什么”（`tool_result`），不带任何结论；`success`、`problem_type` 和“期望 vs 实测”只出现在 `step_verified` 里。这样终端上呈现的分工就不是解说词，而是数据结构本身的形状。
+
+于是同一条多动作请求在运行时长这样（`plan_generated` 一定早于第一个 `step_started`，也就是说参数全部定下来时设备还一点没动）：
+
+```text
+🧭 Planner 分支   目标 关掉客厅灯，然后把卧室空调调到25度
+📋 计划 v1（2 步 · 此刻尚未触碰任何设备）
+  1  关闭客厅灯      control_light  device_name=客厅灯, action=off
+  2  打开卧室空调     control_ac     device_name=卧室空调, action=on, temperature=25
+▶ 计划 v1 已批准，开始逐步执行
+⚙ Executor 步骤 1/2 · 关闭客厅灯
+    调用 control_light(device_name=客厅灯, action=off)
+    工具返回 ✅ 客厅灯已关闭。
+✔ Verifier 步骤 1/2 通过 · 期望 power=False ≡ 实测 power=False
+...
+🏁 规划结束 · completed · 验证通过 2 次 / 共 2 次尝试 · 最终计划 v2
+```
+
+失败路径同样看得见：`↻ 重试步骤 1（第 2/2 次尝试）` 之后若仍失败，就是 `⟲ 重试额度已用尽，把失败原因交回 Planner 重新规划`，接着 v2 计划表格重新出现并再次等待审批。诊断类事件（路由、记忆判断）默认折叠，加 `--trace` 才显示，避免把规划过程淹掉。
+
+进度事件是“流过去就没了”，所以另外提供 `/plan` 命令，从 Checkpoint 里把同一份轨迹再取出来复盘：Planner 产出一张表，Executor + Verifier 的每次尝试一行，重试和被放弃的旧版本都在里面。
 
 可以分别观察：
 
@@ -3598,7 +3644,7 @@ Checkpoint 不只是保存聊天记录，还可以支持查看过去状态并从
 - 完整状态流：节点执行后的完整状态快照；
 - 自定义事件：工具主动报告执行进度。
 
-学习时应避免把模型的隐藏推理过程直接展示给用户。可展示的是任务状态、工具进度和可验证结果，而不是模型内部思维文本。
+学习时应避免把模型的隐藏推理过程直接展示给用户。可展示的是任务状态、工具进度和可验证结果，而不是模型内部思维文本。上面这套事件正是按这个界线设计的：只有“第几步、调了哪个工具、期望值与实测值是否一致”，没有一个字段承载模型的推理文本。
 
 #### 6.5.12 Agentic RAG：区分记忆、实时状态和外部知识
 

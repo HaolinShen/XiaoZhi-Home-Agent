@@ -321,6 +321,11 @@ def build_graph(
         if not use_planner:
             result["planning_active"] = False
             return result
+        emit_progress(
+            "planning_selected",
+            goal=latest_text,
+            reason="请求包含多个自定义动作，交由 Planner 先出计划再执行",
+        )
         result.update({
             "planning_active": True,
             "planning_goal": latest_text,
@@ -357,7 +362,24 @@ def build_graph(
             len(plan.steps),
             plan.goal,
         )
-        emit_progress("plan_generated", revision=revision, step_count=len(plan.steps))
+        emit_progress(
+            "plan_generated",
+            revision=revision,
+            step_count=len(plan.steps),
+            goal=plan.goal,
+            rationale=plan.rationale,
+            # 带上每步的工具名和参数：这是"Planner 只写不做"最直观的证据 ——
+            # 此刻设备状态还没有任何变化，参数却已经全部定下来了。
+            steps=[
+                {
+                    "step_id": step.step_id,
+                    "description": step.description,
+                    "tool_name": step.tool_name,
+                    "arguments": step.arguments,
+                }
+                for step in plan.steps
+            ],
+        )
         return {
             "plan": plan.model_dump(),
             "plan_revision": revision,
@@ -373,6 +395,7 @@ def build_graph(
         request = plan_approval_payload(state["plan"])
         decision = interrupt(request)
         approved = approval_is_granted(decision)
+        emit_progress("plan_decision", approved=approved, revision=state.get("plan_revision", 1))
         return {
             "approval_request": request,
             "approval_decision": "approved" if approved else "rejected",
@@ -381,8 +404,20 @@ def build_graph(
 
     def executor_node(state: AgentState, config: RunnableConfig) -> dict:
         """Execute exactly one plan step using the existing trusted tools."""
-        step = state["plan"]["steps"][state.get("current_step_index", 0)]
-        emit_progress("step_started", step_id=step["step_id"], description=step["description"])
+        index = state.get("current_step_index", 0)
+        total = len(state["plan"]["steps"])
+        step = state["plan"]["steps"][index]
+        attempt = state.get("step_retry_count", 0) + 1
+        emit_progress(
+            "step_started",
+            step_id=step["step_id"],
+            step_index=index + 1,
+            step_total=total,
+            attempt=attempt,
+            description=step["description"],
+            tool_name=step["tool_name"],
+            arguments=step["arguments"],
+        )
         device_id, expected_state, preparation_error = expected_state_for_step(step, registry)
         tool = tools_by_name.get(step["tool_name"])
         try:
@@ -398,6 +433,16 @@ def build_graph(
                 step["step_id"], step["tool_name"], exc,
             )
             tool_result = f"❌ 工具执行异常: {exc}"
+        # Executor 只报告"工具说了什么"，判断留给 Verifier —— 事件也照这个边界切分。
+        emit_progress(
+            "step_executed",
+            step_id=step["step_id"],
+            step_index=index + 1,
+            step_total=total,
+            device_id=device_id,
+            tool_result=tool_result,
+            expected_state=expected_state,
+        )
         return {
             "last_execution": {
                 "step": step,
@@ -420,7 +465,17 @@ def build_graph(
             execution.get("tool_result", ""),
             execution.get("preparation_error"),
         )
-        emit_progress("step_verified", success=verification.success)
+        emit_progress(
+            "step_verified",
+            success=verification.success,
+            step_id=execution["step"]["step_id"],
+            step_index=state.get("current_step_index", 0) + 1,
+            step_total=len(state["plan"]["steps"]),
+            problem_type=verification.problem_type,
+            reason=verification.reason,
+            expected_state=verification.expected_state,
+            actual_state=verification.actual_state,
+        )
         index = state.get("current_step_index", 0)
         results = list(state.get("planning_results", []))
         results.append({
@@ -443,13 +498,33 @@ def build_graph(
 
         retry_count = state.get("step_retry_count", 0) + 1
         max_retries = getattr(getattr(settings, "planning", None), "max_step_retries", 1)
-        if retry_count <= max_retries:
+        # unsupported_action / device_not_found 是确定性错误：计划本身写错了，
+        # 用同一批参数原样重放不可能成功，只会白白耗掉重试额度、拖慢自愈。
+        # 直接跳到 replan 分支，把失败原因（已带合法值列表）交回 Planner 重写。
+        # tool_error / state_mismatch 可能是瞬时的（超时、状态竞态），仍然可重试。
+        deterministic = verification.problem_type in ("unsupported_action", "device_not_found")
+        if retry_count <= max_retries and not deterministic:
             next_status = "executing"
             replan_count = state.get("replan_count", 0)
+            emit_progress(
+                "step_retry",
+                step_id=execution["step"]["step_id"],
+                attempt=retry_count + 1,
+                max_attempts=max_retries + 1,
+                problem_type=verification.problem_type,
+            )
         else:
             replan_count = state.get("replan_count", 0) + 1
             max_replans = getattr(getattr(settings, "planning", None), "max_replans", 1)
             next_status = "planning" if replan_count <= max_replans else "failed"
+            emit_progress(
+                "replan_requested",
+                step_id=execution["step"]["step_id"],
+                replan_count=replan_count,
+                max_replans=max_replans,
+                accepted=next_status == "planning",
+                problem_type=verification.problem_type,
+            )
         feedback = (
             f"步骤 {execution['step']['step_id']}（{execution['step']['description']}）失败："
             f"{verification.reason}。工具结果：{execution['tool_result']}"
@@ -481,6 +556,13 @@ def build_graph(
         else:
             failure = state.get("planning_failure_feedback", "未知原因")
             content = f"多步骤任务未能完成，已停止继续执行。最后失败原因：{failure}"
+        emit_progress(
+            "planning_finished",
+            status=status,
+            succeeded=succeeded,
+            total=len(results),
+            plan_revision=state.get("plan_revision", 0),
+        )
         return {
             "messages": [AIMessage(content=content)],
             "planning_active": False,

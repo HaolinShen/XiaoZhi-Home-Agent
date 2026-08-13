@@ -46,6 +46,7 @@ from loguru import logger
 # ---- 项目模块 ----
 from src.config import get_settings, Settings
 from src.devices import DeviceRegistry, SimulatorBackend
+from src.progress_view import PlanProgressView, format_arguments, format_state
 from src.tools import set_registry as set_tools_registry
 from src.mcp import load_external_tools
 from src.agent import (
@@ -113,6 +114,7 @@ def _print_help() -> None:
     cmd_table.add_row("/scenes", "列出所有可用的场景模式")
     cmd_table.add_row("/reset", "重置对话记忆（开始新对话）")
     cmd_table.add_row("/history", "查看当前会话最近的 Checkpoint 状态历史")
+    cmd_table.add_row("/plan", "复盘最近一次多步骤计划：Planner 产出 + 逐步验证结果")
     cmd_table.add_row("/help", "显示此帮助信息")
     cmd_table.add_row("/quit, /exit", "退出程序")
 
@@ -160,10 +162,73 @@ def _print_checkpoint_history(graph, config: dict) -> None:
     console.print(table)
 
 
-def _approval_payload(result: dict):
-    """Extract the first LangGraph interrupt payload from an invoke result."""
-    interrupts = result.get("__interrupt__", ())
-    return interrupts[0].value if interrupts else None
+def _print_last_plan(graph, config: dict) -> None:
+    """打印本会话最近一次计划的逐步执行与验证结果。
+
+    进度事件是"流过去就没了"，这个命令从 checkpoint 里把同一份轨迹再取出来，
+    用于事后复盘：哪一步重试过、Verifier 比对的期望值和实测值分别是什么。
+    """
+    values = graph.get_state(config).values
+    plan = values.get("plan")
+    if not plan:
+        console.print("\n[dim]本会话还没有生成过多步骤计划。[/dim]")
+        return
+
+    console.print()
+    console.print(Panel(
+        f"[bold]目标[/bold] {plan.get('goal', '')}\n"
+        f"[dim]理由[/dim] {plan.get('rationale') or '—'}\n"
+        f"[dim]版本[/dim] v{values.get('plan_revision', 1)}"
+        f" · [dim]状态[/dim] {values.get('planning_status', 'unknown')}"
+        f" · [dim]重新规划[/dim] {values.get('replan_count', 0)} 次",
+        title="📋 最近一次计划",
+        border_style="magenta",
+    ))
+
+    plan_table = Table(
+        title="Planner 产出（执行前就已确定）", box=box.ROUNDED,
+        border_style="magenta", title_justify="left",
+    )
+    plan_table.add_column("步", width=3, justify="right", style="bold")
+    plan_table.add_column("要做什么", style="white")
+    plan_table.add_column("工具", style="cyan")
+    plan_table.add_column("参数", style="dim")
+    for step in plan.get("steps", []):
+        plan_table.add_row(
+            str(step.get("step_id", "?")),
+            str(step.get("description", "")),
+            str(step.get("tool_name", "")),
+            format_arguments(step.get("arguments")),
+        )
+    console.print(plan_table)
+
+    results = values.get("planning_results", [])
+    if not results:
+        console.print("[dim]计划尚未执行（可能仍在等待确认，或已被拒绝）。[/dim]")
+        return
+
+    result_table = Table(
+        title="Executor + Verifier 轨迹（每次尝试一行）", box=box.ROUNDED,
+        border_style="blue", title_justify="left",
+    )
+    result_table.add_column("计划", width=4, justify="right", style="dim")
+    result_table.add_column("步", width=3, justify="right", style="bold")
+    result_table.add_column("工具返回", style="white")
+    result_table.add_column("验证", width=6)
+    result_table.add_column("期望 vs 实测", style="dim")
+    for item in results:
+        verification = item.get("verification", {})
+        ok = verification.get("success")
+        result_table.add_row(
+            f"v{item.get('plan_revision', 1)}",
+            str(item.get("step_id", "?")),
+            str(item.get("tool_result", "")),
+            "[green]通过[/green]" if ok else f"[red]{verification.get('problem_type', '失败')}[/red]",
+            f"{format_state(verification.get('expected_state'))}"
+            f" {'≡' if ok else '≠'} "
+            f"{format_state(verification.get('actual_state'))}",
+        )
+    console.print(result_table)
 
 
 def _ask_for_approval(payload: dict) -> bool:
@@ -180,15 +245,42 @@ def _ask_for_approval(payload: dict) -> bool:
     return answer in {"y", "yes", "确认", "同意", "继续", "执行", "确定", "好"}
 
 
-def _invoke_with_approval(graph, state_input: dict, config: dict) -> dict:
-    """Invoke a graph and resume any approval interrupts using the same thread."""
+def _stream_segment(graph, payload, config: dict, view: PlanProgressView) -> dict | None:
+    """流式跑图的一段，边跑边渲染进度，返回遇到的第一个 interrupt。
+
+    用 stream 而不是 invoke 是关键：只有 stream 才会把节点里
+    `emit_progress` 发出的 custom 事件交给调用方。invoke 模式下这些事件
+    会被 LangGraph 丢弃，Planner / Executor / Verifier 的分工也就看不见了。
+    """
+    pending = None
+    # status 是 rich 的 Live 区域：view 打印的进度会正常滚动在上方，
+    # 只有"思考中"这一行留在底部，所以等 LLM 时依旧有反馈。
     with console.status("[dim]思考中...[/dim]", spinner="dots"):
-        result = graph.invoke(state_input, config)
-    while payload := _approval_payload(result):
-        approved = _ask_for_approval(payload)
-        with console.status("[dim]正在继续执行...[/dim]", spinner="dots"):
-            result = graph.invoke(Command(resume={"approved": approved}), config)
-    return result
+        for mode, chunk in graph.stream(
+            payload, config, stream_mode=["custom", "updates"]
+        ):
+            if mode == "custom":
+                view.handle(chunk)
+            elif mode == "updates":
+                interrupts = chunk.get("__interrupt__") if isinstance(chunk, dict) else None
+                if interrupts:
+                    pending = interrupts[0].value
+    return pending
+
+
+def _invoke_with_approval(
+    graph, state_input: dict, config: dict, view: PlanProgressView
+) -> dict:
+    """Stream a graph run and resume any approval interrupts on the same thread."""
+    view.reset()
+    pending = _stream_segment(graph, state_input, config, view)
+    while pending:
+        approved = _ask_for_approval(pending)
+        pending = _stream_segment(
+            graph, Command(resume={"approved": approved}), config, view
+        )
+    # 进度事件已经边跑边打了，最终状态从 checkpoint 读一次即可。
+    return graph.get_state(config).values
 
 
 # ============================================================
@@ -200,6 +292,7 @@ def run_interactive_loop(
     registry: DeviceRegistry,
     context: AgentContext,
     sessions: SessionManager,
+    view: PlanProgressView,
 ) -> None:
     """
     交互式对话主循环。
@@ -207,8 +300,8 @@ def run_interactive_loop(
     流程:
       1. 读取用户输入
       2. 处理特殊命令
-      3. 调用 Agent 处理普通消息
-      4. 显示 Agent 回复
+      3. 流式调用 Agent，边跑边渲染 Planner / Executor / Verifier 过程
+      4. 显示 Agent 最终回复
       5. 循环
     """
     while True:
@@ -259,18 +352,23 @@ def run_interactive_loop(
                 _print_checkpoint_history(graph, context.to_config())
                 continue
 
-            # ---- 正常对话 ----
-            console.print("\n[bold cyan]🤖 小智:[/bold cyan] ", end="")
+            elif user_input.lower() == "/plan":
+                _print_last_plan(graph, context.to_config())
+                continue
 
+            # ---- 正常对话 ----
             state_input, config = build_agent_request(
                 HumanMessage(content=user_input), context
             )
-            result = _invoke_with_approval(graph, state_input, config)
+            # 进度事件会在这里边跑边打印，所以 "小智:" 标签要等它跑完再打，
+            # 否则规划过程会插在标签和回复中间。
+            result = _invoke_with_approval(graph, state_input, config, view)
 
             # 提取最终回复
             final_msg = result["messages"][-1]
             response = final_msg.content
 
+            console.print("\n[bold cyan]🤖 小智:[/bold cyan] ", end="")
             # 用 Markdown 渲染回复（支持表格、列表等）
             console.print(Markdown(response))
 
@@ -309,6 +407,11 @@ def chat(
         False,
         "--admin",
         help="以家庭管理员身份运行（仅供可信后端或本地演示设置）",
+    ),
+    trace: bool = typer.Option(
+        False,
+        "--trace",
+        help="额外显示路由、记忆判断等诊断事件（规划过程默认已显示）",
     ),
 ):
     """
@@ -400,10 +503,17 @@ def chat(
         "[bold]现在家里什么状态?[/bold] / "
         "[bold]杭州今天天气怎么样?[/bold]"
     )
+    console.print(
+        "[dim]多动作请求（如「关掉客厅灯，然后把卧室空调调到25度」）会走 "
+        "Planner → Executor → Verifier，过程会逐步显示[/dim]"
+    )
     console.print("[dim]输入 /help 查看更多用法，/quit 退出[/dim]")
 
     # ---- 启动对话循环 ----
-    run_interactive_loop(graph, registry, context, sessions)
+    run_interactive_loop(
+        graph, registry, context, sessions,
+        PlanProgressView(console, show_trace=trace),
+    )
 
 
 @app.command()

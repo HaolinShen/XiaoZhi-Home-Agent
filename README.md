@@ -148,6 +148,9 @@ python -m src.main
 python -m src.main --model qwen-max
 python -m src.main --debug
 
+# 额外显示路由 / 记忆判断等诊断事件（规划过程默认就会显示）
+python -m src.main --trace
+
 # 使用稳定业务会话，并提供 App 当前房间上下文
 python -m src.main --home-id demo-home --user-id user-001 \
   --session-id session-001 --client-id phone-001 --room-id living_room
@@ -220,8 +223,34 @@ python -m src.main --home-id demo-home --user-id admin-001 --admin
 | `/status` | 查看所有设备状态（不经过 LLM） |
 | `/scenes` | 列出所有可用场景 |
 | `/reset` | 重置对话记忆 |
+| `/history` | 查看当前会话最近的 Checkpoint 状态历史 |
+| `/plan` | 复盘最近一次多步骤计划：Planner 产出 + 逐步验证轨迹 |
 | `/help` | 显示帮助 |
 | `/quit` | 退出 |
+
+### 看得见的规划过程
+
+多动作请求（如「关掉客厅灯，然后把卧室空调调到 25 度」）会走 Planner → Executor →
+Verifier，三个阶段在运行时逐步显示，不需要额外开关：
+
+```text
+🧭 Planner 分支   目标 关掉客厅灯，然后把卧室空调调到25度
+📋 计划 v1（2 步 · 此刻尚未触碰任何设备）
+  1  关闭客厅灯      control_light  device_name=客厅灯, action=off
+  2  打开卧室空调     control_ac     device_name=卧室空调, action=on, temperature=25
+▶ 计划 v1 已批准，开始逐步执行
+⚙ Executor 步骤 1/2 · 关闭客厅灯
+    调用 control_light(device_name=客厅灯, action=off)
+    工具返回 ✅ 客厅灯已关闭。
+✔ Verifier 步骤 1/2 通过 · 期望 power=False ≡ 实测 power=False
+🏁 规划结束 · completed · 验证通过 2 次 / 共 2 次尝试 · 最终计划 v1
+```
+
+计划表格在任何设备被操作之前就已完整列出工具名和参数——这就是「Planner 只写不做」
+的直接证据。失败时能看到 `↻ 重试步骤 …`，重试额度用尽则是 `⟲ 把失败原因交回 Planner
+重新规划`，随后 v2 计划重新出现并再次等待确认。
+
+路由、记忆判断这类诊断事件默认折叠，加 `--trace` 才显示，避免淹没规划过程。
 
 ---
 

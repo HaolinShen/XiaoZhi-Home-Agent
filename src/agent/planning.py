@@ -19,6 +19,29 @@ PLANNING_TOOL_NAMES = (
     "control_humidifier",
 )
 
+# 每个工具的合法 action 及其附带参数。
+#
+# 为什么要单独维护这份词表：Planner 走 `llm.with_structured_output(ExecutionPlan)`，
+# 不像 ReAct 分支那样 `bind_tools`，所以工具 docstring 里写的 "on / off / ..."
+# 一个字都到不了模型面前。模型只能凭常识猜 action，于是会写出 Home Assistant
+# 风格的 turn_on / turn_off —— 这正是规划第一版反复失败的根因。把合法值显式喂给
+# 它，第一版就该是对的。
+#
+# 三处 action 枚举必须保持同步：工具实现的 if/elif、expected_state_for_step 的
+# if/elif、以及这里。它们都靠手写（if/elif 无法反射），tests 用一致性用例钉住。
+TOOL_ACTIONS: dict[str, str] = {
+    "control_light": "on / off / set_brightness(brightness) / set_color(color)",
+    "control_ac": (
+        "on(可带 temperature、mode) / off / set_temp(temperature) / "
+        "set_mode(mode) / set_fan(fan_speed)"
+    ),
+    "control_tv": "on / off / set_volume(volume) / mute / set_channel(channel)",
+    "control_curtain": "open / close / set_position(percentage)",
+    "control_humidifier": (
+        "on / off / set_humidity(target_humidity) / set_mist_level(mist_level)"
+    ),
+}
+
 
 class PlanStep(BaseModel):
     """One executable and independently verifiable device operation."""
@@ -96,6 +119,7 @@ def planner_prompt(
 ) -> str:
     """Build the strict prompt used for initial planning and replanning."""
     feedback = failure_feedback or "无，这是第一次规划。"
+    actions = "\n".join(f"  · {tool}: {spec}" for tool, spec in TOOL_ACTIONS.items())
     return f"""你是智能家居任务规划器。请把用户目标拆成 2 到 8 个顺序执行的原子步骤。
 
 用户目标：{user_goal}
@@ -111,11 +135,14 @@ def planner_prompt(
 
 规则：
 1. 每一步只能调用一个工具，工具必须是 {', '.join(PLANNING_TOOL_NAMES)} 之一。
-2. arguments 必须严格符合对应工具参数；device_name 使用设备中文名称。
-3. 不使用 activate_scene，因为本分支用于自定义多步骤目标。
-4. 不添加用户没有要求的设备操作。
-5. 如果是重新规划，应针对失败原因调整步骤或参数，但仍保持用户原目标。
-6. 只输出结构化 ExecutionPlan，不输出额外文本。
+2. arguments.action 只能取下列合法值，括号内是该 action 需要附带的参数；
+   不要使用 turn_on / turn_off 这类其他平台的命名：
+{actions}
+3. arguments 必须严格符合对应工具参数；device_name 使用设备中文名称。
+4. 不使用 activate_scene，因为本分支用于自定义多步骤目标。
+5. 不添加用户没有要求的设备操作。
+6. 如果是重新规划，应针对失败原因调整步骤或参数，但仍保持用户原目标。
+7. 只输出结构化 ExecutionPlan，不输出额外文本。
 """
 
 
@@ -131,6 +158,18 @@ def plan_approval_payload(plan: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
         "plan": plan,
     }
+
+
+def _unsupported_action(tool_name: str, action: Any) -> str:
+    """Build an unsupported-action message that names the valid choices.
+
+    重新规划时这条 feedback 会回喂给 Planner，所以带上合法值列表比只说
+    "unsupported action" 有用得多 —— 否则模型只能凭常识反推正确写法，弱一点的
+    模型可能改成 close/disable 又错一轮，白白耗掉重新规划额度。
+    """
+    spec = TOOL_ACTIONS.get(tool_name, "")
+    suffix = f"（{tool_name} 仅支持 {spec}）" if spec else ""
+    return f"unsupported action: {action}{suffix}"
 
 
 def expected_state_for_step(
@@ -165,7 +204,7 @@ def expected_state_for_step(
         elif action == "set_color":
             expected = {"power": True, "color": args.get("color", "暖白")}
         else:
-            return device.device_id, {}, f"unsupported action: {action}"
+            return device.device_id, {}, _unsupported_action(tool_name, action)
     elif tool_name == "control_ac":
         if action == "on":
             expected = {
@@ -182,7 +221,7 @@ def expected_state_for_step(
         elif action == "set_fan":
             expected = {"fan_speed": args.get("fan_speed", "auto")}
         else:
-            return device.device_id, {}, f"unsupported action: {action}"
+            return device.device_id, {}, _unsupported_action(tool_name, action)
     elif tool_name == "control_tv":
         if action == "on":
             expected = {"power": True}
@@ -195,7 +234,7 @@ def expected_state_for_step(
         elif action == "set_channel":
             expected = {"power": True, "channel": args.get("channel", "HDMI 1")}
         else:
-            return device.device_id, {}, f"unsupported action: {action}"
+            return device.device_id, {}, _unsupported_action(tool_name, action)
     elif tool_name == "control_curtain":
         if action == "open":
             expected = {"position": 100}
@@ -204,7 +243,7 @@ def expected_state_for_step(
         elif action == "set_position":
             expected = {"position": max(0, min(100, int(args.get("percentage", 100))))}
         else:
-            return device.device_id, {}, f"unsupported action: {action}"
+            return device.device_id, {}, _unsupported_action(tool_name, action)
     elif tool_name == "control_humidifier":
         if action == "on":
             expected = {"power": True}
@@ -218,7 +257,7 @@ def expected_state_for_step(
         elif action == "set_mist_level":
             expected = {"power": True, "mist_level": args.get("mist_level", "auto")}
         else:
-            return device.device_id, {}, f"unsupported action: {action}"
+            return device.device_id, {}, _unsupported_action(tool_name, action)
     else:
         return device.device_id, {}, f"unsupported tool: {tool_name}"
     return device.device_id, expected, None

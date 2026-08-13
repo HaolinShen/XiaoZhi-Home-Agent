@@ -9,7 +9,13 @@ from langgraph.types import Command
 
 from src.agent.context import AgentContext, SpaceDirectory
 from src.agent.graph import build_graph
-from src.agent.planning import ExecutionPlan, PlanStep, should_use_planner
+from src.agent.planning import (
+    TOOL_ACTIONS,
+    ExecutionPlan,
+    PlanStep,
+    expected_state_for_step,
+    should_use_planner,
+)
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.memory.store import close_checkpointer
@@ -119,6 +125,52 @@ class PhaseSevenPlannerExecutorVerifierTests(unittest.TestCase):
         self.assertFalse(should_use_planner("关闭客厅灯"))
         self.assertFalse(should_use_planner("我要出门了"))
         self.assertFalse(should_use_planner("开启离家模式"))
+
+    def test_tool_actions_stay_in_sync_with_expected_state_for_step(self):
+        """TOOL_ACTIONS 词表（喂给 Planner）必须和 expected_state_for_step 的
+        if/elif（执行前校验）逐一对上：文档里写的每个合法 action 都不能被判成
+        unsupported，否则 Planner 照做反而失败。三处枚举靠手写同步，用这条钉住。
+        """
+        import re
+
+        # 每个工具挑一个真实存在的设备名，让 device 能被解析（否则会先撞 device_not_found）。
+        device_for_tool = {
+            "control_light": "客厅灯",
+            "control_ac": "客厅空调",
+            "control_tv": "客厅电视",
+            "control_curtain": "客厅窗帘",
+            "control_humidifier": "客厅加湿器",
+        }
+        for tool_name, spec in TOOL_ACTIONS.items():
+            # spec 形如 "on / off / set_temp(temperature) / ..."；按 " / " 切段，
+            # 每段去掉括号里的参数说明，剩下的裸词就是合法 action 名。
+            for segment in spec.split("/"):
+                action = re.sub(r"\(.*?\)", "", segment).strip()
+                self.assertTrue(action, f"{tool_name} 的 spec 段为空：{segment!r}")
+                step = {
+                    "tool_name": tool_name,
+                    "arguments": {"device_name": device_for_tool[tool_name], "action": action},
+                }
+                _, _, error = expected_state_for_step(step, self.registry)
+                self.assertIsNone(
+                    error,
+                    f"{tool_name} 的合法 action {action!r} 被判成了错误：{error}",
+                )
+
+    def test_invalid_action_is_rejected_with_valid_choices_listed(self):
+        """turn_off 这类其他平台命名必须被判 unsupported，且错误信息带上合法值列表，
+        这样重新规划时 Planner 能直接照着改，而不是再猜一轮。
+        """
+        step = {
+            "tool_name": "control_light",
+            "arguments": {"device_name": "客厅灯", "action": "turn_off"},
+        }
+        _, _, error = expected_state_for_step(step, self.registry)
+        self.assertIsNotNone(error)
+        self.assertIn("unsupported action", error)
+        self.assertIn("turn_off", error)
+        # 合法值列表要出现在反馈里，供 Planner 参考。
+        self.assertIn("on / off", error)
 
     def test_approved_plan_executes_each_step_and_verifies_actual_state(self):
         graph, _ = self._build([plan()])
@@ -274,7 +326,9 @@ class PhaseSevenPlannerExecutorVerifierTests(unittest.TestCase):
         self.assertEqual(completed["planning_status"], "failed")
         self.assertEqual(completed["replan_count"], 1)
         self.assertEqual(fake.plan_index, 1)
-        self.assertEqual(len(completed["planning_results"]), 2)
+        # device_not_found 是确定性错误：不再浪费重试额度，第一次失败就直接走 replan，
+        # 因此只记录一次尝试（而不是重试后的两次）。
+        self.assertEqual(len(completed["planning_results"]), 1)
         self.assertIn("未能完成", completed["messages"][-1].content)
 
 
