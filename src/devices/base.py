@@ -29,6 +29,13 @@ from ..models import (
 )
 
 
+# 设备名模糊匹配时忽略的助词与量词。
+# 让"客厅的灯""那台空调"能匹配到"客厅灯""客厅空调"，
+# 而不影响策略 3"多候选拒绝猜测"的安全规则。
+# 这里只放纯虚词/量词，绝不放可能作为设备名区分字的实义字（如"室""厅"）。
+_MATCH_STOPWORDS = frozenset("的之那这台个只盏")
+
+
 # ============================================================
 # 抽象后端接口
 # ============================================================
@@ -146,9 +153,13 @@ class DeviceRegistry:
             if device.name == user_input:
                 return device
 
-        # ---- 策略 2: 模糊匹配（字符包含）----
+        # ---- 策略 2: 模糊匹配（字符包含，忽略助词与量词）----
+        # 过滤掉"的/那/台"等虚词后再比对，这样"客厅的灯"也能命中"客厅灯"。
         for device in type_devices.values():
-            chars = [c for c in user_input if c.strip()]
+            chars = [
+                c for c in user_input
+                if c.strip() and c not in _MATCH_STOPWORDS
+            ]
             if chars and all(c in device.name for c in chars):
                 return device
 

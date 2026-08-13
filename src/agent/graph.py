@@ -449,16 +449,23 @@ def build_graph(
             replan_count = state.get("replan_count", 0) + 1
             max_replans = getattr(getattr(settings, "planning", None), "max_replans", 1)
             next_status = "planning" if replan_count <= max_replans else "failed"
+        feedback = (
+            f"步骤 {execution['step']['step_id']}（{execution['step']['description']}）失败："
+            f"{verification.reason}。工具结果：{execution['tool_result']}"
+        )
+        if verification.problem_type == "device_not_found":
+            feedback += (
+                "\n设备名未能解析。请仅从下列可用设备中选择，"
+                "device_name 必须与设备名称逐字一致（不要添加'的''那台'等修饰）：\n"
+                + registry.get_device_list_prompt()
+            )
         return {
             "last_verification": verification.model_dump(),
             "planning_results": results,
             "step_retry_count": retry_count,
             "replan_count": replan_count,
             "planning_status": next_status,
-            "planning_failure_feedback": (
-                f"步骤 {execution['step']['step_id']}（{execution['step']['description']}）失败："
-                f"{verification.reason}。工具结果：{execution['tool_result']}"
-            ),
+            "planning_failure_feedback": feedback,
         }
 
     def planning_finalize_node(state: AgentState) -> dict:
