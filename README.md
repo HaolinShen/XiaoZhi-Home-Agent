@@ -235,14 +235,17 @@ python -m src.mcp.server --transport sse --port 8765
 }
 ```
 
-项目还内置了一个无需 API Key 的 Open-Meteo 天气 MCP。`.env.example` 默认通过当前 Python 环境启动它：
+项目还内置了一个基于**彩云天气**的天气 MCP。`.env.example` 默认通过当前 Python 环境启动它：
 
 ```dotenv
 EXTERNAL_MCP_SERVERS=[{"name":"weather","transport":"stdio","command":"python","args":["-m","src.mcp.weather_server"]}]
 WEATHER_DEFAULT_LOCATION=杭州
+CAIYUN_WEATHER_TOKEN=你的彩云 token
 ```
 
-启动主 Agent 后可以询问“杭州今天天气怎么样”或“北京未来三天天气如何”。天气 MCP 只提供实时天气和预报查询，不拥有任何设备控制权限。
+彩云 token 可在 <https://dashboard.caiyunapp.com> 免费领取；没配置时天气工具会返回明确的提示而不是报错。彩云只接受经纬度，城市名到坐标的转换仍由免费的 Open-Meteo geocoding 完成，无需额外 Key。
+
+启动主 Agent 后可以询问“杭州今天天气怎么样”或“北京未来三天天气如何”。天气 MCP 只提供实时天气和预报查询（免费额度下预报最多 3 天），不拥有任何设备控制权限。
 
 ---
 
