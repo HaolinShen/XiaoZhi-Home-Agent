@@ -181,7 +181,7 @@ langgraph/
 │   │   ├── __init__.py
 │   │   ├── server.py         # MCP 服务器 (暴露工具给外部 AI)
 │   │   ├── client.py         # MCP 客户端 (消费外部 MCP 服务)
-│   │   └── weather_server.py  # Open-Meteo 天气 MCP（无需 API Key）
+│   │   └── weather_server.py  # 彩云天气 MCP（需 CAIYUN_WEATHER_TOKEN）
 │   │
 │   ├── memory/               # 记忆层
 │   │   ├── __init__.py
@@ -855,12 +855,13 @@ python -m src.mcp.server --transport sse --port 8765
 # }
 ```
 
-**MCP Client** (`mcp/client.py`): 启动时发现外部 MCP 工具，并将其转换为 LangChain 工具交给 Agent。当前项目附带一个基于 Open-Meteo 的天气 MCP：
+**MCP Client** (`mcp/client.py`): 启动时发现外部 MCP 工具，并将其转换为 LangChain 工具交给 Agent。当前项目附带一个基于**彩云天气**的天气 MCP：
 
 ```python
 # .env.example 已提供此配置；python 会自动使用当前解释器
 EXTERNAL_MCP_SERVERS=[{"name":"weather","transport":"stdio","command":"python","args":["-m","src.mcp.weather_server"]}]
 WEATHER_DEFAULT_LOCATION=杭州
+CAIYUN_WEATHER_TOKEN=你的彩云 token
 ```
 
 启动后可直接询问：
@@ -870,7 +871,7 @@ WEATHER_DEFAULT_LOCATION=杭州
 北京未来三天天气如何？
 ```
 
-天气 MCP 提供 `weather__current_weather` 和 `weather__weather_forecast` 两个只读工具，数据来自 Open-Meteo，不需要天气服务 API Key。网络不可用时工具会返回可解释的暂时不可用信息，不会伪造天气结果。
+天气 MCP 提供 `weather__current_weather` 和 `weather__weather_forecast` 两个只读工具，数据来自彩云天气。彩云 token 可在 <https://dashboard.caiyunapp.com> 免费领取；没配置时工具会返回明确的提示而不是报错（网络不可用时同理）。城市名到坐标的转换仍由免费的 Open-Meteo geocoding 完成，无需额外 Key。
 
 ---
 
@@ -1099,10 +1100,10 @@ class MetricsInterceptor:
 
 本项目把记忆拆成两个层次，分别解决不同问题：
 
-| 记忆层 | 解决的问题 | 典型内容 | 保存位置 |
-|--------|------------|----------|----------|
-| **短期会话记忆** | “这一轮对话之前聊了什么？” | 用户消息、AI 回复、工具调用结果、滚动摘要、当前关注的房间和设备 | LangGraph Checkpoint |
-| **长期结构化记忆** | “这个用户长期喜欢什么、家里有什么固定规则？” | 灯光偏好、空调温度、设备别名、生活例程、家庭约束 | 独立 SQLite 数据库 |
+| 记忆层 | 解决的问题 | 典型内容 | 保存位置 | 开关 |
+|--------|------------|----------|----------|------|
+| **短期会话记忆** | “这一轮对话之前聊了什么？” | 用户消息、AI 回复、工具调用结果、滚动摘要、当前关注的房间和设备 | `data/checkpoints.db` | `CHECKPOINT_DB_PATH` |
+| **长期结构化记忆** | “这个用户长期喜欢什么、家里有什么固定规则？” | 灯光偏好、空调温度、设备别名、生活例程、家庭约束 | `data/memories.db` | `ENABLE_LONG_TERM_MEMORY` |
 
 举个例子：
 
@@ -1118,28 +1119,85 @@ AI：已打开。
 用户：我一般喜欢把客厅灯调成暖光，以后按这个习惯来。
 ```
 
-“喜欢暖光”可能在未来的新会话中仍然有用，因此适合作为**长期记忆候选**。注意这里先生成候选，不会直接写入正式记忆；只有用户确认后才保存。
+“喜欢暖光”在未来的新会话中仍然有用，属于**长期记忆**。
 
-两层记忆的关系可以概括为：
+**先看代码分布**，后面每一节都会回到这张表：
+
+| 文件 | 行数 | 职责 |
+|------|-----:|------|
+| `src/memory/models.py` | 128 | 六个 Pydantic 数据模型，定义“记忆长什么样” |
+| `src/memory/repository.py` | 520 | SQLite 建表、迁移、CRUD。只管读写，不判断权限 |
+| `src/memory/service.py` | 294 | 权限、作用域、候选、检索排序、冲突合并 |
+| `src/memory/extractor.py` | 67 | 正则抽取自然语言候选。不碰数据库 |
+| `src/memory/summarizer.py` | 90 | 会话摘要与 token 估算（服务于短期记忆） |
+| `src/memory/store.py` | 117 | Checkpointer 创建与过期清理（服务于短期记忆） |
+| `src/tools/memory.py` | — | 暴露给 LLM 的 9 个记忆工具 |
+
+两层记忆的关系（注意**明确表述不经过候选**，这是三条路径中唯一直达的一条）：
 
 ```text
 当前会话消息 ──> Checkpoint ──> 同一个 thread_id 恢复上下文
 
-明确偏好或重复操作 ──> 候选记忆 ──> 用户确认 ──> 长期记忆
-                                                    │
-新会话中的问题 ──> 检索最相关记忆 <──────────────────┘
+
+① 用户明确要求记住 ─────────────────────────────────> 长期记忆
+                                                          ↑
+② 同一操作重复 3 次 ──┐                                   │
+                      ├─> 候选记忆 ──> 用户确认 ──────────┘
+③ 对话中被动抽取 ─────┘         │
+                                └─> 用户拒绝 ──> rejected（不写入）
+
+新会话中的问题 ──> 按当前身份检索 Top-K ──> 注入系统提示词
 ```
+
+> ⚠️ 路径 ① 直接写库，**没有确认步骤**。理由见 6.4.6：用户已经明说了“以后按这个来”，再弹一次确认属于多余。候选机制针对的是系统自己**猜出来**的偏好（路径 ②③）。
 
 #### 6.4.2 短期会话记忆：Checkpoint 如何工作
 
-LangGraph 在图编译时接收一个 checkpointer：
+**代码位置：`src/memory/store.py:37-79`**
+
+这个函数做一件事：根据配置返回内存版还是 SQLite 版的 checkpointer。
+
+```python
+# src/memory/store.py:37
+def create_checkpointer(db_path: Optional[str] = None):
+    if db_path:
+        if not _HAS_SQLITE:
+            raise RuntimeError(
+                "SQLite checkpointing is configured but "
+                "langgraph-checkpoint-sqlite is not installed"
+            )
+        try:
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)      # 目录不存在就建
+
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            checkpointer = SqliteSaver(conn)
+            logger.info(f"✅ SQLite 检查点已就绪 | path={db_path}")
+            return checkpointer
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to initialize SQLite checkpointer at {db_path!r}: {exc}"
+            ) from exc
+
+    logger.info("📝 使用内存检查点（会话记忆在重启后丢失）")
+    return MemorySaver()
+```
+
+三个容易忽略但重要的设计：
+
+1. **`check_same_thread=False`**（`store.py:69`）：LangGraph 可能在不同线程里执行节点，默认的 SQLite 线程检查会直接抛异常。
+2. **配置了路径就必须成功**（`store.py:73-76`）：不会“SQLite 打不开就悄悄退回内存模式”。否则用户以为在持久化，重启后发现会话全丢。宁可启动就报错。
+3. **`_HAS_SQLITE` 是可选依赖**（`store.py:29-34`）：`langgraph-checkpoint-sqlite` 没装时，只要不配置 `CHECKPOINT_DB_PATH` 就仍能跑内存模式。
+
+编译图时把它交给 LangGraph（`src/agent/graph.py:730` 附近）：
 
 ```python
 checkpointer = create_checkpointer(settings.memory.db_path)
 graph = workflow.compile(checkpointer=checkpointer)
 ```
 
-每次图执行后，LangGraph 会按照 `thread_id` 保存 `AgentState`。再次使用相同的 `thread_id` 调用图时，之前的消息和状态会被恢复。
+每次图执行后，LangGraph 按 `thread_id` 保存整个 `AgentState`。再次用相同 `thread_id` 调用时自动恢复：
 
 ```text
 thread_id="session-a"
@@ -1150,19 +1208,37 @@ thread_id="session-b"
   另一段独立会话，不会读取 session-a 的消息历史
 ```
 
-项目支持两种 Checkpoint 存储方式：
+两种存储方式的取舍：
 
 | 对比项 | `MemorySaver` | `SqliteSaver` |
 |--------|---------------|---------------|
+| 触发条件 | `CHECKPOINT_DB_PATH` 为空 | 配置了路径 |
 | 存储位置 | 当前 Python 进程内存 | `data/checkpoints.db` |
 | 进程重启后 | 会话状态丢失 | 可以恢复原会话状态 |
 | 适用场景 | 单元测试、临时调试 | 本地开发和持久化会话 |
 
-`CHECKPOINT_DB_PATH` 为空时使用内存模式；配置数据库路径时使用 SQLite：
+**会话过期清理：`src/memory/store.py:89-117`**
 
-```dotenv
-CHECKPOINT_DB_PATH=data/checkpoints.db
+`cleanup_expired_checkpoints()` 遍历所有 thread，取每个 thread 最新快照的时间戳，超过 TTL 的整个删除：
+
+```python
+# src/memory/store.py:98-108
+for item in checkpointer.list(None):          # None = 不过滤，扫全部
+    configurable = item.config.get("configurable", {})
+    thread_id = configurable.get("thread_id")
+    if not thread_id:
+        continue
+    timestamp = item.checkpoint.get("ts")
+    if timestamp:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        previous = latest_by_thread.get(thread_id)
+        if previous is None or parsed > previous:
+            latest_by_thread[thread_id] = parsed   # 只留最新的一条
 ```
+
+注意 `.replace("Z", "+00:00")`：Python 3.10 及更早的 `fromisoformat` 不认 `Z` 后缀，而 LangGraph 写入的时间戳用的正是 `Z`。判断过期时统一 `.astimezone(timezone.utc)`（`store.py:113`），避免带时区和不带时区的时间相减报错。
+
+TTL 由 `CHECKPOINT_SESSION_TTL_HOURS` 控制，默认 168 小时（7 天）。这个函数需要**由调用方主动触发**，不是后台定时任务。
 
 > 依赖以 `pyproject.toml` 为准。请先使用项目既有的 Conda 环境检查依赖；如果环境缺少所需包，应暂停运行并交由环境维护者配置，不要在教程步骤中擅自创建环境或安装依赖。
 
@@ -1176,29 +1252,97 @@ Checkpoint 能保存消息，但不能让消息无限增长。长对话会带来
 2. 很久以前的无关信息会干扰当前推理。
 3. 工具返回内容可能很长，持续保存在状态中会让数据库膨胀。
 
-因此图中在每次调用模型前都会经过 `compact_context` 节点：
+因此每次调用模型前都会经过 `compact_context` 节点（图结构见 `src/agent/graph.py:608`、`:653`、`:725-726`）：
 
 ```text
-sync_context
-    ↓
-compact_context  ── 保留最近消息、生成滚动摘要、裁剪旧工具结果
-    ↓
-agent
-    ↓ 有工具调用
-tools ──────────────> compact_context
+sync_context → memory_reasoner → task_router
+                                     ↓
+                              compact_context  ── 保留最近消息、生成滚动摘要、裁剪旧工具结果
+                                     ↓
+                                   agent
+                                     ↓ 有工具调用
+                             tools ──┴──> compact_context（回到压缩，形成闭环）
 ```
 
-相关配置如下：
+注意 `tools` 执行完不是直接回 `agent`，而是**再过一次压缩**。因为工具结果本身就是上下文膨胀的主要来源。
+
+**决定保留多少：`src/memory/summarizer.py:32-36`**
+
+```python
+# src/memory/summarizer.py:32
+keep_from = max(0, len(messages) - max_messages)
+while keep_from < len(messages) - 1 and estimate_tokens(messages[keep_from:]) > max_tokens:
+    keep_from += 1
+old = messages[:keep_from]
+recent = messages[keep_from:]
+```
+
+两道闸门叠加：先按**条数**切出最近 12 条，如果这 12 条估算 token 仍超限，就继续往后推窗口。`keep_from < len(messages) - 1` 保证**至少留一条**消息——否则模型会收到空输入。
+
+token 估算是刻意做成廉价且确定的（`summarizer.py:10-12`）：
+
+```python
+def estimate_tokens(messages: Iterable) -> int:
+    return sum(max(1, (len(str(getattr(message, "content", ""))) + 1) // 2) for message in messages)
+```
+
+按“2 个字符 ≈ 1 token”粗算。它不追求准确，只用来做护栏；换成真正的 tokenizer 会引入依赖和耗时，而护栏并不需要那种精度。
+
+**裁剪超长工具结果：`src/memory/summarizer.py:84-90`**
+
+```python
+def _truncate_message(message, max_chars: int):
+    content = str(getattr(message, "content", ""))
+    if max_chars <= 0 or len(content) <= max_chars:
+        return message
+    marker = "\n…（工具结果已裁剪）"
+    kept = max(0, max_chars - len(marker))
+    return message.model_copy(update={"content": content[:kept] + marker})
+```
+
+只裁 `ToolMessage`（`summarizer.py:26-31` 用 `isinstance` 判断），用户和 AI 的消息一律不动。留下明确的裁剪标记，模型才知道内容不完整，而不是误以为工具就返回了这么多。
+
+**真正写回 Checkpoint：`src/memory/summarizer.py:64-74`**
+
+```python
+recent_ids = {message.id for message in recent if getattr(message, "id", None)}
+removals = [
+    RemoveMessage(id=message.id)
+    for message in messages
+    if getattr(message, "id", None) and message.id not in recent_ids
+]
+```
+
+`RemoveMessage` 是 LangGraph 提供的删除指令。把它放进 `messages` 更新里，`add_messages` reducer 就会把对应消息从持久化状态中真正移除——不是只在这一轮不传给模型，而是数据库里也不再保留。这是“压缩”与“截断”的区别。
+
+**节点里如何汇总：`src/agent/graph.py:249-270`**
+
+```python
+updates, summary, token_estimate = build_compaction_update(
+    list(state["messages"]),
+    state.get("conversation_summary", ""),      # 上一轮的摘要，滚动累积
+    max_messages=getattr(settings.memory, "context_max_messages", 12),
+    max_tokens=getattr(settings.memory, "context_max_tokens", 2400),
+    ...
+)
+kept_count = len(state["messages"]) - sum(
+    1 for message in updates if message.__class__.__name__ == "RemoveMessage"
+)
+```
+
+摘要是**滚动合并**的（`summarizer.py:79-81`）：旧摘要与新归纳拼接后取末尾 `max_summary_chars` 个字符，所以越久远的内容会自然淡出。`conversation_summary` 最终被拼进系统提示词（`graph.py:535`），模型仍能看到早期对话的梗概。
+
+相关配置（`src/config.py:44-70`，前缀 `CHECKPOINT_`）：
 
 | 配置项 | 默认值 | 作用 |
 |--------|-------:|------|
-| `CHECKPOINT_CONTEXT_MAX_MESSAGES` | `12` | Checkpoint 中重点保留的最近消息数 |
-| `CHECKPOINT_CONTEXT_MAX_TOKENS` | `2400` | 上下文估算 token 上限 |
-| `CHECKPOINT_TOOL_RESULT_MAX_CHARS` | `1200` | 单条旧工具结果的字符上限 |
+| `CHECKPOINT_CONTEXT_MAX_MESSAGES` | `12` | 保留的最近消息条数 |
+| `CHECKPOINT_CONTEXT_MAX_TOKENS` | `2400` | 上下文估算 token 上限，超限则继续收窄窗口 |
+| `CHECKPOINT_TOOL_RESULT_MAX_CHARS` | `1200` | 单条工具结果的字符上限 |
 | `CHECKPOINT_SUMMARY_MAX_CHARS` | `1800` | 滚动摘要的最大长度 |
-| `CHECKPOINT_SESSION_TTL_HOURS` | `168` | 会话过期时间，默认 7 天 |
+| `CHECKPOINT_SESSION_TTL_HOURS` | `168` | 会话检查点保留时长，默认 7 天 |
 
-压缩不是简单删除历史。系统会把较早对话归纳到 `conversation_summary`，保留最近的原始消息，并通过 LangGraph 的 `RemoveMessage` 从持久化状态中移除不再需要的旧消息。
+压缩过程还会把 `context_message_count` 和 `context_token_estimate` 写回状态（`graph.py:265-266`），配合 `graph.py:260-262` 的 `logger.debug`，可以直接观察上下文规模的变化趋势。
 
 #### 6.4.4 长期记忆保存什么，不保存什么
 
@@ -1220,159 +1364,483 @@ tools ──────────────> compact_context
 
 实时设备状态应从 `DeviceBackend` 查询。把它当成长久偏好保存，会导致状态过时，还会混淆“设备现在是什么状态”和“用户长期喜欢什么”。
 
-一条正式记忆的核心结构如下：
+四种类型不是随手分的，它们在 `src/memory/models.py:23-27` 里是枚举，写库时由 Pydantic 卡住：
 
 ```python
-MemoryRecord(
-    scope="user",
-    memory_type="preference",
-    memory_key="lighting.color",
-    memory_value={"color": "暖光"},
-    confidence=0.84,
-    importance=0.65,
-    version=1,
-    valid_from=...,
-    valid_to=None,
-)
+# src/memory/models.py:23
+class MemoryType(str, Enum):
+    PREFERENCE = "preference"      # 偏好
+    ALIAS = "alias"                # 别名
+    ROUTINE = "routine"            # 例程
+    CONSTRAINT = "constraint"      # 约束
 ```
 
-这里故意使用 `memory_key + JSON memory_value`，而不是只保存一段自然语言。结构化数据更容易校验、去重、合并、检索和测试。
+**一条正式记忆长什么样：`src/memory/models.py:30-53`**
+
+```python
+class MemoryRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")     # 多传字段直接报错
+
+    id: str
+    home_id: str                                  # 必填，家庭隔离的根据
+    user_id: str | None = None                    # None 表示共享记忆
+    room_id: str | None = None
+    device_id: str | None = None
+    scope: MemoryScope
+    memory_type: MemoryType
+    memory_key: str
+    memory_value: dict[str, Any]
+    confidence: float = Field(default=1.0, ge=0, le=1)    # 有多确信
+    source: str | None = None                             # 来自哪里，可追溯
+    status: str = "active"
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = None
+    importance: float = Field(default=0.5, ge=0, le=1)    # 有多重要
+    access_count: int = Field(default=0, ge=0)            # 被检索命中几次
+    last_accessed_at: datetime | None = None
+    valid_from: datetime                                  # 版本生效时间
+    valid_to: datetime | None = None                      # None = 当前有效版本
+    version: int = Field(default=1, ge=1)
+```
+
+几个字段的设计意图：
+
+- **`extra="forbid"`**：宁可在写入时报错，也不要让拼错的字段名被静默丢弃。所有六个模型都开了这个开关。
+- **`user_id` 用 `None` 表达共享**，不是用空字符串或哨兵值。这样 6.4.5 的 SQL 权限过滤可以直接写 `user_id IS NULL OR user_id = ?`。
+- **`confidence` 与 `importance` 分开**：“我有多确信这是真的”和“这条有多值得优先”是两件事。用户明说的偏好 confidence 高；儿童房音量约束 importance 高。检索排序会分别用到（6.4.7）。
+- **`ge=0, le=1` 的约束**是有意义的护栏：分数只要越界，排序公式的结果就没法解释了。
+- **`access_count` / `last_accessed_at`** 支撑检索的频次项和置信度衰减（6.4.7、6.4.8）。
+- **`valid_from` / `valid_to` / `version`** 是版本机制的三件套。`valid_to is None` 即当前版本，见 6.4.8。
+
+**写入用的是另一个模型：`src/memory/models.py:56-69`**
+
+```python
+class MemoryWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: MemoryScope
+    memory_type: MemoryType
+    memory_key: str = Field(min_length=1)
+    memory_value: dict[str, Any]
+    room_id: str | None = None
+    device_id: str | None = None
+    source: str | None = None
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    expires_at: datetime | None = None
+    importance: float = Field(default=0.5, ge=0, le=1)
+    valid_from: datetime | None = None
+```
+
+对比 `MemoryRecord` 会发现：`MemoryWrite` **没有 `home_id`、`user_id`、`id`、`version`、`access_count`**。这不是省略，而是刻意的边界——这些字段由服务端从可信上下文填入，调用方（包括 LLM）**没有位置**去指定它们。这是 6.4.5 权限模型能成立的前提。
+
+`memory_key` 用 `min_length=1` 卡住空字符串，因为它参与唯一键判重（6.4.8）。
+
+`src/memory/models.py` 里还有四个模型，各自服务一个环节：`MemoryVersion`（历史版本快照）、`ExtractedMemoryCandidate`（抽取器输出，见 6.4.6）、`PreferenceCandidate`（待确认候选）、`MemoryConflict`（冲突记录，见 6.4.8）。
+
+**为什么是 `memory_key` + JSON `memory_value`，而不是一句自然语言？**
+
+```python
+memory_key="lighting.color", memory_value={"color": "暖光"}
+```
+
+用点号分段的 key 让同类偏好天然归类（`lighting.color`、`lighting.brightness`、`ac.temperature`），并且成为判重和合并的依据——如果存的是“我喜欢暖光”这句话，系统无法判断它和“灯光颜色设为暖白”是不是同一条。JSON value 则让合并可以逐字段进行（6.4.8 的 `_merge_values`），也让测试可以直接断言字典相等，而不是去匹配一段可能被模型改写的文本。
 
 #### 6.4.5 作用域：这条记忆应该让谁看见
 
-长期记忆支持四种作用域：
+四种作用域定义在 `src/memory/models.py:16-20`：
 
-| 作用域 | 含义 | 示例 |
-|--------|------|------|
-| `user` | 只属于当前用户 | 用户 A 喜欢暖光 |
-| `home` | 整个家庭共享 | 离家时关闭所有灯 |
-| `room` | 某个房间共享 | 儿童房夜间保持安静 |
-| `device` | 针对某台设备 | 客厅电视的默认音量限制 |
+| 作用域 | 含义 | 示例 | 写入权限 |
+|--------|------|------|----------|
+| `user` | 只属于当前用户 | 用户 A 喜欢暖光 | 本人 |
+| `home` | 整个家庭共享 | 离家时关闭所有灯 | 管理员 |
+| `room` | 某个房间共享 | 儿童房夜间保持安静 | 管理员 |
+| `device` | 针对某台设备 | 客厅电视的默认音量限制 | 管理员 |
 
-个人偏好与共享规则的权限不同：
-
-- 普通用户可以创建、修改和删除自己的 `user` 记忆。
-- `home`、`room`、`device` 属于共享记忆，写入和修改需要管理员权限。
-- 所有 Repository 查询都必须带 `home_id`，避免不同家庭之间串数据。
-- 个人记忆还要校验 `user_id`，用户 A 不能读取或修改用户 B 的个人偏好。
-
-身份信息不会让模型自由填写。`home_id`、`user_id`、`room_id`、`device_id` 和 `is_admin` 都来自服务端构造的 `RunnableConfig`：
+**可信身份从哪来：`src/agent/context.py:17-49`**
 
 ```python
-config = {
-    "configurable": {
-        "thread_id": "session-a",
-        "home_id": "home-a",
-        "user_id": "user-a",
-        "client_id": "phone-a",
-        "room_id": "living_room",
-        "is_admin": False,
-    }
-}
+class AgentContext(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    home_id: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    client_id: str = Field(min_length=1)
+    room_id: str | None = None
+    device_id: str | None = None
+    is_admin: bool = False
+
+    def to_config(self) -> dict:
+        """Build the only supported LangGraph configurable payload."""
+        return {"configurable": {"thread_id": self.session_id, **self.model_dump()}}
 ```
 
-记忆工具的参数中没有 `home_id` 和 `user_id`。这样即使模型生成了错误工具参数，也不能借此访问另一个家庭或用户的数据。
+四个必填 ID 用 `min_length=1` 加 `reject_blank_required_ids` 校验器（`context.py:30-35`）双重卡空值。注意 `session_id` 直接充当 LangGraph 的 `thread_id`——身份和会话绑在一起，换会话不会换身份。
+
+记忆工具的函数签名里**没有** `home_id` 和 `user_id`，它们只能从 `RunnableConfig` 里读。这样即使模型生成了越权的工具参数，也没有可以填写的位置（详见 6.4.11）。
+
+**房间和设备归属校验：`src/agent/context.py:99-120`**
+
+`SpaceDirectory.validate()` 是所有记忆操作的第一道门，`MemoryService` 的每个公开方法开头都调用它：
+
+```python
+def validate(self, context: AgentContext) -> AgentContext:
+    rooms = self._rooms_by_home.get(context.home_id)
+    if rooms is None:
+        raise ContextValidationError(f"unknown home_id: {context.home_id}")
+
+    if context.room_id and context.room_id not in rooms:
+        raise ContextValidationError(...)            # 房间不属于这个家
+
+    if context.device_id:
+        location = self._devices.get(context.device_id)
+        if location is None or location.home_id != context.home_id:
+            raise ContextValidationError(...)        # 设备不属于这个家
+        if context.room_id and location.room_id != context.room_id:
+            raise ContextValidationError(...)        # 设备不在这个房间
+```
+
+三层递进：家 → 房间归属 → 设备归属，且设备和房间必须自洽。伪造一个别人家的 `device_id` 会在这里被挡住，根本到不了数据库。
+
+**作用域自洽性检查：`src/memory/service.py:235-263`**
+
+`_normalize_and_validate_scope()` 在写入前修正并校验字段组合：
+
+```python
+if item.scope == MemoryScope.HOME:
+    if room_id or device_id:
+        raise ValueError("home memory cannot specify room_id or device_id")
+elif item.scope == MemoryScope.ROOM:
+    if not room_id or device_id:
+        raise ValueError("room memory requires room_id and cannot specify device_id")
+elif item.scope == MemoryScope.DEVICE:
+    if not device_id:
+        raise ValueError("device memory requires device_id")
+    inferred_room_id = self.spaces.room_for_device(device_id)
+    room_id = room_id or inferred_room_id          # 设备记忆自动补房间
+elif device_id and not room_id:                    # scope == USER
+    room_id = self.spaces.room_for_device(device_id)
+```
+
+“全家规则”带着房间 ID 是自相矛盾的，直接拒绝；`device` 作用域则会**自动推断房间**（`room_for_device`，`context.py:122-126`），调用方不必手填，也不会填错。归一化后还要再 `validate` 一遍（`service.py:257-261`），因为推断出的 `room_id` 同样需要校验归属。
+
+**共享作用域的管理员闸门：`src/memory/service.py:36-44`**
+
+```python
+shared_scope = item.scope in {MemoryScope.HOME, MemoryScope.ROOM, MemoryScope.DEVICE}
+if shared_scope and not (is_admin or context.is_admin):
+    raise MemoryPermissionError(
+        "home, room, and device memories require administrator permission"
+    )
+owner = None if shared_scope else context.user_id     # 共享记忆没有 owner
+```
+
+最后一行是整套权限模型的枢纽：**共享记忆的 `user_id` 存 `NULL`，个人记忆存实际用户**。这个约定让读取权限可以完全交给 SQL。
+
+**读取权限就是一条 SQL：`src/memory/repository.py:376-393`（`list_accessible`）**
+
+```sql
+SELECT * FROM memories
+WHERE home_id = ? AND status = 'active'
+  AND (user_id IS NULL OR user_id = ?)      -- 共享的 + 自己的
+  AND (room_id IS NULL OR room_id = ?)      -- 全局的 + 当前房间的
+  AND (device_id IS NULL OR device_id = ?)  -- 全局的 + 当前设备的
+ORDER BY CASE scope WHEN 'home' THEN 0 WHEN 'room' THEN 1
+                    WHEN 'device' THEN 2 ELSE 3 END, updated_at
+```
+
+三个 `IS NULL OR = ?` 同时表达了“共享内容都可见”和“专属内容只在对应上下文可见”。权限过滤放在 SQL 里而不是取回后用 Python 筛，意味着**不可能因为漏写一个 `if` 而泄漏数据**——越权的行根本不会被 SELECT 出来。
+
+**单条读取的两种拒绝：`src/memory/service.py:224-233`**
+
+```python
+def _authorized_record(self, context, memory_id, *, is_admin) -> MemoryRecord:
+    self.spaces.validate(context)
+    record = self.repository.get(memory_id, context.home_id)   # home_id 已在 SQL 里
+    if record is None:
+        raise KeyError(memory_id)
+    if record.user_id is not None and record.user_id != context.user_id:
+        raise MemoryPermissionError("personal memory belongs to another user")
+    if record.user_id is None and not is_admin:
+        raise MemoryPermissionError("home shared memory requires administrator permission")
+    return record
+```
+
+两个错误信息刻意分开：“这是别人的个人记忆”和“共享记忆需要管理员”是不同的失败原因，混成一句话会让排查变难。`update` 和 `delete` 都走这个方法（`service.py:194-207`），而只读的 `get`（`service.py:184-192`）不检查管理员——共享记忆本来就是给全家看的。
 
 #### 6.4.6 记忆如何产生：明确保存与候选确认
 
-系统提供两条产生长期记忆的路径。
+对应 6.4.1 的三条路径：路径 ① 直接写库，路径 ②③ 先进候选池。
 
-**路径一：用户明确要求记住**
+**路径 ①：用户明确要求记住 → `MemoryService.save()`（`src/memory/service.py:25-57`）**
 
-例如用户说：“请记住，我喜欢暖光。”Agent 可以调用 `save_personal_memory`：
+用户说“请记住，我喜欢暖光”，Agent 调用 `save_personal_memory` 工具，最终落到 `save()`：
 
 ```python
-save_personal_memory(
-    memory_key="lighting.color",
-    memory_value={"color": "暖光"},
-    source="用户明确要求记住",
-)
+def save(self, context, item: MemoryWrite, *, is_admin: bool = False) -> MemoryRecord:
+    self.spaces.validate(context)                              # ① 空间归属
+    item = self._normalize_and_validate_scope(context, item)   # ② 作用域自洽
+    shared_scope = item.scope in {MemoryScope.HOME, MemoryScope.ROOM, MemoryScope.DEVICE}
+    if shared_scope and not (is_admin or context.is_admin):    # ③ 管理员闸门
+        raise MemoryPermissionError(...)
+    owner = None if shared_scope else context.user_id
+    existing = self.repository.find_by_key(...)                # ④ 是否已有同 key
+    if existing:
+        merged = _merge_values(existing.memory_value, item.memory_value)
+        if existing.memory_value != item.memory_value:
+            resolution = "merged" if merged != item.memory_value else "incoming_wins"
+            self.repository.add_conflict(existing, item.memory_value, merged, resolution)
+        item = item.model_copy(update={"memory_value": merged})
+    return self.repository.upsert(context.home_id, owner, item)
 ```
 
-这是显式写入，因为保存动作来自用户明确指令。
+**这里没有确认步骤**。用户已经明说了“记住”，再弹一次“要记住吗”是多余的交互。校验的是权限，不是意图。
 
-**路径二：系统发现可能的习惯，先生成候选**
+第 ④ 步顺带解决了重复保存：同 key 不会写出两条记录，而是走合并 + 冲突记录（6.4.8）。
 
-候选有两个来源：
+**路径 ②：重复操作统计 → `record_operation()`（`src/memory/service.py:59-75`）**
 
-1. **自然语言抽取**：识别“我喜欢”“我一般”“以后请”等稳定表达。
-2. **重复操作统计**：同一个用户反复执行相同设置，达到阈值后形成候选。
-
-自然语言抽取器位于 `src/memory/extractor.py`，当前采取高精度、低误报策略。例如：
-
-```text
-“我一般把空调设为 25 度”
-    → 候选：ac.temperature = {"temperature": 25}
-
-“我喜欢客厅用暖光”
-    → 候选：lighting.color = {"color": "暖光"}
-
-“今天有点冷，空调开 25 度”
-    → 含有临时表达，不生成候选
+```python
+def record_operation(self, context, memory_key, memory_value, *, minimum_repetitions: int = 3):
+    """Aggregate a real operation and create, but never auto-save, a candidate."""
+    self.spaces.validate(context)
+    count = self.repository.observe_preference(
+        context.home_id, context.user_id, memory_key, memory_value,
+        context.room_id, context.device_id,
+    )
+    if count < minimum_repetitions:
+        return None                                   # 不到 3 次，只累计不生成候选
+    confidence = min(0.95, 0.5 + 0.1 * count)
+    return self.repository.upsert_candidate(...)
 ```
 
-重复操作的默认阈值是 3 次：
+docstring 里的 “but never auto-save” 是这个方法的全部要点：它写的是 `preference_candidates`，不是 `memories`。
 
-```text
-成功控制设备
-    ↓
-record_operation()
-    ↓
-同一 user + memory_key + memory_value 累计达到 3 次
-    ↓
-PreferenceCandidate(status="pending")
+置信度 `min(0.95, 0.5 + 0.1 * count)`：3 次得 0.8，4 次 0.9，5 次及以上封顶 0.95。**永远不到 1.0**——统计推断出的偏好不该和用户亲口说的享有同等确信度。
+
+**路径 ③：自然语言抽取 → `extract_candidates_from_text()`（`src/memory/service.py:77-90`）**
+
+它在 `sync_context` 节点里被调用（`src/agent/graph.py:213`），每轮对话都跑一次。真正的抽取逻辑在 `src/memory/extractor.py`，全文只有 67 行，但设计很讲究。
+
+**先否决，再匹配：`src/memory/extractor.py:14-24`**
+
+```python
+_STABLE_MARKERS = ("我喜欢", "我偏好", "我习惯", "我通常", "我一般", "以后都", "以后请")
+_TEMPORARY_MARKERS = ("今天", "这次", "现在", "有点", "暂时", "刚才")
+
+def extract_memory_candidates(text: str) -> list[ExtractedMemoryCandidate]:
+    normalized = text.strip()
+    if not normalized or any(marker in normalized for marker in _TEMPORARY_MARKERS):
+        return []                                     # ① 临时词一票否决
+    if not any(marker in normalized for marker in _STABLE_MARKERS):
+        return []                                     # ② 没有稳定词，不猜
 ```
 
-无论候选来自哪条路径，都不会自动成为正式记忆：
+两道过滤的顺序不能换。**临时标记优先于稳定标记**：“今天有点冷，我一般把空调开 25 度”同时含“今天/有点”和“我一般”，先否决就正确地不生成候选。反过来先匹配稳定词就会误记。
+
+这是典型的**高精度、低召回**取舍：漏抽一条偏好，用户下次再说一遍就行；错记一条偏好，用户要主动发现并删除，代价高得多。
+
+**四个正则抽取器：`src/memory/extractor.py:27-51`**
+
+| memory_key | 触发词 + 取值 | 产出的 value | confidence | importance |
+|------------|---------------|--------------|-----------:|-----------:|
+| `ac.temperature` | 空调 / 温度 + 16–30 度 | `{"temperature": 25}` | 0.82 | 0.75 |
+| `lighting.brightness` | 灯 / 亮度 + 0–100% | `{"brightness": 30}` | 0.80 | 0.65 |
+| `lighting.color` | 暖白 / 暖黄 / 暖光 / 冷白光 / 白光 | `{"color": "暖光"}` | 0.84 | 0.65 |
+| `routine.quiet_hours` | 时刻 + 安静 / 静音 / 低音量 | `{"after": "22:00"}` | 0.76 | 0.80 |
+
+```python
+# src/memory/extractor.py:27
+temperature = re.search(r"(?:空调|温度).*?(1[6-9]|2\d|30)\s*(?:度|℃|°C)?", normalized, re.I)
+```
+
+温度范围 `1[6-9]|2\d|30` 直接写在正则里，而不是先抓任意数字再判断区间——“我一般把音量设成 50”里的 50 不会被误当成空调温度。
+
+```python
+# src/memory/extractor.py:39
+color_match = re.search(r"(暖白|暖黄|暖光|冷白光|白光)", normalized)
+if color_match and any(word in normalized for word in ("灯", "光", "色温")):
+```
+
+颜色词之外**额外要求**上下文出现“灯 / 光 / 色温”，否则“我喜欢暖黄色的墙纸”会被记成灯光偏好。
+
+```python
+# src/memory/extractor.py:45
+quiet = re.search(r"(?:晚上|夜间)?\s*(\d{1,2})(?::(\d{2}))?\s*点?.*?(?:安静|静音|低音量)", normalized)
+if quiet:
+    hour = max(0, min(23, int(quiet.group(1))))     # 钳到合法小时
+    minute = int(quiet.group(2) or 0)
+```
+
+`max(0, min(23, ...))` 把小时钳进 0–23，`quiet.group(2) or 0` 处理“10 点”这种没写分钟的情况。它的 confidence 最低（0.76）但 importance 最高（0.80）：时间表达更容易解析错，可“晚上要安静”一旦成立就很关键。
+
+最后 `_deduplicate` 以 `(memory_key, repr(sorted(value.items())))` 为键去重（`extractor.py:63-67`），同一句话里重复提到同一偏好只留一条。用 `sorted(...items())` 而不是 `str(dict)`，因为字典字面顺序不同但内容相同的两个 value 应当算重复。
+
+**抽取器不碰数据库**：它的返回类型是 `ExtractedMemoryCandidate`（纯数据），入库由 `service.py:84-89` 完成。这样抽取逻辑可以脱离 SQLite 单测——给一句话，断言返回的候选列表，仅此而已。
+
+**确认与拒绝：`src/memory/service.py:96-121`**
+
+```python
+def confirm_candidate(self, context, candidate_id: str) -> MemoryRecord:
+    candidate = self.repository.get_candidate(candidate_id, context.home_id)
+    if candidate is None or candidate.user_id != context.user_id or candidate.status != "pending":
+        raise KeyError(candidate_id)                  # 三个条件合并成同一个错误
+    record = self.save(context, MemoryWrite(
+        scope=MemoryScope.USER,                       # 恒为个人
+        memory_type=MemoryType.PREFERENCE,            # 恒为偏好
+        memory_key=candidate.memory_key,
+        memory_value=candidate.memory_value,
+        confidence=candidate.confidence,
+        importance=candidate.importance,
+        source=f"confirmed_candidate:{candidate.id}", # 可追溯到候选
+    ))
+    self.repository.resolve_candidate(
+        candidate.id, context.home_id, context.user_id, "confirmed", record.id
+    )
+    return record
+```
+
+三处细节：
+
+1. **`scope` 和 `memory_type` 写死**，不取自候选。系统猜出来的东西**永远只能变成个人偏好**，绝无可能升级成全家规则——那需要管理员显式操作。
+2. **三个失败条件抛同一个 `KeyError`**：不存在、不是你的、已处理过，对外都是“找不到这个候选”。分开报错等于告诉调用方“这个 ID 存在但不属于你”。
+3. **`source` 记录来源候选 ID**，事后可以追问“这条记忆当初是怎么来的”。
+
+`reject_candidate()`（`service.py:117-121`）只把状态改成 `rejected`，候选行仍在库里——保留“用户拒绝过”这个事实，比删掉它更有价值。
 
 ```text
 pending 候选
-   ├─ 用户确认 ──> confirmed ──> 写入 MemoryRecord
-   └─ 用户拒绝 ──> rejected  ──> 不写入长期记忆
+   ├─ confirm_candidate() ──> confirmed ──> 写入 memories 表 + 回填 confirmed_memory_id
+   └─ reject_candidate()  ──> rejected  ──> 保留记录，不进 memories
 ```
-
-这种“先候选、后确认”的设计可以显著降低误记忆风险。Agent 可以提出“我注意到你经常把空调设为 25 度，要记住这个偏好吗？”，但不能替用户做决定。
 
 #### 6.4.7 检索：不是把所有记忆都塞进 Prompt
 
-当长期记忆变多时，每轮把全部记录交给模型既浪费 token，也会引入无关信息。因此 `sync_context` 节点会根据用户当前问题检索 Top-K 记忆：
+当长期记忆变多时，每轮把全部记录交给模型既浪费 token，也会引入无关信息。因此 `sync_context` 节点会按当前问题检索 Top-K。
+
+**调用点：`src/agent/graph.py:211-228`**
 
 ```python
-memory_service.format_for_prompt(
-    context,
-    query=latest_user_text,
-    top_k=settings.memory.retrieval_top_k,
-)
+if memory_service and state.get("request_home_id") and state.get("request_user_id"):
+    context = _context_from_state(state, result)
+    memory_service.extract_candidates_from_text(context, latest_text)   # 顺带抽候选
+    records = memory_service.retrieve(
+        context, latest_text,
+        top_k=getattr(settings.memory, "retrieval_top_k", 6),
+    )
+    result["retrieved_memories"] = [record.model_dump(mode="json") for record in records]
+    result["memory_context"] = "\n".join(
+        f"- [{record.scope.value}/{record.memory_type.value}] "
+        f"{record.memory_key}: {record.memory_value} "
+        f"(confidence={record.confidence:.2f}, importance={record.importance:.2f})"
+        for record in records
+    ) or "（无可用长期记忆）"
 ```
 
-默认 `CHECKPOINT_RETRIEVAL_TOP_K=6`。每条可访问记忆的分数由五部分组成：
+三点值得注意：
 
-```text
-score =
-    0.45 × 词项相关性
-  + 0.20 × 置信度
-  + 0.20 × 重要性
-  + 0.10 × 时间新鲜度
-  + 0.05 × 访问频率
+- 前置 `if` 要求 `home_id` 和 `user_id` 都存在。**没有可信身份就完全不检索**，而不是退化成“查全库”。
+- 抽取候选和检索在同一个分支里完成，共用一次 `latest_text` 和一份 `context`。
+- 格式化后的字符串写进 `memory_context`，最终拼进系统提示词（`graph.py:536`）。原始记录另存 `retrieved_memories`（`graph.py:219`），供调试和评估使用。
+
+`src/memory/service.py:213-222` 有一个功能等价的 `format_for_prompt()`，输出格式与上面完全一致。图里选择内联，是因为它同时需要格式化文本**和**原始记录两份产物。
+
+**排序公式：`src/memory/service.py:165-178`**
+
+```python
+@staticmethod
+def _retrieval_score(record: MemoryRecord, query: str, now) -> float:
+    searchable = (
+        record.memory_key + " " + json.dumps(record.memory_value, ensure_ascii=False)
+    ).lower()
+    terms = _query_terms(query)
+    relevance = sum(1 for term in terms if term in searchable) / max(1, len(terms))
+    age_days = max(0.0, (now - record.updated_at).total_seconds() / 86400)
+    recency = math.exp(-age_days / 90)
+    frequency = min(1.0, math.log1p(record.access_count) / math.log(11))
+    return (
+        0.45 * relevance + 0.20 * record.confidence
+        + 0.20 * record.importance + 0.10 * recency + 0.05 * frequency
+    )
 ```
 
-- **相关性**：当前问题中的词是否出现在记忆 key 或 value 中。
-- **置信度**：系统对这条记忆可靠程度的估计。
-- **重要性**：这条记忆对未来决策的业务价值。
-- **时间新鲜度**：较新的偏好通常优先级更高。
-- **访问频率**：经常被用到的记忆获得少量加分，并使用对数归一化避免无限放大。
+| 分项 | 权重 | 计算方式 | 为什么这么算 |
+|------|-----:|----------|--------------|
+| 词项相关性 | 0.45 | 命中词数 / 总词数 | 归一化到 0–1，长问题不会因为词多而占优 |
+| 置信度 | 0.20 | 记录字段 | 系统对这条记忆有多确信 |
+| 重要性 | 0.20 | 记录字段 | 业务价值，与确信度独立 |
+| 时间新鲜度 | 0.10 | `exp(-天数/90)` | 90 天衰减到 1/e，平滑而非断崖 |
+| 访问频率 | 0.05 | `log1p(n)/log(11)` | 10 次即接近 1.0，防止高频记忆霸榜 |
 
-检索顺序非常重要：系统先按家庭、用户、房间和设备做权限过滤，再对当前用户可见的记录排序。不能先在全库召回，再指望模型自己忽略无权访问的内容。
+`ensure_ascii=False` 是必需的：否则中文 value 会变成 `\uXXXX` 转义，中文查询词永远匹配不上。`max(1, len(terms))` 防止空查询导致除零。`max(0.0, ...)` 兜住时钟回拨造成的负数天龄。
 
-命中的记忆会更新 `access_count` 和 `last_accessed_at`，为之后的排序提供访问统计。
+**同义词扩展：`src/memory/service.py:277-294`**
 
-当前实现没有引入 Embedding 或向量数据库，优点是依赖少、评分可解释、容易测试。`evaluate_vector_retrieval()` 会在记忆规模达到阈值时给出是否考虑向量召回的建议，但不会自动下载或初始化额外服务。
+这一步是让中文查询能命中英文 key 的关键：
+
+```python
+def _query_terms(query: str) -> set[str]:
+    lowered = query.lower()
+    terms = set(re.findall(r"[a-z0-9_.]+|[一-鿿]{2,}", lowered))
+    aliases = {
+        "空调": {"ac", "temperature", "mode", "fan"},
+        "温度": {"temperature", "ac"},
+        "灯": {"lighting", "brightness", "color"},
+        "亮度": {"brightness", "lighting"},
+        ...
+    }
+    for marker, expansions in aliases.items():
+        if marker in lowered:
+            terms.update(expansions)
+    return terms
+```
+
+没有这张表，“空调调到多少度”里一个中文词都匹配不上 `ac.temperature` 这个英文 key，relevance 恒为 0。
+
+正则 `[a-z0-9_.]+|[一-鿿]{2,}` 分两类切词：英文串连点号一起保留（`ac.temperature` 可整体匹配），中文取**连续 2 字以上**——单个汉字噪声太大。注意 alias 匹配用的是 `marker in lowered`（在原始字符串里找子串），所以单字键“灯”依然能生效，绕开了 2 字下限。
+
+**顺序不能颠倒：`src/memory/service.py:147-163`**
+
+```python
+def retrieve(self, context, query: str, *, top_k: int = 6) -> list[MemoryRecord]:
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    records = self.list(context)                      # ① 先做权限过滤（SQL）
+    if not records:
+        return []
+    now = utc_now()
+    ranked = sorted(records, key=lambda r: self._retrieval_score(r, query, now),
+                    reverse=True)[:top_k]             # ② 再对可见集排序
+    self.repository.record_accesses(context.home_id, [r.id for r in ranked])
+    return ranked
+```
+
+**先权限过滤，再排序**。`list()`（`service.py:140-145`）走的是 6.4.5 那条 SQL，无权访问的行根本不会进入排序候选集。不能反过来全库召回再指望模型忽略——那不是权限控制。
+
+最后一行 `record_accesses` 让被选中的记录 `access_count + 1`，喂给下一次检索的 frequency 项，形成正反馈。默认 `top_k` 为 6，由 `CHECKPOINT_RETRIEVAL_TOP_K` 配置（`src/config.py`，`Field(default=6, ge=1, le=20)`）。
+
+**为什么不用向量检索：`src/memory/service.py:131-138`**
+
+```python
+def evaluate_vector_retrieval(self, home_id=None, *, threshold: int = 500) -> dict:
+    count = self.repository.active_count(home_id)
+    return {
+        "active_memory_count": count,
+        "threshold": threshold,
+        "recommend_vector_retrieval": count >= threshold,
+        "reason": "memory_scale_threshold_reached" if count >= threshold
+                  else "structured_filters_sufficient",
+    }
+```
+
+它只**返回建议**，不会自动下载模型或起服务。家庭场景的记忆量通常是几十条，结构化过滤加可解释打分完全够用；上向量库要付出依赖、索引维护和“为什么召回了这条”难以解释的代价。500 条是给出建议的阈值，不是自动切换的开关。
 
 #### 6.4.8 更新、冲突与历史版本
 
-用户偏好会改变。例如用户先说喜欢暖光，后来改成冷白光。如果直接覆盖数据库中的 JSON，系统只能看到最新结果，无法回答“什么时候发生了变化”。
+用户偏好会改变。例如用户先说喜欢暖光，后来改成冷白光。如果直接覆盖数据库里的 JSON，系统就只剩最新结果，无法回答“什么时候变的”。
 
-因此每条记忆都有版本号和有效时间区间：
+因此每条记忆都带版本号和有效区间：
 
 ```text
 版本 1：暖光
@@ -1384,43 +1852,171 @@ valid_from = 2026-08-01
 valid_to   = NULL        ← 当前仍然有效
 ```
 
-更新流程如下：
+**同一条记忆如何被识别：`src/memory/repository.py:56-60`**
 
-1. 关闭旧版本，把旧版本的 `valid_to` 设为更新时间。
-2. 写入新值并把 `version` 加 1。
-3. 创建新的 `MemoryVersion`，其 `valid_to` 为空。
-4. 当前查询只返回 active 的最新版本，历史版本仍可审计。
-
-如果相同 key 收到不同 value，`MemoryService` 会执行结构化合并，并把旧值、输入值、最终值和解决方式写入 `memory_conflicts`。这使冲突处理可以追踪，而不是悄悄覆盖。
-
-删除和过期也采用逻辑关闭：正式记录不再参与当前检索，同时关闭当前版本的有效区间。历史版本不会因为普通删除操作而消失。
-
-可以通过工具查询版本：
-
-```text
-list_memory_versions(memory_id)
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memories_business_key
+    ON memories(
+        home_id, COALESCE(user_id, ''), COALESCE(room_id, ''),
+        COALESCE(device_id, ''), scope, memory_type, memory_key
+    );
 ```
+
+七个字段构成业务唯一键。`COALESCE(x, '')` 是必需的：SQLite 的唯一索引里 **`NULL` 互不相等**，不做转换的话共享记忆（`user_id IS NULL`）会被允许重复插入无数条。
+
+**版本推进：`src/memory/repository.py:149-199`（`upsert`）**
+
+```python
+existing = self.find_by_key(...)
+memory_id = str(uuid.uuid4())
+version = existing.version + 1 if existing else 1
+if existing:
+    memory_id = existing.id                       # 复用同一 id，不新建行
+    self.connection.execute(
+        "UPDATE memory_versions SET valid_to=? WHERE memory_id=? AND version=?",
+        (valid_from, existing.id, existing.version),
+    )                                             # 关闭上一版本的区间
+```
+
+关键在 `memory_id = existing.id`：更新走的是同一行，`memories` 表里永远只有一条**当前**记录，历史沉到 `memory_versions`。旧版本的 `valid_to` 被设为新版本的 `valid_from`，两段区间首尾相接、不留空隙。
+
+```sql
+-- src/memory/repository.py:179-189
+ON CONFLICT DO UPDATE SET
+    memory_value=excluded.memory_value,
+    ...
+    status='active',          -- 已删除的记忆再次写入会复活
+    valid_to=NULL,            -- 新版本尚未结束
+    version=excluded.version
+```
+
+`status='active'` 让“删掉后又重新保存同一 key”正常工作，不会留下一条 `deleted` 挡住唯一索引。写完主表后 `_save_version()`（`repository.py:201-212`）落一条版本快照，`UNIQUE(memory_id, version)` 保证同一版本不会重复记录。
+
+**冲突合并：`src/memory/service.py:266-274`**
+
+```python
+def _merge_values(previous: dict, incoming: dict) -> dict:
+    """Preserve complementary fields while explicit incoming fields take precedence."""
+    merged = dict(previous)
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_values(merged[key], value)      # 嵌套字典递归合并
+        else:
+            merged[key] = value                                  # 新值覆盖
+    return merged
+```
+
+递归合并而不是整体替换。已有 `{"color": "暖光", "brightness": 60}`，新值只给 `{"color": "冷白光"}`，结果保留 `brightness=60`——用户只说改颜色，不该顺带丢掉亮度。
+
+合并结果决定冲突的记录方式（`service.py:52-56`）：
+
+```python
+merged = _merge_values(existing.memory_value, item.memory_value)
+if existing.memory_value != item.memory_value:
+    resolution = "merged" if merged != item.memory_value else "incoming_wins"
+    self.repository.add_conflict(existing, item.memory_value, merged, resolution)
+```
+
+`merged != item.memory_value` 说明旧值贡献了字段，记为 `merged`；否则新值完全覆盖，记为 `incoming_wins`。`memory_conflicts` 表同时保存 previous / incoming / resolved 三份值（`repository.py:332-344`），事后可以完整复盘一次覆盖到底发生了什么，而不是只看到结果。
+
+**删除是逻辑关闭：`src/memory/repository.py:434-446`**
+
+```python
+def delete(self, memory_id: str, home_id: str) -> bool:
+    now = utc_now().isoformat()
+    cursor = self.connection.execute(
+        """UPDATE memories SET status='deleted', updated_at=?, valid_to=?
+           WHERE id=? AND home_id=? AND status='active'""",
+        (now, now, memory_id, home_id),
+    )
+    self.connection.execute(
+        "UPDATE memory_versions SET valid_to=? WHERE memory_id=? AND valid_to IS NULL",
+        (now, memory_id),
+    )
+```
+
+没有 `DELETE FROM`。改状态 + 关闭区间，`memory_versions` 里的历史一条不少。`WHERE ... status='active'` 让重复删除返回 `False`（`rowcount == 0`）而不是假装成功。过期清理 `cleanup_expired()`（`repository.py:467-492`）用同一套逻辑，只是状态写 `'expired'`；它在每次 `list_accessible` 开头被调用（`repository.py:380`），所以过期记忆不需要定时任务就会自动退出检索。
+
+**置信度随时间衰减：`src/memory/repository.py:356-363`**
+
+```sql
+UPDATE memories SET confidence=MAX(?, confidence * ?), updated_at=?
+WHERE status='active' AND updated_at<? AND confidence>?
+```
+
+`MemoryService.decay_stale_confidence()`（`service.py:123-129`）的默认参数是 90 天、系数 0.9、下限 0.2。`MAX(floor, ...)` 保证衰减不会归零——很久没用到只说明优先级降低，不代表这条偏好错了。`confidence>?` 让已经触底的行不再被更新，避免每次调用都白改一遍 `updated_at`。
+
+查询历史版本用 `list_memory_versions(memory_id)` 工具，底层是 `repository.py:407-413`，按 `version` 升序返回。`MemoryService.list_versions()`（`service.py:180-182`）会先调 `self.get(...)` 做一次可见性校验——**不能通过查版本绕过权限读到别人的记忆**。
 
 #### 6.4.9 SQLite 中保存了哪些表
 
-Checkpoint 与长期记忆使用不同的数据库，职责不要混淆：
+长期记忆的建表语句全在 `src/memory/repository.py:26-99` 一个 `executescript` 里，五张表加四个索引：
 
-```text
-data/checkpoints.db   LangGraph 会话状态
-data/memories.db      结构化长期记忆
+| 表 | 定义位置 | 作用 |
+|----|---------:|------|
+| `memories` | `:29-51` | 当前长期记忆及其状态、分数、访问统计、版本号 |
+| `preference_observations` | `:61-68` | 重复操作的原始计数（路径 ②） |
+| `preference_candidates` | `:69-78` | 等待确认或已处理的候选（路径 ②③） |
+| `memory_conflicts` | `:82-87` | 同一记忆收到不同值时的合并审计 |
+| `memory_versions` | `:88-95` | 每次变更的历史值和有效区间 |
+
+`memories` 与 `preference_observations` 的主键设计差别值得看一眼：
+
+```sql
+-- src/memory/repository.py:67
+PRIMARY KEY (home_id, user_id, memory_key, value_fingerprint)
 ```
 
-长期记忆数据库的主要表包括：
+观测表用**复合主键**而不是自增 ID，因为它的语义就是“这个组合被观察了几次”，天然唯一。`value_fingerprint` 是 `json.dumps(..., sort_keys=True)` 的结果（`repository.py:249`）——`sort_keys=True` 保证 `{"a":1,"b":2}` 和 `{"b":2,"a":1}` 产生同一个指纹，否则同一个偏好会被拆成两条计数，永远攒不够 3 次。
 
-| 表 | 作用 |
-|----|------|
-| `memories` | 当前长期记忆及其状态、分数、访问统计和版本号 |
-| `preference_observations` | 重复设备操作的原始计数 |
-| `preference_candidates` | 等待用户确认或已经处理的候选 |
-| `memory_conflicts` | 同一记忆收到不同值时的合并审计 |
-| `memory_versions` | 每次变更对应的历史值和有效时间 |
+```sql
+-- src/memory/repository.py:79-81
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_candidate
+    ON preference_candidates(home_id, user_id, memory_key)
+    WHERE status='pending';
+```
 
-Repository 启动时会检查旧数据库结构，并为阶段二至阶段四创建的数据库补充阶段五字段和版本记录，因此升级后不要求删除原数据库重建。
+这是**部分索引**（partial index）：约束只作用于 `pending` 行。效果是同一个 key 最多有一条待确认候选（不会反复打扰用户），但历史上的 `confirmed` / `rejected` 记录可以任意累积。
+
+四个索引各有分工：`idx_memories_home_scope` 和 `idx_memories_user` 服务 6.4.5 那条权限过滤 SQL，`uq_memories_business_key` 保证判重（6.4.8），`idx_memory_versions_memory` 服务版本回溯。
+
+**原地迁移：`src/memory/repository.py:103-147`（`_migrate_schema`）**
+
+```python
+memory_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(memories)")}
+additions = {
+    "importance": "REAL NOT NULL DEFAULT 0.5",
+    "access_count": "INTEGER NOT NULL DEFAULT 0",
+    "last_accessed_at": "TEXT",
+    "valid_from": "TEXT", "valid_to": "TEXT",
+    "version": "INTEGER NOT NULL DEFAULT 1",
+}
+for name, definition in additions.items():
+    if name not in memory_columns:
+        self.connection.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
+self.connection.execute("UPDATE memories SET valid_from=COALESCE(valid_from, created_at)")
+```
+
+先用 `PRAGMA table_info` 读出现有列，缺什么补什么。新增的 `valid_from` 对老数据是 `NULL`，用 `created_at` 回填——老记忆的“生效时间”就是它的创建时间，这是唯一合理的推断。
+
+迁移的最后一步给缺失版本快照的记忆补建 `memory_versions`（`repository.py:131-147`）：
+
+```sql
+SELECT * FROM memories m WHERE NOT EXISTS (
+    SELECT 1 FROM memory_versions v WHERE v.memory_id=m.id AND v.version=m.version
+)
+```
+
+`_migrate_schema` 在 `_create_schema` 内部被调用（`repository.py:100`），也就是**每次构造 `MemoryRepository` 都会跑一遍**。它设计成幂等的：所有操作都先判断“是否已经做过”，重复执行无副作用。所以升级版本不需要删库重建。
+
+**两个数据库分开：**
+
+```text
+data/checkpoints.db   LangGraph 会话状态（由 SqliteSaver 管理表结构）
+data/memories.db      结构化长期记忆（由本项目管理表结构）
+```
+
+职责不同，生命周期也不同：checkpoints 按 TTL 过期（7 天），memories 长期保留。混在一个文件里会让备份和清理策略互相牵制。
 
 相关配置：
 
@@ -1431,7 +2027,7 @@ ENABLE_LONG_TERM_MEMORY=true
 CHECKPOINT_RETRIEVAL_TOP_K=6
 ```
 
-当 `ENABLE_LONG_TERM_MEMORY=false` 时，Agent 仍可使用设备工具和短期 Checkpoint，但不会创建 MemoryRepository，也不会抽取或注入长期记忆。
+`ENABLE_LONG_TERM_MEMORY=false` 时，Agent 仍能用设备工具和短期 Checkpoint，但不会创建 `MemoryRepository`，也不会抽取或注入长期记忆——对应 `graph.py:211` 那个 `if memory_service and ...` 判断。
 
 #### 6.4.10 记忆模块的代码分层
 
@@ -1447,44 +2043,135 @@ src/memory/store.py        Checkpoint 创建、关闭和会话清理
 src/tools/memory.py        提供给 LLM 的记忆工具
 ```
 
-调用链如下：
+**依赖方向是单向的**，看每个文件的 import 就能确认：
+
+```text
+tools/memory.py  ──> memory/service.py ──> memory/repository.py ──> memory/models.py
+                                      └──> memory/extractor.py  ──> memory/models.py
+                                      └──> agent/context.py
+```
+
+- `repository.py` 只 import `models`（`repository.py:11-14`），**没有** import `service`。
+- `extractor.py` 只 import `models`（`extractor.py:11`），既不认识 Repository 也不认识 Service。
+- `service.py` 同时依赖 `repository`、`extractor` 和 `agent/context`（`service.py:10-13`）——它是唯一知道全局的一层。
+
+这个方向不能反过来。一旦 Repository 开始 import Service 去查权限，两层就锁死了，Repository 再也无法脱离权限体系单测。
+
+调用链：
 
 ```text
 用户消息
    ↓
-LangGraph.sync_context
-   ├─> extractor 生成候选
-   └─> MemoryService 检索长期记忆
-            ↓
-       MemoryRepository 查询 SQLite
-            ↓
-格式化 Top-K 记忆并注入系统提示词
-            ↓
-LLM 根据当前消息 + 摘要 + 相关长期记忆进行决策
+LangGraph.sync_context（graph.py:211-228）
+   ├─> MemoryService.extract_candidates_from_text ──> extractor 抽取 ──> Repository 存候选
+   └─> MemoryService.retrieve ──> Repository.list_accessible（SQL 权限过滤）
+                                        ↓
+                                  Service 打分排序 Top-K
+                                        ↓
+                    格式化写入 memory_context ──> 拼进系统提示词（graph.py:536）
+                                        ↓
+                    LLM 根据当前消息 + 摘要 + 相关长期记忆决策
 ```
 
-这里最重要的边界是：
+四条边界，各自对应代码里的具体做法：
 
-- `Repository` 只负责可靠地读写数据。
-- `Service` 负责“是否允许”和“应该怎样处理”。
-- `Extractor` 不直接操作 Repository。
-- `Tool` 不相信模型提供的身份，而是读取受信任配置。
+| 边界 | 含义 | 代码证据 |
+|------|------|----------|
+| Repository 只管读写 | 不判断权限，不做业务决策 | 权限体现为 SQL 的 `WHERE`（`repository.py:385-387`），而非 Python 的 `if` |
+| Service 管“允许吗”和“怎么处理” | 所有方法开头 `self.spaces.validate(context)` | `service.py:33, 64, 81, 93, 97, 118, 141` |
+| Extractor 不碰数据库 | 返回纯数据对象 | 返回 `list[ExtractedMemoryCandidate]`，入库在 `service.py:84-89` |
+| Tool 不信任模型给的身份 | 身份只从 `RunnableConfig` 取 | `tools/memory.py:22-31` 的 `_context()` |
+
+分层带来的直接好处是可测性：测 Extractor 不需要数据库，测 Repository 不需要构造权限上下文，测 Service 的权限逻辑不需要跑 LLM。
 
 #### 6.4.11 可供 Agent 调用的记忆工具
 
-| 工具 | 用途 |
-|------|------|
-| `save_personal_memory` | 保存用户明确要求记住的个人偏好 |
-| `save_home_rule` | 管理员保存家庭共享规则 |
-| `list_personal_memories` | 查看当前上下文中可访问的记忆 |
-| `update_personal_memory` | 修改当前用户拥有的个人记忆 |
-| `delete_personal_memory` | 删除当前用户拥有的个人记忆 |
-| `list_preference_candidates` | 查看等待确认的偏好候选 |
-| `confirm_preference_candidate` | 确认候选并生成正式记忆 |
-| `reject_preference_candidate` | 拒绝候选，不写入正式记忆 |
-| `list_memory_versions` | 查看一条记忆的历史版本 |
+九个工具全部定义在 `src/tools/memory.py`：
 
-业务代码也可以绕过 LLM，直接调用 `MemoryService`。例如保存一条个人偏好：
+| 工具 | 定义位置 | 用途 |
+|------|---------:|------|
+| `save_personal_memory` | `:52-72` | 保存用户明确要求记住的个人偏好 |
+| `save_home_rule` | `:75-97` | 管理员保存家庭共享规则 |
+| `list_personal_memories` | `:100-109` | 查看当前上下文可访问的记忆 |
+| `update_personal_memory` | `:112-122` | 修改当前用户拥有的个人记忆 |
+| `delete_personal_memory` | `:125-131` | 删除当前用户拥有的记忆 |
+| `list_preference_candidates` | `:134-144` | 查看等待确认的偏好候选 |
+| `confirm_preference_candidate` | `:147-153` | 确认候选并生成正式记忆 |
+| `reject_preference_candidate` | `:156-163` | 拒绝候选，不写入正式记忆 |
+| `list_memory_versions` | `:166-181` | 查看一条记忆的历史版本 |
+
+**身份注入：`src/tools/memory.py:22-36`**
+
+这是整个工具层最关键的十几行：
+
+```python
+def _context(config: RunnableConfig) -> AgentContext:
+    configurable = config.get("configurable", {})
+    return AgentContext(
+        home_id=configurable["home_id"],          # 中括号，缺了就 KeyError
+        user_id=configurable["user_id"],
+        session_id=configurable["thread_id"],
+        client_id=configurable["client_id"],
+        room_id=configurable.get("room_id"),      # 可选，用 .get()
+        device_id=configurable.get("device_id"),
+    )
+
+def _is_admin(config: RunnableConfig) -> bool:
+    """Read authorization only from trusted server-side configuration."""
+    return config.get("configurable", {}).get("is_admin") is True
+```
+
+必填 ID 用 `configurable["..."]` 而非 `.get()`：**没有身份就必须失败**，不能退化成匿名调用。`is_admin` 用 `is True` 严格比较，`"true"`、`1`、`"admin"` 这些值一律不算管理员。
+
+`RunnableConfig` 是 LangChain 注入的参数——写在工具签名里，LangChain 会自动传入，但**不会出现在生成给 LLM 的 JSON Schema 中**。模型看到的 `save_personal_memory` 只有 `memory_key`、`memory_value`、`source` 三个参数，根本没有位置去指定 `home_id`。
+
+**看一个完整工具：`src/tools/memory.py:52-72`**
+
+```python
+@tool
+def save_personal_memory(
+    memory_key: str, memory_value: dict[str, Any], source: str, config: RunnableConfig,
+) -> str:
+    """Save an explicitly requested personal preference. Identity is injected by the server."""
+    if _service is None:
+        return "长期记忆未启用"                    # 未启用时返回提示，不抛异常
+    context = _context(config)
+    record = _service.save(context, MemoryWrite(
+        scope=MemoryScope.USER,                    # 写死
+        memory_type=MemoryType.PREFERENCE,         # 写死
+        memory_key=memory_key,
+        memory_value=memory_value,
+        room_id=context.room_id,                   # 来自 config，不是模型
+        device_id=context.device_id,
+        source=source,
+    ))
+    return f"已保存个人记忆 {record.memory_key}（id={record.id}）"
+```
+
+`scope` 和 `memory_type` 写死为 `USER` / `PREFERENCE`。模型**不能**通过这个工具写家庭规则——那要走 `save_home_rule`，而后者会带上 `is_admin=_is_admin(config)`（`memory.py:95`）交给 Service 校验。两个工具分开，权限差异就体现在工具本身，而不是靠一个模型可控的参数来区分。
+
+九个工具开头都有同一句 `if _service is None: return "长期记忆未启用"`。返回文本而不是抛异常，是因为这是**配置状态**而非错误：`ENABLE_LONG_TERM_MEMORY=false` 时模型该知道这条路走不通，然后换别的方式回答。
+
+**路径 ② 的触发点：`src/tools/memory.py:39-49`**
+
+```python
+def record_preference_operation(
+    config: RunnableConfig, device_id: str, memory_key: str, memory_value: dict[str, Any],
+) -> None:
+    """Record a successful device setting without exposing identity to the model."""
+    if _service is None:
+        return
+    context = _context(config).model_copy(update={"room_id": None, "device_id": device_id})
+    _service.record_operation(context, memory_key, memory_value)
+```
+
+注意它**没有 `@tool` 装饰器**——这是给设备控制工具在成功后内部调用的，模型看不见也调不到。重复操作统计必须来自真实执行结果，如果做成工具，模型就能凭空"刷"出候选。
+
+`room_id` 被显式置空、`device_id` 用真实操作的设备覆盖：偏好统计要归到**实际被控制的那台设备**，而不是 App 当前所在的房间。
+
+**绕过 LLM 直接调用 Service**
+
+业务代码（如设置页面）不需要经过模型：
 
 ```python
 from src.memory import MemoryScope, MemoryType, MemoryWrite
@@ -1517,6 +2204,8 @@ for version in versions:
     print(version.version, version.memory_value, version.valid_from, version.valid_to)
 ```
 
+权限校验在 Service 层，不在工具层。所以绕过工具直连 Service **不会绕过权限**——`context` 依然要通过 `SpaceDirectory.validate()`，共享作用域依然要求 `is_admin`。工具层只负责“别让模型碰身份”，真正的守卫在下面一层。
+
 #### 6.4.12 如何验证记忆功能
 
 先使用项目已配置的 `langgraph` 环境，不要新建环境或自行安装包：
@@ -1528,42 +2217,238 @@ $python = 'F:\Software\Anaconda\envs\langgraph\python.exe'
 & $python -m pip check
 ```
 
-建议重点验证以下场景：
+> ⚠️ 直接敲 `python -m pytest` 很可能命中 base 环境，报 `ModuleNotFoundError: No module named 'loguru'`。这不是代码问题，是解释器选错了。用上面的完整路径。
 
-1. 同一个 `thread_id` 能恢复上一轮消息，不同 `thread_id` 相互隔离。
-2. 长对话会生成摘要并限制持久化消息规模。
-3. 用户 A 无法读取和修改用户 B 的个人记忆。
-4. 非管理员无法写入家庭、房间和设备共享规则。
-5. “今天有点冷”不会被当成长期偏好。
-6. 自然语言候选和重复操作候选都必须确认后才写入。
-7. 与当前问题相关的记忆排在无关记忆之前，且只返回 Top-K。
-8. 更新偏好后旧版本被关闭，新版本成为当前有效版本。
-9. 阶段二至阶段四的旧 SQLite 数据库可以自动迁移。
+**记忆相关的测试分布在三个文件里**，每条断言都对应前面某一节：
 
-只验证数据库文件存在还不够。最可靠的测试方式是断言业务行为和权限边界，而不是依赖肉眼查看表内容。
+| 测试文件 | 覆盖的章节 | 关键用例 |
+|----------|-----------|----------|
+| `tests/test_phase_two.py` | 6.4.5 作用域与权限 | 13 个用例，见下表 |
+| `tests/test_phase_three.py` | 6.4.2 / 6.4.3 短期记忆与压缩 | 6 个用例 |
+| `tests/test_phase_four.py` | 6.4.6 候选机制 | 9 个用例 |
+| `tests/test_phase_five.py` | 6.4.7 / 6.4.8 检索与版本 | 5 个用例 |
+
+单独跑记忆相关的部分：
+
+```powershell
+& $python -m pytest tests/test_phase_two.py tests/test_phase_three.py `
+                    tests/test_phase_four.py tests/test_phase_five.py -q
+```
+
+**权限边界：`tests/test_phase_two.py`**
+
+```python
+test_homes_and_users_are_isolated                          # :130
+test_shared_rules_are_visible_but_personal_preferences_are_private  # :143
+test_shared_memory_write_requires_admin                    # :159
+test_room_device_and_personal_combinations_are_filtered    # :171
+test_invalid_scope_combinations_are_rejected               # :231
+test_view_update_and_delete_respect_ownership              # :254
+test_tools_use_identity_from_runnable_config               # :286
+test_home_rule_tool_requires_trusted_admin_flag            # :316
+```
+
+这一组是**安全断言**，不是功能断言。`test_tools_use_identity_from_runnable_config` 验证的是 6.4.11 那个设计：即使模型试图传身份也无效。`test_upsert_survives_repository_restart`（`:116`）单独验证数据真的落盘了，不是只活在内存里。
+
+**候选机制：`tests/test_phase_four.py`**
+
+```python
+test_repeated_operations_create_candidate_but_not_memory   # :39  —— 3 次只出候选
+test_successful_device_settings_feed_candidate_observations # :53  —— 只统计成功操作
+test_confirm_candidate_saves_memory_and_reject_does_not    # :71
+test_candidates_are_isolated_by_user_and_tools_require_trusted_context  # :87
+test_conflicts_are_recorded_and_complementary_values_are_merged  # :105 —— 对应 _merge_values
+test_stale_confidence_decays_with_floor                    # :124 —— 验证下限 0.2
+test_vector_retrieval_is_only_recommended_after_scale_threshold  # :138
+```
+
+第一个用例的名字就是 6.4.6 的核心约定：**create candidate but not memory**。
+
+**检索与版本：`tests/test_phase_five.py`**
+
+```python
+test_natural_language_extractor_is_conservative            # :34 —— "今天有点冷"不入库
+test_extracted_text_only_creates_pending_candidate         # :40
+test_hybrid_retrieval_uses_top_k_and_tracks_access_count   # :48 —— Top-K + access_count
+test_updates_create_version_and_close_previous_validity    # :60 —— valid_to 被关闭
+test_graph_injects_only_relevant_top_k_memory_and_extracts_candidate  # :72
+```
+
+最后一个是**端到端**用例：跑真实的图，断言无关记忆没有被注入提示词。
+
+**短期记忆：`tests/test_phase_three.py`**
+
+```python
+test_message_and_token_window_is_bounded_with_rolling_summary  # :23
+test_tool_results_are_trimmed_and_checkpoint_update_removes_old_messages  # :32
+test_graph_persists_a_bounded_recent_window_and_context_statistics  # :52
+test_checkpoint_cleanup_deletes_only_expired_threads        # :92 —— 注意 "only"
+test_session_end_removes_memory_checkpoint                 # :119
+test_expired_long_term_memories_are_cleaned_globally       # :139
+```
+
+`deletes_only_expired_threads` 里的 `only` 是重点：清理逻辑要删对，更要**不删错**。只断言"过期的被删了"会漏掉把活跃会话一起删掉的 bug。
+
+**手工验证跨会话记忆**
+
+```powershell
+& $python -m src.main --home-id demo-home --user-id user-001 --session-id s1
+# 输入：以后我睡觉时空调设为 25 度
+# 输入：/quit
+
+& $python -m src.main --home-id demo-home --user-id user-001 --session-id s2
+# 输入：我要睡了 —— 应当体现 25 度
+```
+
+换 `--session-id` 意味着新 `thread_id`、空消息历史，但长期记忆按身份重新检索，所以偏好仍然生效。这正好把 6.4.1 那张两层表验证了一遍。
+
+只验证数据库文件存在远远不够。可靠的测试断言的是**业务行为和权限边界**，而不是肉眼看表内容——上面每个用例名都能读成一句可判真假的陈述，这是有意为之。
 
 #### 6.4.13 常见问题
 
 **Q：新会话为什么还能知道我的偏好？**
-A：新 `thread_id` 不会继承旧消息，但 `sync_context` 会按当前可信身份重新检索 SQLite 长期记忆，所以跨会话偏好仍然可用。
+A：新 `thread_id` 不继承旧消息，但 `sync_context` 会按当前可信身份重新检索 SQLite 长期记忆（`graph.py:211-228`）。短期记忆按会话隔离，长期记忆按**身份**检索——这是 6.4.1 两层设计的直接结果。
 
 **Q：Checkpoint 会保存模拟设备的实时状态吗？**
-A：不会把设备后端状态自动持久化。Checkpoint 主要保存 AgentState；模拟设备的实时状态仍由 `SimulatorBackend` 管理，进程重启后是否保留取决于设备后端本身。
+A：不会。Checkpoint 保存的是 `AgentState`（`src/agent/state.py`）。设备实时状态由 `SimulatorBackend` 管理，重启后是否保留取决于设备后端本身。这也是 6.4.4 强调"实时状态不进长期记忆"的原因：状态该问设备，不该问记忆。
 
-**Q：说一次“空调调到 25 度”会被永久记住吗？**
-A：不会。它首先是一次设备操作。只有明确的稳定偏好表达，或相同操作重复达到阈值，才会生成候选；候选还必须由用户确认。
+**Q：说一次"空调调到 25 度"会被永久记住吗？**
+A：不会。它首先是一次设备操作。`record_operation()` 会累计观测，但 `count < 3` 时直接返回 `None`（`service.py:69-70`）；到 3 次也只生成候选，仍需确认。
 
-**Q：为什么候选不直接写入？**
-A：自然语言可能有歧义，重复行为也可能只是短期需求。确认步骤把最终决定权留给用户，可以降低错误个性化和隐私风险。
+**Q：那我说"以后空调都开 25 度"呢？**
+A：这句含稳定标记"以后都"，抽取器会产出 `ac.temperature` 候选（`extractor.py:14`、`:27`）——**仍然是候选**。但如果你调用的是"请记住"这类明确指令并触发 `save_personal_memory` 工具，就走 6.4.6 的路径 ①，直接写库。区别在于是否有明确的保存指令，而不是措辞的强弱。
+
+**Q：为什么候选不直接写入，明确保存却可以？**
+A：候选是系统**猜**的——自然语言有歧义，重复行为也可能只是短期需求，猜错的代价由用户承担（要主动发现并删除）。明确保存是用户**说**的，意图已经确定，再确认一次纯属多余。所以 `save()` 里没有确认步骤，只有权限校验（`service.py:25-57`）。
+
+**Q：确认候选会不会被提升成全家规则？**
+A：不会。`confirm_candidate()` 把 `scope` 和 `memory_type` 写死为 `USER` / `PREFERENCE`（`service.py:102-103`），不读候选里的值。系统猜出来的东西永远只能成为个人偏好；全家规则必须由管理员显式创建。
 
 **Q：修改偏好后旧值去哪了？**
-A：当前记录会切换到新版本，旧值保存在 `memory_versions` 中，并带有完整的有效时间区间。
+A：`memories` 表里的行被原地更新（复用同一 `id`），`version + 1`；旧值以快照形式留在 `memory_versions`，并把 `valid_to` 设为新版本的 `valid_from`（`repository.py:158-163`）。用 `list_memory_versions` 可以完整回看。
+
+**Q：删除记忆是真的删了吗？**
+A：不是。`delete()` 只把 `status` 改成 `'deleted'` 并关闭有效区间（`repository.py:434-446`），`memory_versions` 里的历史一条不少。检索走 `status='active'` 过滤，所以用户感知上确实消失了。要物理删除需要另外的运维操作。
 
 **Q：数据库会不会无限增长？**
-A：会话消息通过压缩和 TTL 控制；长期记忆支持过期、逻辑删除和 Top-K 检索。生产环境仍应增加定期归档、备份、彻底删除和容量监控策略。
+A：会话消息由压缩（6.4.3）和 TTL（`CHECKPOINT_SESSION_TTL_HOURS`）控制；长期记忆有过期清理、逻辑删除和唯一索引判重——同一个 key 不会堆出多行。但 `memory_versions`、`memory_conflicts`、`preference_observations` 是**只增不减**的审计表。生产环境应增加定期归档、备份、物理删除和容量监控。
+
+**Q：`cleanup_expired_checkpoints` 会自动跑吗？**
+A：不会。它是普通函数（`store.py:89-117`），需要调用方主动触发。长期记忆的 `cleanup_expired` 不同，它挂在每次 `list_accessible` 开头（`repository.py:380`），所以过期记忆会自动退出检索。
 
 **Q：当前是否使用向量数据库？**
-A：没有。当前使用结构化权限过滤和可解释的混合排序。家庭级小规模记忆足够使用，规模扩大后可再增加向量召回层。
+A：没有。用的是结构化权限过滤 + 可解释的五项加权排序（6.4.7）。好处是零额外依赖、每条记忆的得分都能拆开解释、测试可以直接断言顺序。`evaluate_vector_retrieval()` 会在活跃记忆达到 500 条时**建议**考虑向量召回，但不会自动启用任何服务。
+
+**Q：为什么不用 LLM 来抽取偏好，正则不是太弱了吗？**
+A：正则确实召回低，但它**确定、可测、零成本**——每轮对话都跑一次，用 LLM 抽取意味着每轮多一次调用和一次不可预测的输出。而且 6.4.6 的取舍是漏抽比错记好，正则的高精度倾向正好对上。真要提升召回，可以在候选生成后加一层 LLM 复核，而不是替换掉这一层。
+
+#### 6.4.14 通俗总结：把整个记忆模块说成一件事
+
+前面十三节把每个零件都拆开讲过了。这一节不引入新东西，只把它们串成一个普通人能听懂的故事——如果你只读一节，读这节。
+
+**一句话概括**
+
+> 大模型每次醒来都失忆。这个模块的全部工作，就是在它开口之前，把"刚才聊了什么"和"这个人长期是什么样"这两份材料准备好递过去。
+
+**打个比方：新来的管家**
+
+想象你家请了一位管家，他能力很强，但有个毛病——**每天下班后会忘掉当天所有事**。为了让他能正常工作，你得给他配两样东西：
+
+| 东西 | 对应本项目 | 解决什么 |
+|------|-----------|---------|
+| **手边的便签本**，记着今天这一趟的来龙去脉，下班就撕掉 | 短期会话记忆（Checkpoint，`data/checkpoints.db`） | "刚才你说的调暗一点，是指哪盏灯？" |
+| **抽屉里的住户手册**，写着这家人长期的习惯和规矩，一直留着 | 长期结构化记忆（`data/memories.db`） | "这家男主人一向喜欢暖光" |
+
+这两样东西的差别不在于存多久，而在于**取的方式**：便签本按"这一趟"取（同一个 `session_id` / `thread_id`），住户手册按"这个人是谁"取（`home_id` + `user_id`）。所以你换个会话重新进来，便签本是空的，但手册照样翻得到——这就是 6.4.1 讲的两层，也是 6.4.13 第一问的答案。
+
+**便签本会写满：为什么要压缩**
+
+一趟活干久了，便签本会写满。管家不可能每说一句话都把整本从头念一遍——费时间，而且真正要紧的就最近几条。
+
+所以每次开口前会做一次整理（`compact_context` 节点，`graph.py:247`）：
+
+```text
+最近 12 条 → 原样留着（细节要准）
+更早的       → 每条压成一句话，并进"摘要"（大意留着就行）
+超长的工具结果 → 截断，加一句"（已裁剪）"
+```
+
+管家最终看到的是「一段摘要 + 最近几条原话」，而不是全本流水账。好处很实在：数据库不会无限膨胀，每次调用模型的费用也被卡住了上限。代价也很实在：**被压缩掉的细节真的没了**，只剩摘要里那一句概括。所以压缩窗口开多大，本质上是在花钱买记性——这就是 6.4.3 讲的取舍。
+
+**住户手册怎么写进去：三条路，两种态度**
+
+这是整个模块最值得理解的地方。系统对"要不要记住一件事"，态度取决于**是谁提出的**：
+
+```text
+① 你亲口说"以后都按这个来"  ──────────────────> 直接写进手册
+② 同一个操作你重复做了 3 次  ──┐
+                               ├─> 先写在"待办便签"上 ──> 问过你 ──> 写进手册
+③ 聊天时被系统听出苗头      ──┘                    └─> 你说不用 ──> 丢掉
+```
+
+路径 ① 不问，路径 ②③ 一定要问。理由很朴素：**你说的算数，系统猜的不算数**。猜错了要你自己去发现、去删除，成本落在你身上；而你都已经明说了"以后按这个来"，再弹个框问"确定吗"就是烦人。
+
+而且系统猜的东西有个天花板：候选被确认后，只能变成"**你个人的偏好**"，永远变不成"**全家的规矩**"（`service.py:102-103` 把作用域写死了）。想立全家规矩，必须管理员显式来定。系统再有把握，也没资格替全家做决定。
+
+至于路径 ③ 的"听出苗头"，用的是**正则匹配**（`extractor.py`），不是让模型去理解。规则很死板：句子里必须出现"我喜欢/我习惯/以后都"这类稳定信号，而且不能出现"今天/这次/暂时"这类临时信号。所以"我今天想把空调开 26 度"绝对抽不出来——**宁可漏记，也不错记**。
+
+**手册怎么翻开：不是全塞给管家**
+
+住户手册可能有几百条，全念一遍既浪费又干扰判断。所以每轮对话开始时（`sync_context` 节点），系统只挑最相关的 6 条塞进提示词，挑选分两步：
+
+第一步，**SQL 层面先筛掉不该看的**。别人的私人偏好、别的房间的规则，压根不会被查出来——权限写在 `WHERE` 里，不是查出来再用 `if` 过滤掉。这个区别很关键：过滤发生在数据离开数据库之前，代码里根本没机会失误。
+
+第二步，**给剩下的打分排序**，五个因素加权：
+
+| 因素 | 权重 | 通俗说法 |
+|------|-----:|---------|
+| 相关性 | 0.45 | 跟这句话有关系吗 |
+| 置信度 | 0.20 | 这条有多可靠 |
+| 重要性 | 0.20 | 这条有多要紧 |
+| 新鲜度 | 0.10 | 是不是最近才更新的 |
+| 使用频率 | 0.05 | 平时常不常用上 |
+
+没有用向量数据库。用的是"关键词命中 + 手写权重"，土，但**每一条为什么排在前面都能拆开算给你看**，测试里可以直接断言顺序。记忆条数真到 500 x条以上时，系统会**建议**你考虑上向量检索，但不会自己偷偷启用（6.4.7）。
+
+**改了和删了：其实什么都没丢**
+
+手册里的条目改动时，旧值不是被覆盖掉，而是留了一份快照进 `memory_versions`，条目本身版本号加一。删除也不是真删，只是把状态标成 `deleted`，检索时过滤掉——**你感觉它消失了，审计记录里它还在**。
+
+这个设计的用处在出问题的时候才显出来：用户说"我明明设的是暖光，怎么变冷白了"，你能把这条记忆的每一次变更、每一次的来源翻出来对账。代价是那几张审计表只增不减，生产环境得自己加归档和容量监控（6.4.13 最后几问）。
+
+**权限：三道锁**
+
+记忆里存的是个人习惯，串了就是隐私事故。所以有三道独立的锁：
+
+1. **身份不听模型的**。`home_id` / `user_id` 只从 `RunnableConfig` 取（`tools/memory.py` 的 `_context()`），用户在对话里说"我是管理员"没有任何效果——那只是一段文本。
+2. **看不见就是看不见**。跨用户、跨房间的隔离做在 SQL 的 `WHERE` 里。
+3. **写共享的要管理员**。个人偏好自己就能存；房间规则、全家约束必须管理员。
+
+**为什么拆成六个文件**
+
+一句话：**让每一层都能单独测**。
+
+```text
+models.py      记忆长什么样        —— 只有数据定义
+repository.py  怎么存怎么取        —— 只管读写，不判断权限
+service.py     允不允许、怎么处理  —— 唯一知道全局的一层
+extractor.py   从话里听出苗头      —— 碰不到数据库
+summarizer.py  便签本怎么压缩      —— 纯函数，没有副作用
+store.py       便签本本身          —— Checkpointer 的创建和清理
+```
+
+依赖方向严格单向：上面的认识下面的，下面的绝不回头认识上面的。一旦 `repository.py` 为了查权限去 import `service.py`，两层就锁死了，从此测存取必须先构造一整套权限上下文。现在的好处是：测抽取不用开数据库，测存取不用造用户身份，测权限不用调模型。
+
+**最后：这个模块的一贯态度**
+
+回头看，六个文件、十几个函数，背后其实是同一套判断反复出现：
+
+- **能确定的，绝不去猜**——正则而不是模型抽取，SQL 权限而不是 Python 判断，手写权重而不是黑盒向量。
+- **要猜的，一定问过再算数**——候选机制，而且系统猜的永远只能是个人偏好。
+- **删掉的，留一份底**——版本快照、逻辑删除、冲突记录。
+- **说好持久化，就必须真持久化**——配了 SQLite 路径却打不开，宁可启动直接报错，也不悄悄退回内存模式让你以为存上了（`store.py:73-76`）。
+
+这几条不是记忆模块独有的，它们是整个项目在**面对"不确定"时的一致选择**：宁可能力弱一点，也要行为可预测。
 
 ### 6.5 智能体与 LangGraph 进阶扩展
 
@@ -1734,64 +2619,186 @@ Agent：已取消操作，设备状态没有变化。
 
 #### 6.5.2 显式意图识别与条件路由
 
-阶段八已经增加结构化意图路由，阶段九至十二又在此基础上接入并行查询、Supervisor 和知识 RAG。当前 `task_router` 位于 `memory_reasoner` 之后：它先识别请求属于哪类业务，再生成 `intent_route` 和 `delegated_agent`，具体工具仍由后续节点选择。
+**先说清楚它解决什么问题**
+
+没有路由的时候，图只有一条路：不管用户说什么，都塞给同一个 agent 节点，由模型自己面对全部工具做决定。这条路能跑通，但有三件事做不了：
+
+- 一句"客厅、卧室、书房的空调各是多少度"，模型只能一个一个查，串行三次；
+- 一句"帮我把灯打开、空调调到 25 度、窗帘拉上"，模型可能漏掉其中一步，而且没人检查它做没做到；
+- 一句"这个故障码 E3 什么意思"，模型会凭记忆编，因为它手里没有说明书。
+
+这些请求本质上需要**不同的处理流程**，不是换个提示词就能解决的。于是加一个岔路口：先花一次判断确定这句话属于哪一类，再决定走哪条流程。这个岔路口就是 `task_router`（`graph.py:272`）。
+
+**它在图里的位置**
 
 ```text
-sync_context
+sync_context      ← 确定说的是哪个房间/设备，检索长期记忆
   ↓
-memory_reasoner
+memory_reasoner   ← 判断哪些记忆用得上
   ↓
-task_router
-  ├── device_query       → 设备查询分支
-  ├── device_control     → 设备控制分支
-  ├── scene_control      → 场景分支
-  ├── memory_management  → 记忆分支
-  ├── device_knowledge   → 设备知识 RAG 分支
-  ├── general_chat       → 通用对话分支
-  └── clarification      → 澄清分支
+task_router       ← 岔路口在这里
+  ↓
+  ├─→ planner              多步骤任务，先规划再逐步执行验证
+  ├─→ knowledge_rag        设备知识问答，查本地文档
+  ├─→ device_query_subgraph 多设备查询，并行发出
+  ├─→ clarification        信息不够，直接反问
+  └─→ compact_context      其余全部走原来的 ReAct 环
 ```
 
-路由结果使用结构化输出，而不是让代码解析模型生成的自然语言：
+注意最后一条：**路由不是取代 ReAct，而是在它前面加了几个专用出口**。大部分日常请求（开灯、关空调、聊天）仍然走 `compact_context → agent → tools` 那条老路。路由只把"老路处理不好"的那几类请求摘出去。
+
+**第一步：判断意图**
+
+分类结果不是让模型自由发挥再拿代码去解析文本，而是用结构化输出锁死格式（`routing.py:22-25`）：
 
 ```python
+Intent = Literal[
+    "device_query",       # 查状态、温度、开关
+    "device_control",     # 控制设备，但不属于预定义场景
+    "scene_control",      # 启用/取消预定义场景
+    "memory_management",  # 记住、修改、删除偏好
+    "device_knowledge",   # 说明书、故障码、维护方法
+    "general_chat",       # 闲聊、一般问题
+    "clarification",      # 信息不足，无法安全判断
+]
+
 class IntentResult(BaseModel):
-    intent: Literal[
-        "device_query",
-        "device_control",
-        "scene_control",
-        "memory_management",
-        "device_knowledge",
-        "general_chat",
-        "clarification",
-    ]
-    confidence: float
-    reason: str
+    intent: Intent
+    confidence: float = Field(ge=0, le=1)   # 0-1，越低越不确定
+    reason: str = ""                        # 为什么这么判，方便排查
 ```
 
-Router 的意图结果会进一步映射为图真正使用的执行路径。条件边依据 `state["intent_route"]` 选择下一个节点：
+`Literal` 保证 `intent` 只能是这七个值之一，`ge=0, le=1` 保证 `confidence` 落在合法区间——模型返回别的东西会当场校验失败，而不是带着脏数据往下走。多出来的 `reason` 字段不参与任何逻辑，纯粹是给人看的：路由判错时，你能直接看到它当时是怎么想的。
+
+**第二步：LLM 判不了就用关键词**
+
+`classify_intent`（`routing.py:68`）的实现只有几行，但结构值得注意：
 
 ```python
-workflow.add_conditional_edges(
-    "task_router",
-    route_task,
-    {
-        "planner": "planner",
-        "compact_context": "compact_context",
-        "device_query_subgraph": "device_query_subgraph",
-        "knowledge_rag": "knowledge_rag",
-        "clarification": "clarification",
-    },
-)
+def classify_intent(llm, text: str) -> IntentResult:
+    """Use structured LLM output when available; never let routing break the agent."""
+    fallback = classify_intent_fallback(text)     # ① 先把兜底算出来
+    try:
+        structured = llm.with_structured_output(IntentResult)
+        result = structured.invoke(intent_router_prompt(text))
+        return result if isinstance(result, IntentResult) else IntentResult.model_validate(result)
+    except Exception:
+        return fallback                           # ② 出任何问题都退回兜底
 ```
 
-可以对比两种设计：
+docstring 那句 `never let routing break the agent` 是整段代码的目的：**路由是辅助功能，它自己坏了不能把整个 Agent 拖下水**。API 超时、模型输出不合 schema、网络断了，统统退回关键词匹配继续跑。
+
+兜底层（`classify_intent_fallback`，`routing.py:44`）是纯字符串子串匹配，没有分词、没有正则、没有模型：
+
+```python
+if any(word in value for word in memory_words):
+    return IntentResult(intent="memory_management", confidence=0.92, reason="包含记忆或偏好操作词")
+```
+
+五组关键词按固定顺序依次判断，先命中先返回：
+
+```text
+记忆词 → 知识词 → 场景词 → 查询词 → 控制词 → (太短)澄清 → 通用对话
+```
+
+`confidence` 是手写常量，不是算出来的。这层"土"得很明显，但它**确定、可测、零成本**——和 6.4 记忆模块里正则抽取的取舍是同一套思路。
+
+顺序是人工排的，有对也有错。`scene_words` 排在 `control_words` 前面是对的，所以"关闭睡眠场景"能正确进场景分支；但 `query_words` 里有"温度"且排在控制词前面，于是"把温度调到 25 度"会被判成 `device_query`——一句明确的控制指令被当成了查询。正常情况下踩不到，因为默认走 LLM；一旦模型侧静默降级，这类误判就会浮现。这是兜底方案要付的价。
+
+**第三步：意图 ≠ 路径**
+
+这是最容易看错的一步。上面七个意图，和图里五个出口，**不是一一对应的**。中间隔着一层判定，顺序有讲究（`graph.py:288-306`）：
+
+```python
+use_planner = planning_enabled and should_use_planner(latest_text)
+intent_route = "planner" if use_planner else "react"
+
+if not use_planner and intent.intent == "device_knowledge" and rag_enabled:
+    intent_route = "knowledge_rag"
+if not use_planner and intent.intent == "device_query" and should_use_parallel_query(...):
+    intent_route = "parallel_query"
+if not use_planner and (intent.intent == "clarification"
+                        or intent.confidence < confidence_threshold
+                        or memory_decision.needs_clarification):
+    intent_route = "clarification"
+```
+
+三个关键点：
+
+**① Planner 优先级最高。** 每个后续分支都带 `not use_planner` 前置条件，所以复杂多步任务不会被降级成 RAG 或澄清。而且判断多步任务用的**不是 LLM 意图**，而是独立的规则函数 `should_use_planner`（`planning.py:63`）：数一句话里有几个动作词、涉及几类设备、有没有"然后/同时/并且"这类连接词，`动作 ≥ 2 且（设备种类 ≥ 2 或有连接词）` 才成立。它还专门排除了预定义场景——"我要睡了"归场景分支，不进 Planner。
+
+**② 意图对了还得条件成立。** `device_knowledge` 只有在 `RAG_ENABLED=true` 时才走 RAG，否则回落 ReAct；`device_query` 只有在**真的涉及 2 个以上设备**时才走并行子图（`parallel.py:38`），查单个设备走并行反而是浪费。
+
+**③ 澄清有三个触发口。** 模型明确判为 `clarification`、置信度低于阈值（默认 0.6）、或者记忆推理阶段认为需要追问——任一成立就反问用户。第二个口是关键：**模型说不准的时候，宁可多问一句，也不要猜着去动设备。**
+
+**第四步：条件边**
+
+前面算出的 `intent_route` 存进 state，`route_task` 只是把它翻译成节点名（`graph.py:628-649`）：
+
+```python
+def route_task(state: AgentState) -> Literal[
+    "planner", "compact_context", "clarification", "device_query_subgraph", "knowledge_rag"
+]:
+    if state.get("intent_route") == "clarification":
+        return "clarification"
+    if state.get("intent_route") == "parallel_query":
+        return "device_query_subgraph"
+    if state.get("intent_route") == "knowledge_rag":
+        return "knowledge_rag"
+    return "planner" if state.get("planning_active") else "compact_context"
+
+workflow.add_conditional_edges("task_router", route_task, {
+    "planner": "planner",
+    "compact_context": "compact_context",
+    "clarification": "clarification",
+    "device_query_subgraph": "device_query_subgraph",
+    "knowledge_rag": "knowledge_rag",
+})
+```
+
+**决策和跳转是分开的**：`task_router` 节点负责想，`route_task` 函数负责跳，中间靠 state 传递。这样拆的好处是路由决策会进 checkpoint——事后你能查到"这一轮为什么走了 RAG 分支"，而不是只看到结果。
+
+返回值标注成 `Literal` 也不是摆设：这几个字符串必须和 `add_conditional_edges` 的映射键对上，标了之后写错节点名类型检查器当场报错，不用等运行到那条边才抛异常；同时 LangGraph 会读这个标注来推断图的边，画出来的 mermaid 图才有正确的分支（见 `tests/visualize_graph.ipynb`）。
+
+**这个项目到底是哪种设计**
+
+回到最初的对比：
 
 | 设计 | 优点 | 适合研究的问题 |
 | --- | --- | --- |
 | 单 Agent 自主选工具 | 图简单，模型自由度高 | ReAct、工具选择、提示词设计 |
 | Router + 专用分支 | 路径清晰，状态容易约束 | 结构化输出、条件边、模块边界 |
 
-不要默认认为节点越多越先进。这个实验真正需要观察的是：增加路由后，工具选择是否更准确，复杂度和模型调用次数是否值得。
+**本项目两种都有，是"外层 Router 分流 + 内层 ReAct"的混合结构，骨架是 Router 式的。**
+
+- **外层**：`task_router` 决定走哪条业务流程，路径清晰、状态可约束——只有 planner 分支才有 `plan`、`step_retry_count` 这些字段。
+- **内层**：落到 ReAct 分支后，agent 节点面对完整工具列表，调哪个工具、调几次全由模型决定。**Router 只选路径，不选工具**（`routing.py:3-4` 的注释明确写了这一点）。
+- **中间还有一层**：`MULTI_AGENT_ENABLED=true` 时，Router 会把意图映射成角色（`multi_agent.py:9-18`），agent 节点按角色换一组**预绑定的工具**和一份角色提示词。Device Agent 摸不到记忆工具，Memory Agent 不得控制设备——比纯 ReAct 多了约束，比硬编码分支灵活。
+
+**这个实验该怎么做**
+
+不要默认节点越多越先进。加路由是有代价的：**每轮对话多一次 LLM 调用**，多一层可能判错的逻辑，图也从一条线变成了五个分支。
+
+真正的验证方法是做对照：
+
+```powershell
+# 关掉路由，全部走 ReAct
+$env:ROUTING_ENABLED = "false"
+& $python -m src.main --home-id demo-home --user-id user-001
+
+# 开启路由（默认）
+$env:ROUTING_ENABLED = "true"
+```
+
+用同一组请求跑两遍，对比三件事：
+
+| 观察项 | 怎么看 |
+|--------|--------|
+| 工具选择是否更准 | 日志里 `Agent 决策: 调用工具 → [...]` 的序列对不对 |
+| 多花的调用值不值 | 路由多花 1 次，但并行查询可能省下 N-1 次串行 |
+| 判错时是否可控 | 关键词兜底会不会把控制指令判成查询 |
+
+结论很可能是"看情况"：单设备操作路由纯属额外开销；多设备查询和多步任务，路由带来的并行和规划能力是 ReAct 给不了的。**这个"看情况"本身就是实验结果**——你要找的不是哪种设计更好，而是哪类请求值得为它多付一次调用。
 
 #### 6.5.3 Planner–Executor：把规划和执行分开
 
@@ -3022,7 +4029,10 @@ training/
 ```ini
 EXTERNAL_MCP_SERVERS=[{"name":"weather","transport":"stdio","command":"python","args":["-m","src.mcp.weather_server"]}]
 WEATHER_DEFAULT_LOCATION=杭州
+CAIYUN_WEATHER_TOKEN=你的彩云 token
 ```
+
+`CAIYUN_WEATHER_TOKEN` 在 <https://dashboard.caiyunapp.com> 免费领取。留空时天气工具仍能被发现和调用，只会返回“未配置彩云天气 token”的提示。免费额度下预报最多 3 天，请求过密会触发限流提示。
 
 运行 `python -m src.main` 时，Agent 会自动发现天气工具并把它们加入普通聊天 Agent。设备控制、场景、记忆和知识 RAG Agent 不会获得天气工具，避免职责混用。
 
