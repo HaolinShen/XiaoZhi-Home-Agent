@@ -50,13 +50,14 @@ def build_approval_request(tool_calls: list[dict[str, Any]]) -> ApprovalRequest 
 
 
 def approval_is_granted(value: Any) -> bool:
-    """Normalize CLI/API resume payloads to a strict approval decision."""
+    """Normalize CLI/API resume payloads to a strict approval decision.
+    将 CLI/API 恢复有效负载规范化，使其符合严格的审批决策。"""
     if isinstance(value, bool):
         return value
     if isinstance(value, dict):
         return value.get("approved") is True
     if isinstance(value, str):
-        return value.strip().lower() in {"y", "yes", "true", "确认", "同意", "继续"}
+        return value.strip().lower() in {"y", "yes", "true", "确认", "同意", "继续", "执行", "确定", "好"}
     return False
 
 

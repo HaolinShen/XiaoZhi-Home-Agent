@@ -173,8 +173,10 @@ def _ask_for_approval(payload: dict) -> bool:
         title=f"⚠️ 操作确认 · {payload.get('risk_level', 'unknown')}",
         border_style="yellow",
     ))
-    answer = console.input("[bold yellow]确认执行？[y/N]:[/bold yellow] ").strip().lower()
-    return answer in {"y", "yes", "确认", "同意", "继续"}
+    answer = console.input(
+        "[bold yellow]输入 y 确认执行，直接回车或其他键取消：[/bold yellow] "
+    ).strip().lower()
+    return answer in {"y", "yes", "确认", "同意", "继续", "执行", "确定", "好"}
 
 
 def _invoke_with_approval(graph, state_input: dict, config: dict) -> dict:
