@@ -22,3 +22,4 @@
 | 007 | 记忆推理、时间旅行与进度事件 | 已实现 | [007-memory-time-travel-streaming.md](007-memory-time-travel-streaming.md) |
 | 008 | Agentic RAG 与轨迹评测 | 已实现 | [008-agentic-rag-evaluation.md](008-agentic-rag-evaluation.md) |
 | 009 | 规划过程的运行时可见性 | 已实现 | [009-runtime-planning-visibility.md](009-runtime-planning-visibility.md) |
+| 010 | 事件驱动家庭自动化 | 已实现 | [010-event-driven-automation.md](010-event-driven-automation.md) |

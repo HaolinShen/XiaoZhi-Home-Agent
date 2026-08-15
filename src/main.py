@@ -48,6 +48,8 @@ from src.config import get_settings, Settings
 from src.devices import DeviceRegistry, SimulatorBackend
 from src.progress_view import PlanProgressView, format_arguments, format_state
 from src.tools import set_registry as set_tools_registry
+from src.tools import set_automation_runtime
+from src.automation.runtime import AutomationRuntime
 from src.mcp import load_external_tools
 from src.agent import (
     AgentContext,
@@ -115,6 +117,7 @@ def _print_help() -> None:
     cmd_table.add_row("/reset", "重置对话记忆（开始新对话）")
     cmd_table.add_row("/history", "查看当前会话最近的 Checkpoint 状态历史")
     cmd_table.add_row("/plan", "复盘最近一次多步骤计划：Planner 产出 + 逐步验证结果")
+    cmd_table.add_row("/routines", "查看起床/车辆回家例程及其待执行任务")
     cmd_table.add_row("/help", "显示此帮助信息")
     cmd_table.add_row("/quit, /exit", "退出程序")
 
@@ -231,6 +234,26 @@ def _print_last_plan(graph, config: dict) -> None:
     console.print(result_table)
 
 
+def _print_routines(runtime: AutomationRuntime | None, home_id: str) -> None:
+    if runtime is None:
+        console.print("[dim]自动化调度器未启用。[/dim]")
+        return
+    routines = runtime.store.list_routines(home_id)
+    table = Table(title="⏰ 自动化例程", box=box.ROUNDED, border_style="cyan")
+    table.add_column("ID", style="dim")
+    table.add_column("名称")
+    table.add_column("触发器")
+    table.add_column("任务状态")
+    for routine in routines:
+        tasks = runtime.store.list_tasks(routine.id)
+        counts: dict[str, int] = {}
+        for task in tasks:
+            counts[task.status] = counts.get(task.status, 0) + 1
+        summary = ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "尚未触发"
+        table.add_row(routine.id[:10], routine.name, routine.trigger_type, summary)
+    console.print(table)
+
+
 def _ask_for_approval(payload: dict) -> bool:
     """Render one approval request and return a strict yes/no decision."""
     console.print()
@@ -293,6 +316,7 @@ def run_interactive_loop(
     context: AgentContext,
     sessions: SessionManager,
     view: PlanProgressView,
+    automation_runtime: AutomationRuntime | None = None,
 ) -> None:
     """
     交互式对话主循环。
@@ -354,6 +378,10 @@ def run_interactive_loop(
 
             elif user_input.lower() == "/plan":
                 _print_last_plan(graph, context.to_config())
+                continue
+
+            elif user_input.lower() == "/routines":
+                _print_routines(automation_runtime, context.home_id)
                 continue
 
             # ---- 正常对话 ----
@@ -457,6 +485,18 @@ def chat(
     # ---- 注入注册中心到工具层 ----
     set_tools_registry(registry)
 
+    automation_runtime = None
+    if settings.automation.enabled:
+        automation_runtime = AutomationRuntime(
+            registry,
+            db_path=settings.automation.db_path,
+            timezone_name=settings.automation.timezone,
+            event_sink=lambda event: logger.info("自动化事件 | {}", event),
+        )
+        automation_runtime.scheduler.poll_seconds = settings.automation.poll_seconds
+        automation_runtime.scheduler.start()
+        set_automation_runtime(automation_runtime)
+
     space_directory = SpaceDirectory.from_registry(registry, home_id=home_id)
 
     # ---- 构建 Agent 图 ----
@@ -482,6 +522,9 @@ def chat(
             session_id=session_id,
         )
     except Exception as e:
+        if automation_runtime is not None:
+            automation_runtime.close()
+            set_automation_runtime(None)
         console.print(f"\n[red]❌ Agent 初始化失败: {e}[/red]\n")
         console.print(
             "[dim]可能的原因:\n"
@@ -510,10 +553,16 @@ def chat(
     console.print("[dim]输入 /help 查看更多用法，/quit 退出[/dim]")
 
     # ---- 启动对话循环 ----
-    run_interactive_loop(
-        graph, registry, context, sessions,
-        PlanProgressView(console, show_trace=trace),
-    )
+    try:
+        run_interactive_loop(
+            graph, registry, context, sessions,
+            PlanProgressView(console, show_trace=trace),
+            automation_runtime,
+        )
+    finally:
+        if automation_runtime is not None:
+            automation_runtime.close()
+            set_automation_runtime(None)
 
 
 @app.command()

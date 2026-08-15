@@ -200,6 +200,16 @@ langgraph/
 │   ├── evaluation/           # Agent 轨迹评测
 │   │   └── trajectory.py     # 路由、状态、来源和拒答指标
 │   │
+│   ├── automation/           # 事件驱动家庭自动化
+│   │   ├── models.py         # 例程、动作、任务和车辆事件模型
+│   │   ├── store.py          # SQLite 例程与调度任务持久化
+│   │   ├── scheduler.py      # 可测试 tick + 后台调度 worker
+│   │   ├── executor.py       # 复用设备工具和 Verifier 执行动作
+│   │   ├── speaker.py        # 音响闹钟接口与模拟器
+│   │   ├── vehicle.py        # 车辆事件模拟器与回家编排器
+│   │   ├── routines.py       # 起床、车辆回家例程模板
+│   │   └── runtime.py        # 应用侧自动化运行时
+│   │
 │   ├── middleware/           # 中间件层
 │   │   ├── __init__.py
 │   │   └── interceptors.py   # 日志拦截器 + 重试拦截器
@@ -220,6 +230,7 @@ langgraph/
 │   ├── test_phase_ten.py     # Supervisor 多智能体测试
 │   ├── test_phase_eleven.py  # 记忆推理、时间旅行与事件测试
 │   ├── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
+│   ├── test_automation_routines.py # 起床、车辆 ETA、取消和去重测试
 │   ├── test_weather_mcp.py   # 天气 MCP 发现、调用与结果格式测试
 │   ├── test_humidifier.py    # 加湿器模型、工具、Planner 与状态测试
 │   ├── test_sensors.py       # 传感器模型、环境推演、read_sensor 与只读约束测试
@@ -232,7 +243,8 @@ langgraph/
 │
 └── data/                     # 运行时数据（自动创建）
     ├── checkpoints.db        # SQLite 会话检查点
-    └── memories.db           # SQLite 长期结构化记忆
+    ├── memories.db           # SQLite 长期结构化记忆
+    └── automation.db         # 自动化例程、运行批次和待执行任务
 ```
 
 ### 架构分层
@@ -4139,9 +4151,232 @@ rag_device_model: str | None
 
 `src/evaluation/trajectory.py` 可以离线计算路由准确、回答/拒答状态、来源正确性、是否发生检索、查询改写次数和引用数量。评测关注的是整条轨迹，而不只是最终回答是否流畅。
 
-#### 6.5.13 推荐的进阶学习顺序
+#### 6.5.13 事件驱动例程：定时起床与车辆回家联动
 
-下面阶段六至十二的能力目前都已进入项目，但学习时仍不建议一次全部展开。可以按照它们对 LangGraph 核心能力的依赖关系分阶段理解：
+前面的 Agent 都由一条用户消息启动。但“明天早上 6 点叫我起床”和“汽车快到家时提前准备热水”不能在本轮对话里立即执行，它们需要先保存计划，再由未来的时间或外部事件唤醒。
+
+当前项目使用“通用计划 + 两类触发器”，而不是为每句话编写一个固定模板：
+
+```text
+固定时间触发
+  用户：今天 17:00 打球回到家，提前准备洗澡水和客厅降温
+  Agent 动态规划：
+      ├── 16:30：热水器设置到 45°C
+      └── 16:40：客厅空调设置到 25°C
+
+车辆事件触发
+  用户：车辆到家前准备热水、降温并打开窗帘
+  Agent 动态规划动作和 offset_minutes
+  汽车每次上报 ETA 后，调度器重新计算尚未执行任务的时间
+```
+
+##### 为什么不能只让 LangGraph 等到明天
+
+一次图执行不应该为了等待明天 6 点而一直占用进程。Checkpoint 可以恢复图状态，但它不是后台定时器。因此项目把职责拆成两层：
+
+```text
+对话 LangGraph
+  负责理解请求、选择 Automation Agent、请求确认、创建例程
+
+AutomationRuntime
+  负责持久化、等待触发、执行任务、验证状态和失败重试
+```
+
+例程保存在 `data/automation.db`。即使对话结束，待执行任务也不会依赖消息历史；应用重新启动后，调度器可以继续读取未完成任务。
+
+##### 统一的数据模型
+
+起床和车辆回家使用同一个 `Routine`：
+
+```python
+class Routine(BaseModel):
+    id: str
+    home_id: str
+    user_id: str
+    name: str
+    trigger_type: Literal[
+        "fixed_time", "vehicle_eta", "vehicle_geofence", "manual"
+    ]
+    timezone: str
+    enabled: bool
+    actions: list[RoutineAction]
+
+class RoutineAction(BaseModel):
+    offset_minutes: int
+    tool_name: str
+    arguments: dict
+    description: str
+```
+
+`offset_minutes` 相对于锚点时间。例如起床时间是 06:00，`-30` 表示 05:30；汽车预计 18:00 到家，`-10` 表示 17:50。
+
+每个动作会转换成独立的 `ScheduledTask`。任务具有 `pending`、`running`、`completed`、`failed` 和 `cancelled` 状态，并使用 `dedupe_key` 防止同一车辆事件重复创建任务。
+
+##### 通用定时计划如何由智能体创建
+
+结构化路由新增了 `automation_management` 意图，并交给 Automation Agent。它只拥有以下工具：
+
+```text
+create_scheduled_routine
+create_vehicle_arrival_routine
+schedule_wake_routine
+enable_vehicle_arrival_routine
+list_automation_routines
+cancel_automation_routine
+```
+
+`schedule_wake_routine` 和 `enable_vehicle_arrival_routine` 是兼容早期示例的便捷模板。新的自然语言请求优先使用两个 `create_*` 通用工具。
+
+例如用户说：
+
+```text
+我今天下午 5 点打球回到家，帮我提前准备洗澡水，同时提前打开客厅空调降温。
+```
+
+主图会把可信的 `current_datetime` 和家庭时区放进 Agent 上下文。Automation Agent 将“今天下午 5 点”转换成带日期和时区的绝对时间，再根据目标动态生成动作：
+
+```python
+create_scheduled_routine(
+    name="打球回家准备",
+    anchor_at_iso="2026-08-15T17:00:00+08:00",
+    actions=[
+        {
+            "offset_minutes": -30,
+            "tool_name": "control_water_heater",
+            "description": "提前准备洗澡热水",
+            "arguments": {
+                "device_name": "卫生间电热水器",
+                "action": "set_temp",
+                "target_temp": 45,
+            },
+        },
+        {
+            "offset_minutes": -20,
+            "tool_name": "control_ac",
+            "description": "提前降低客厅温度",
+            "arguments": {
+                "device_name": "客厅空调",
+                "action": "on",
+                "temperature": 25,
+                "mode": "cool",
+            },
+        },
+    ],
+)
+```
+
+这里真正由模型规划的是 `actions` 和 `offset_minutes`，不是从代码里选择“打球模板”。确定性代码会在入库前逐步校验：工具是否在白名单、设备名称是否存在、action 是否合法、参数是否能形成可验证状态、是否包含定时解锁等禁止动作。
+
+如果用户没有说明提前量，Automation Agent 使用保守的设备准备参考值：热水器 30 分钟、空调 20 分钟、烧水壶 10 分钟、窗帘 2 分钟、灯光 0 分钟。它们只是规划提示，用户明确指定“提前 45 分钟”时必须以用户要求为准。
+
+创建定时或车辆自动化属于持续生效的副作用，会进入现有 `approval` 节点。确认面板会展示目标时间和动作列表，只有用户确认后才真正写入数据库。
+
+音响目前使用 `SimulatorSpeakerBackend`。真实音响可以实现同一个 `SpeakerBackend` 接口，无需修改例程和调度器。
+
+##### 车辆 ETA 为什么会不断变化
+
+车辆接入边界使用 `VehicleEvent`：
+
+```python
+class VehicleEvent(BaseModel):
+    vehicle_id: str
+    home_id: str
+    event_type: Literal[
+        "location", "eta_update", "geofence_enter",
+        "ignition_on", "ignition_off"
+    ]
+    latitude: float
+    longitude: float
+    eta_minutes: int | None
+    occurred_at: datetime
+```
+
+同一趟行程使用稳定的 `trip_id`。新的 ETA 到来时，调度器更新尚未执行任务的 `due_at`；已经完成的任务不会倒退或再次执行。
+
+```text
+17:00 ETA=20 分钟 → 空调计划 17:10 执行
+17:01 ETA=25 分钟 → 空调改为 17:16 执行
+已完成的热水器任务 → 保持 completed，不重新执行
+```
+
+项目提供 `VehicleSimulator` 用于本地验证。未来接汽车厂商 API、MQTT 或 Webhook 时，只需要把外部数据转换成 `VehicleEvent`，再调用：
+
+```python
+runtime.arrivals.handle(vehicle_event)
+```
+
+##### 调度器如何执行和验证
+
+`RoutineScheduler` 有两种运行方式：
+
+- `start()`：CLI 中启动后台 worker，周期性查询到期任务；
+- `tick(now=...)`：测试中注入虚拟时间，不需要真的等 30 分钟。
+
+到期任务交给 `RoutineExecutor`。它复用现有工具、`expected_state_for_step` 和 `verify_step`：
+
+```text
+ScheduledTask 到期
+  ↓
+调用 control_water_heater / control_ac / control_curtain 等可信工具
+  ↓
+读取 DeviceRegistry 真实状态
+  ↓
+Verifier 比对 expected_state 和 actual_state
+  ↓
+completed / pending retry / failed
+```
+
+因此自动化任务不是“工具返回成功就算成功”，仍然要检查模拟设备或真实设备后端的状态。
+
+##### 安全边界
+
+通用计划遵守以下约束：
+
+- 自动化创建必须先经过一次人工确认；
+- 车辆回家例程永远不会自动解锁门锁；
+- 工具、设备名、action 和参数在任务入库前完成确定性校验；
+- 任何 LLM 生成的定时解锁步骤都会被 Pydantic Schema 拒绝；
+- 冲牛奶只表示准备 80°C 热水，不声称已经自动完成冲奶；
+- 取消例程会把所有未执行任务改为 `cancelled`，并停用已经写入模拟音响的闹钟；
+- 汽车事件使用 `home_id`、`vehicle_id` 和 `trip_id` 去重；
+- 真实汽车位置和音响账号需要由业务后端完成授权，不能由模型从文本中伪造。
+
+##### 如何查看和测试
+
+CLI 中可以输入：
+
+```text
+/routines
+```
+
+它会显示例程 ID、触发器，以及 pending、completed、failed 等任务数量。后台执行还会输出 `routine_scheduled`、`routine_action_started` 和 `routine_action_finished` 事件日志。
+
+自动化测试不依赖真实时间和真实汽车：
+
+```powershell
+F:\Software\Anaconda\envs\langgraph\python.exe -m pytest -q `
+  -p no:cacheprovider tests/test_automation_routines.py
+```
+
+测试覆盖：
+
+- “今天 17 点打球回家”这类非模板请求可动态生成热水器和空调步骤；
+- 完整主图在批准前不会写入例程，批准后才持久化动态计划；
+- 通用计划按照 `offset_minutes` 在目标时间前执行；
+- 不存在的设备、非法 action 和定时解锁会在入库前失败；
+- 创建起床例程后立即设置音响闹钟；
+- 起床前 30 分钟准备洗澡热水；
+- 起床前 10 分钟准备冲奶热水；
+- 起床时打开窗帘和灯；
+- 车辆 ETA 分阶段执行回家准备；
+- ETA 更新只移动 pending 任务；
+- 同一趟行程不会重复创建任务；
+- 取消后设备不会被操作；
+- Automation Agent 的工具集与其他 Agent 隔离。
+
+#### 6.5.14 推荐的进阶学习顺序
+
+下面阶段六至十三的能力目前都已进入项目，但学习时仍不建议一次全部展开。可以按照它们对 LangGraph 核心能力的依赖关系分阶段理解：
 
 ```text
 阶段六：人在回路与可恢复执行（已实现）
@@ -4164,11 +4399,14 @@ rag_device_model: str | None
         ↓
 阶段十二：Agentic RAG 与轨迹评测（已实现）
   知识检索、来源路由、执行轨迹比较
+        ↓
+阶段十三：事件驱动自动化（已实现）
+  Routine、Scheduler、车辆 ETA、持久化任务、后台执行
 ```
 
-这里的阶段编号是教程中的 Agent 学习路线编号，不等同于 `docs/iterations/` 文件名前缀。章节对应关系为：阶段六对应 6.5.1；阶段七对应 6.5.3 和 6.5.4；阶段八至十二依次对应 6.5.2、6.5.6–6.5.7、6.5.8、6.5.9–6.5.11 和 6.5.12。6.5.5 的独立 Evaluator–Optimizer 循环仍是扩展方向。
+这里的阶段编号是教程中的 Agent 学习路线编号，不等同于 `docs/iterations/` 文件名前缀。章节对应关系为：阶段六对应 6.5.1；阶段七对应 6.5.3 和 6.5.4；阶段八至十二依次对应 6.5.2、6.5.6–6.5.7、6.5.8、6.5.9–6.5.11 和 6.5.12；阶段十三对应 6.5.13。6.5.5 的独立 Evaluator–Optimizer 循环仍是扩展方向。
 
-阶段六至阶段十二均已完成。项目现在覆盖人在回路、规划验证、结构化路由、子图并行、Supervisor 多智能体、显式记忆推理、时间旅行、进度事件以及带来源的 Agentic RAG。下一步更适合从评测数据出发补齐薄弱场景，或进入 6.6 的家居领域 SFT、LoRA 与偏好优化路线，而不是继续无目标增加节点。
+阶段六至阶段十三均已完成。项目现在还覆盖固定时间和车辆事件驱动的家庭自动化例程。下一步可以接入真实音响、Home Assistant 或汽车厂商事件源，也可以进入 6.6 的家居领域 SFT、LoRA 与偏好优化路线。
 
 ### 6.6 家居领域模型训练：SFT、LoRA 与强化学习
 

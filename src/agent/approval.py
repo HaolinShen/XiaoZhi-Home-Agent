@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal, TypedDict
 
 from langchain_core.messages import ToolMessage
@@ -31,6 +32,42 @@ def _is_unlock_call(call: dict[str, Any]) -> bool:
     )
 
 
+def _is_automation_call(call: dict[str, Any]) -> bool:
+    return call.get("name") in {
+        "create_scheduled_routine",
+        "create_vehicle_arrival_routine",
+        "schedule_wake_routine",
+        "enable_vehicle_arrival_routine",
+    }
+
+
+def _automation_actions(value: Any) -> list[dict[str, Any]]:
+    """Normalize model-produced action payloads before tool validation runs."""
+    for _ in range(2):
+        if not isinstance(value, str):
+            break
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(item, dict):
+            result.append(item)
+        elif hasattr(item, "model_dump"):
+            result.append(item.model_dump())
+    return result
+
+
 def build_approval_request(tool_calls: list[dict[str, Any]]) -> ApprovalRequest | None:
     """Return an approval request for batch scene actions or lock unlocks.
 
@@ -40,7 +77,7 @@ def build_approval_request(tool_calls: list[dict[str, Any]]) -> ApprovalRequest 
     """
     risky_calls = [
         call for call in tool_calls
-        if call.get("name") == "activate_scene" or _is_unlock_call(call)
+        if call.get("name") == "activate_scene" or _is_unlock_call(call) or _is_automation_call(call)
     ]
     if not risky_calls:
         return None
@@ -54,10 +91,33 @@ def build_approval_request(tool_calls: list[dict[str, Any]]) -> ApprovalRequest 
             description = meta.get("description", "将同时修改多台家居设备")
             descriptions.append(f"{scene_name}：{description}")
             risk_levels.append("medium")
-        else:
+        elif _is_unlock_call(call):
             device_name = str(call.get("args", {}).get("device_name", "门锁"))
             descriptions.append(f"解锁{device_name}（对外敏感动作）")
             risk_levels.append("high")
+        else:
+            if call.get("name") in {"schedule_wake_routine", "create_scheduled_routine"}:
+                args = call.get("args", {})
+                target = args.get("wake_at_iso") or args.get("anchor_at_iso") or "未指定时间"
+                name = args.get("name", "起床自动化")
+                actions = _automation_actions(args.get("actions", []))
+                action_text = "；".join(
+                    f"{item.get('offset_minutes', 0):+}分钟 {item.get('description') or item.get('tool_name', '')}"
+                    for item in actions
+                )
+                suffix = f"：{action_text}" if action_text else ""
+                descriptions.append(f"创建定时自动化「{name}」（{target}）{suffix}")
+            else:
+                args = call.get("args", {})
+                vehicle_id = args.get("vehicle_id", "未指定车辆")
+                actions = _automation_actions(args.get("actions", []))
+                action_text = "；".join(
+                    f"{item.get('offset_minutes', 0):+}分钟 {item.get('description') or item.get('tool_name', '')}"
+                    for item in actions
+                )
+                suffix = f"：{action_text}" if action_text else ""
+                descriptions.append(f"启用车辆 {vehicle_id} 的回家自动化{suffix}")
+            risk_levels.append("medium")
 
     summary = "；".join(descriptions)
     risk_level: Literal["medium", "high"] = "high" if "high" in risk_levels else "medium"

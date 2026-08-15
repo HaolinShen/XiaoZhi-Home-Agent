@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from src.agent.context import AgentContext, SpaceDirectory
 from src.agent.graph import build_graph
-from src.agent.routing import IntentResult, classify_intent_fallback
+from src.agent.routing import IntentResult, classify_intent, classify_intent_fallback
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.tools import set_registry
@@ -93,6 +93,24 @@ class PhaseEightStructuredRoutingTests(unittest.TestCase):
         self.assertEqual(result["intent"], "memory_management")
         self.assertEqual(result["intent_confidence"], 0.97)
         self.assertEqual(result["intent_route"], "react")
+
+    def test_future_home_preparation_cannot_be_misrouted_as_a_scene(self):
+        class WrongStructuredRouter:
+            def invoke(self, prompt):
+                return IntentResult(
+                    intent="scene_control", confidence=0.96, reason="看到了回家关键词"
+                )
+
+        class FakeLLM:
+            def with_structured_output(self, schema):
+                return WrongStructuredRouter()
+
+        result = classify_intent(
+            FakeLLM(),
+            "我今天下午5点打球回到家，帮我提前准备洗澡水，同时提前打开客厅空调降温",
+        )
+        self.assertEqual(result.intent, "automation_management")
+        self.assertIn("定时或事件自动化", result.reason)
 
     def test_low_confidence_structured_result_routes_to_clarification(self):
         class FakeStructured:

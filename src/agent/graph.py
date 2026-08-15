@@ -16,7 +16,10 @@ LangGraph Agent 工作流
   4. 支持升级为 SqliteSaver 实现持久化记忆
 """
 
+import re
+from datetime import datetime
 from typing import Literal, Sequence
+from zoneinfo import ZoneInfo
 from loguru import logger
 
 from langgraph.graph import StateGraph, END
@@ -58,6 +61,66 @@ from .multi_agent import agent_for_intent, role_prompt
 from .reasoning import format_memory_decision, reason_about_memories
 from .observability import emit_progress
 from ..knowledge import KnowledgeBase, build_knowledge_rag_subgraph
+
+
+def _current_datetime(settings: Settings) -> str:
+    timezone_name = getattr(getattr(settings, "automation", None), "timezone", "Asia/Shanghai")
+    try:
+        zone = ZoneInfo(timezone_name)
+    except Exception:
+        zone = ZoneInfo("Asia/Shanghai")
+    return datetime.now(zone).isoformat(timespec="seconds")
+
+
+_AUTOMATION_READ_MARKERS = (
+    "有哪些", "有多少", "多少个", "多少条", "几个", "几条", "查看", "看看",
+    "看一下", "列出", "列表", "查询", "有没有", "是否有", "都有什么",
+    "什么任务", "哪些任务", "什么例程",
+)
+_AUTOMATION_CANCEL_MARKERS = ("取消", "删除", "停用", "撤销", "清空", "不要了")
+_AUTOMATION_TRIGGER_MARKERS = (
+    "提前", "定时", "闹钟", "起床", "叫我", "到家前", "回家前",
+    "车辆", "汽车", "车快到", "eta", "地理围栏",
+)
+_AUTOMATION_ACTION_MARKERS = (
+    "打开", "开启", "关闭", "关掉", "调到", "调高", "调低", "设置", "设为",
+    "准备", "预热", "烧水", "降温", "升温", "制冷", "制热", "启动", "叫我",
+)
+_AUTOMATION_TIME_PATTERN = re.compile(
+    r"\d{1,2}\s*[:：]\d{2}"
+    r"|\d{1,2}\s*[点時时]"
+    r"|\d{1,3}\s*(?:分钟|个小时|小时)后"
+    r"|今天|今晚|明天|明早|明晚|后天"
+    r"|周[一二三四五六日天]|星期[一二三四五六日天]"
+)
+
+
+def _required_automation_tool(text: str) -> str | None:
+    """Return the mutation tool a creation request must call, if any.
+
+    强制机制的默认值必须是"不强制"：只有同时出现未来触发信号和设备动作信号
+    时才锁定创建工具。查询和取消类请求（例如"当前有多少个定时任务"）必须返回
+    None，否则 Agent 会被反复要求为一个问句创建例程，两轮都失败后只能对用户
+    报错，而它本来应该调用 list_automation_routines。
+    """
+    normalized = text.strip().lower()
+    if not normalized:
+        return None
+    if any(marker in normalized for marker in _AUTOMATION_READ_MARKERS):
+        return None
+    if any(marker in normalized for marker in _AUTOMATION_CANCEL_MARKERS):
+        return None
+    has_trigger = bool(_AUTOMATION_TIME_PATTERN.search(normalized)) or any(
+        marker in normalized for marker in _AUTOMATION_TRIGGER_MARKERS
+    )
+    has_action = any(marker in normalized for marker in _AUTOMATION_ACTION_MARKERS)
+    if not (has_trigger and has_action):
+        return None
+    if any(marker in normalized for marker in ("车辆", "汽车", "车快到", "eta", "地理围栏")):
+        return "create_vehicle_arrival_routine"
+    if any(marker in normalized for marker in ("起床", "闹钟", "叫我起床")):
+        return "schedule_wake_routine"
+    return "create_scheduled_routine"
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -120,7 +183,8 @@ def build_graph(
     llm_with_tools = llm.bind_tools(tools)
     device_tool_names = {
         "control_light", "control_ac", "control_tv", "control_curtain",
-        "control_humidifier", "read_sensor", "get_device_status",
+        "control_humidifier", "control_water_heater", "control_lock", "control_kettle",
+        "read_sensor", "get_device_status",
     }
     # 场景分支也要能读传感器：离家模式前需要先确认家里没人。
     scene_tool_names = {"activate_scene", "list_scenes", "read_sensor"}
@@ -129,10 +193,16 @@ def build_graph(
         "update_personal_memory", "delete_personal_memory", "list_preference_candidates",
         "confirm_preference_candidate", "reject_preference_candidate", "list_memory_versions",
     }
+    automation_tool_names = {
+        "create_scheduled_routine", "create_vehicle_arrival_routine",
+        "schedule_wake_routine", "enable_vehicle_arrival_routine",
+        "list_automation_routines", "cancel_automation_routine",
+    }
     specialised_llms = {
         "device": llm.bind_tools([tool for tool in tools if tool.name in device_tool_names]),
         "scene": llm.bind_tools([tool for tool in tools if tool.name in scene_tool_names]),
         "memory": llm.bind_tools([tool for tool in tools if tool.name in memory_tool_names]),
+        "automation": llm.bind_tools([tool for tool in tools if tool.name in automation_tool_names]),
         "knowledge": llm,
         "chat": llm.bind_tools(external_tools) if external_tools else llm,
     }
@@ -620,6 +690,7 @@ def build_graph(
           3. 返回 LLM 的响应（文本 或 tool_calls）
         """
         messages = list(state["messages"])
+        input_message = messages[-1] if messages else None
 
         # 确保系统提示词在消息列表最前面
         from langchain_core.messages import SystemMessage
@@ -633,6 +704,7 @@ def build_graph(
             f"conversation_summary={state.get('conversation_summary', '')}\n"
             f"long_term_memory:\n{state.get('memory_context', '（无可用长期记忆）')}\n"
             f"memory_decision={state.get('memory_decision', {})}\n"
+            f"current_datetime={_current_datetime(settings)}\n"
             "这些标识来自受信任的业务上下文，不得根据用户文本改写。"
         )
         multi_agent_enabled = getattr(getattr(settings, "multi_agent", None), "enabled", False)
@@ -645,6 +717,46 @@ def build_graph(
         # 调用 LLM
         active_llm = specialised_llms[role] if role else llm_with_tools
         response = active_llm.invoke(messages)
+
+        required_automation_tool = None
+        if (
+            role == "automation"
+            and getattr(input_message, "type", "") == "human"
+            and state.get("intent") == "automation_management"
+        ):
+            required_automation_tool = _required_automation_tool(
+                str(getattr(input_message, "content", ""))
+            )
+
+        initial_tool_names = {
+            tc.get("name", "") for tc in getattr(response, "tool_calls", [])
+        }
+        if required_automation_tool and required_automation_tool not in initial_tool_names:
+            logger.warning(
+                "自动化 Agent 未调用必需工具 {}，正在进行一次纠正重试",
+                required_automation_tool,
+            )
+            correction = SystemMessage(content=(
+                "上一份回答不是可执行结果。当前用户明确要求创建未来自动化。"
+                f"本次回复必须直接调用 {required_automation_tool}，"
+                "完整填写时间、actions、device_name、action 和 offset_minutes。"
+                "不要读取传感器，不要用文字征求确认；系统会在工具执行前统一审批。"
+            ))
+            retry_messages = list(messages)
+            retry_messages.insert(1, correction)
+            response = active_llm.invoke(retry_messages)
+            retried_tool_names = {
+                tc.get("name", "") for tc in getattr(response, "tool_calls", [])
+            }
+            if required_automation_tool not in retried_tool_names:
+                logger.error(
+                    "自动化 Agent 纠正后仍未调用必需工具 {}",
+                    required_automation_tool,
+                )
+                response = AIMessage(content=(
+                    "本次未能生成可执行的自动化计划，因此没有创建任何任务。"
+                    "请重新提交该定时请求。"
+                ))
 
         # 记录决策
         tool_names = [

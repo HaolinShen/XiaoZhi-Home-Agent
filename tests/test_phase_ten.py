@@ -96,6 +96,17 @@ class PhaseTenMultiAgentTests(unittest.TestCase):
         self.assertEqual(chat_result["delegated_agent"], "chat")
         self.assertEqual(chat_fake.invoked_tool_sets[-1], set())
 
+    def test_automation_agent_only_receives_routine_tools(self):
+        result, fake = self._invoke("明天早上6点设置闹钟并准备热水")
+        self.assertEqual(result["delegated_agent"], "automation")
+        selected = fake.invoked_tool_sets[-1]
+        self.assertIn("create_scheduled_routine", selected)
+        self.assertIn("create_vehicle_arrival_routine", selected)
+        self.assertIn("schedule_wake_routine", selected)
+        self.assertIn("enable_vehicle_arrival_routine", selected)
+        self.assertNotIn("control_light", selected)
+        self.assertNotIn("save_personal_memory", selected)
+
     def test_runtime_trace_exposes_delegation_and_completion(self):
         fake = MultiAgentFakeLLM()
         with patch("src.agent.graph.build_llm", return_value=fake):

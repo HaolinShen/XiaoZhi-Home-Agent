@@ -30,6 +30,15 @@ from .memory import (
     set_memory_service,
     update_personal_memory,
 )
+from .automation import (
+    cancel_automation_routine,
+    create_scheduled_routine,
+    create_vehicle_arrival_routine,
+    enable_vehicle_arrival_routine,
+    list_automation_routines,
+    schedule_wake_routine,
+    set_automation_runtime,
+)
 
 
 def set_registry(registry) -> None:
@@ -62,6 +71,12 @@ def get_all_tools() -> list:
         confirm_preference_candidate,
         reject_preference_candidate,
         list_memory_versions,
+        create_scheduled_routine,
+        create_vehicle_arrival_routine,
+        schedule_wake_routine,
+        enable_vehicle_arrival_routine,
+        list_automation_routines,
+        cancel_automation_routine,
     ]
 
 
@@ -90,4 +105,11 @@ __all__ = [
     "confirm_preference_candidate",
     "reject_preference_candidate",
     "list_memory_versions",
+    "schedule_wake_routine",
+    "create_scheduled_routine",
+    "create_vehicle_arrival_routine",
+    "enable_vehicle_arrival_routine",
+    "list_automation_routines",
+    "cancel_automation_routine",
+    "set_automation_runtime",
 ]

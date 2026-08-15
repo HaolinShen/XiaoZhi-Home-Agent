@@ -41,7 +41,7 @@ class AgentState(TypedDict):
     intent_reason: NotRequired[str]
     intent_route: NotRequired[Literal["react", "planner", "clarification", "parallel_query", "knowledge_rag"]]
     parallel_query_results: NotRequired[list[dict[str, Any]]]
-    delegated_agent: NotRequired[Literal["device", "scene", "memory", "knowledge", "chat"]]
+    delegated_agent: NotRequired[Literal["device", "scene", "memory", "automation", "knowledge", "chat"]]
     handoff_count: NotRequired[int]
     collaboration_status: NotRequired[Literal["delegated", "working", "completed", "stopped"]]
     retrieved_memories: NotRequired[list[dict[str, Any]]]

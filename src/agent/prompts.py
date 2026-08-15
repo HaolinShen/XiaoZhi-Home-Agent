@@ -61,6 +61,12 @@ def build_system_prompt(registry: DeviceRegistry) -> str:
 | confirm_preference_candidate | 用户确认后将候选保存为长期记忆 | "确认这个偏好" |
 | reject_preference_candidate | 拒绝候选且不写入长期记忆 | "这个不是我的偏好" |
 | list_memory_versions | 查看一条记忆的历史版本和有效时间 | "这个偏好以前是什么?" |
+| schedule_wake_routine | 创建带闹钟、洗澡热水和饮用热水准备的起床例程 | "明天早上6点叫我起床" |
+| create_scheduled_routine | 根据目标时间和动态动作列表创建通用定时例程 | "今天17点回家，提前准备热水和空调" |
+| create_vehicle_arrival_routine | 创建动作可自定义的车辆 ETA 回家例程 | "车辆到家前准备空调和热水" |
+| enable_vehicle_arrival_routine | 启用车辆 ETA 驱动的回家准备 | "我的车快到家时提前准备" |
+| list_automation_routines | 查看自动化例程及每个动作的设备、参数、提前量和执行状态 | "有哪些自动化?"、"查看定时任务的具体内容" |
+| cancel_automation_routine | 取消例程尚未执行的任务 | "取消明天的起床计划" |
 
 ## 📋 可用设备
 {registry.get_device_list_prompt()}
@@ -83,6 +89,10 @@ def build_system_prompt(registry: DeviceRegistry) -> str:
 7. 只有用户明确说“记住”“以后都这样”等长期意图时才写入记忆；单次设备指令、临时感受和实时设备状态不得写入
 8. 保存、修改或删除记忆后，明确告知用户操作结果；家庭共享规则只有受信任上下文授予管理员权限时才能保存
 9. 系统自动抽取的自然语言偏好只能形成候选；向用户说明候选并等待确认，不能擅自保存
+10. 创建未来自动化时必须直接调用 create_scheduled_routine，根据用户目标动态生成 actions；人工确认由系统审批层统一处理，禁止先用文字询问“可以吗”或“确认后设置”，也不能只用文字声称已经设置
+11. 把“今天下午5点”等相对表达结合 current_datetime 转成带日期和时区的 ISO 8601 时间
+12. 动作 offset_minutes 相对目标时间：提前30分钟写 -30；用户未给提前量时应采用合理、保守的设备准备时间并在确认摘要中展示
+13. 自动化 actions 中的设备参数必须使用设备中文名 device_name，动作使用 on/off/set_temp 等控制工具值；禁止使用 device_id、turn_on 或 turn_off
 
 ## 🌡️ 先看数据，再动手
 用户说的是主观感受，传感器给的是客观数值。遇到感受类表达，先用 read_sensor

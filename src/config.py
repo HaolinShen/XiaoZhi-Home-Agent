@@ -105,6 +105,16 @@ class RAGConfig(BaseSettings):
     max_rewrites: int = Field(default=1, ge=0, le=3)
 
 
+class AutomationConfig(BaseSettings):
+    """Persistent event-driven routine scheduler settings."""
+    model_config = SettingsConfigDict(env_prefix="AUTOMATION_")
+
+    enabled: bool = Field(default=True)
+    db_path: str = Field(default="data/automation.db")
+    timezone: str = Field(default="Asia/Shanghai")
+    poll_seconds: float = Field(default=1.0, ge=0.1, le=60)
+
+
 # ============================================================
 # 主配置
 # ============================================================
@@ -191,6 +201,7 @@ class Settings(BaseSettings):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     multi_agent: MultiAgentConfig = Field(default_factory=MultiAgentConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
+    automation: AutomationConfig = Field(default_factory=AutomationConfig)
 
     # ---- 最终解析后的值（非 Field，用于内部使用）----
     _api_key: str = ""
