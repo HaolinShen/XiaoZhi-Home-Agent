@@ -1,6 +1,6 @@
 # 智能家居家电互联智能体 — 开发教程
 
-> **适用版本**: 阶段十二（已包含 Agentic RAG 与轨迹评测）
+> **适用版本**: 阶段十三（已包含事件驱动家庭自动化）
 > **适用人群**: 想要学习现代 AI Agent 开发的 Python 开发者  
 > **前置知识**: Python 基础（类、装饰器、类型注解）、理解 LLM 的基本概念  
 > **完成时间**: 核心章节阅读约 2 小时，完整实践建议分阶段完成
@@ -26,11 +26,11 @@
 
 ### 1.1 这是什么？
 
-一个基于 **LangGraph + MCP (Model Context Protocol)** 的智能家居 AI Agent。你可以用自然语言查询和控制设备，并学习状态图编排、工具调用、会话检查点、上下文压缩、长期记忆、Human-in-the-loop、规划执行、结构化路由、多智能体协作以及 Agentic RAG。
+一个基于 **LangGraph + MCP (Model Context Protocol)** 的智能家居 AI Agent。你可以用自然语言查询和控制设备，并学习状态图编排、工具调用、会话检查点、上下文压缩、长期记忆、Human-in-the-loop、规划执行、结构化路由、多智能体协作、Agentic RAG 以及事件驱动的持久化自动化。
 
 当前项目已经具备：
 
-- 灯光、空调、电视、窗帘、加湿器等模拟设备控制；
+- 灯光、空调、电视、窗帘、加湿器、电热水器、门锁、电热水壶等模拟设备控制；
 - 温湿度与人体存在传感器（只读），读数会跟随执行器状态变化；
 - 回家、离家、睡眠、观影、起床等多设备场景；
 - LangGraph ReAct 工具调用循环；
@@ -40,9 +40,10 @@
 - 使用 `Command(resume=...)` 从原检查点批准或拒绝操作；
 - Planner–Executor–Verifier 规划、执行、验证、重试与重新规划；
 - 结构化意图路由、设备查询子图和动态并行；
-- Supervisor 按职责向设备、场景、记忆和聊天 Agent 委派；
+- Supervisor 按职责向设备、场景、记忆、自动化、知识和聊天 Agent 委派；
 - 显式记忆推理、Checkpoint 时间旅行和自定义进度事件；
 - 基于本地设备文档的 Agentic RAG、来源引用与轨迹评测；
+- 固定时间与车辆 ETA 触发的持久化自动化例程，含后台调度、状态验证和取消；
 - MCP Server 工具暴露和外部 MCP Client 接入能力。
 
 ### 1.2 技术栈
@@ -158,9 +159,10 @@ langgraph/
 │   │
 │   ├── tools/                # 工具层
 │   │   ├── __init__.py       # 工具注册 & 导出
-│   │   ├── devices.py        # 设备控制工具 (control_light/ac/tv/curtain/humidifier) + read_sensor
+│   │   ├── devices.py        # 设备控制工具 (control_light/ac/tv/curtain/humidifier/water_heater/lock/kettle) + read_sensor
 │   │   ├── scenes.py         # 场景模式工具 (activate_scene, list_scenes)
-│   │   └── memory.py         # 长期记忆管理工具
+│   │   ├── memory.py         # 长期记忆管理工具
+│   │   └── automation.py     # 自动化例程创建、查询和取消工具
 │   │
 │   ├── agent/                # Agent 层
 │   │   ├── __init__.py
@@ -201,7 +203,9 @@ langgraph/
 │   │   └── trajectory.py     # 路由、状态、来源和拒答指标
 │   │
 │   ├── automation/           # 事件驱动家庭自动化
+│   │   ├── __init__.py
 │   │   ├── models.py         # 例程、动作、任务和车辆事件模型
+│   │   ├── planning.py       # LLM 动作入库前的 Schema 与安全边界校验
 │   │   ├── store.py          # SQLite 例程与调度任务持久化
 │   │   ├── scheduler.py      # 可测试 tick + 后台调度 worker
 │   │   ├── executor.py       # 复用设备工具和 Verifier 执行动作
@@ -217,7 +221,7 @@ langgraph/
 │   ├── progress_view.py      # 进度事件 → 终端渲染（Planner/Executor/Verifier 过程）
 │   └── main.py               # ★ CLI 主入口 (typer + rich)
 │
-├── tests/                    # 阶段一至阶段十二 + 设备扩展自动化测试
+├── tests/                    # 阶段一至阶段十三 + 设备扩展自动化测试
 │   ├── test_phase_one.py
 │   ├── test_phase_two.py
 │   ├── test_phase_three.py
@@ -1227,11 +1231,11 @@ python -m src.mcp.server --transport sse --port 8765
 ```bash
 python -m pytest -q
 
-# 只运行某个阶段，例如阶段十二
-python -m pytest -q tests/test_phase_twelve.py
+# 只运行某个阶段，例如阶段十三
+python -m pytest -q tests/test_automation_routines.py
 ```
 
-当前共 123 个测试，覆盖阶段一至阶段十二、天气 MCP、加湿器设备闭环、环境传感器和规划过程可视化。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
+当前共 157 个测试，覆盖阶段一至阶段十三、天气 MCP、加湿器设备闭环、环境传感器和规划过程可视化。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
 
 | 测试文件 | 主要验证内容 |
 | --- | --- |
@@ -1247,12 +1251,13 @@ python -m pytest -q tests/test_phase_twelve.py
 | `test_phase_ten.py` | Supervisor 委派、专用 Agent 能力边界和工具隔离 |
 | `test_phase_eleven.py` | 显式记忆决策、Checkpoint 时间旅行和自定义进度事件 |
 | `test_phase_twelve.py` | Agentic RAG 型号过滤、引用、拒答和轨迹评测指标 |
+| `test_automation_routines.py` | 动态定时计划、车辆 ETA 分阶段执行与去重、批准前不落库、动作明细输出、强制工具边界和取消 |
 | `test_weather_mcp.py` | 天气 MCP 配置解析、stdio 工具发现、同步调用和天气结果格式 |
 | `test_humidifier.py` | 加湿器字段约束、状态汇总、控制工具、空水箱保护、场景关闭和 Planner 预期状态 |
 | `test_sensors.py` | 传感器字段约束与离线展示、环境推演的确定性、`read_sensor` 的筛选与错误提示、只读约束不被场景与规划绕过 |
 | `test_planning_progress.py` | 规划事件的发出顺序（计划先于执行、执行先于验证）、重试与重新规划事件、`PlanProgressView` 的渲染与容错 |
 
-测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 123 是规划过程可视化接入后的基线。
+测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 157 是事件驱动自动化接入后的基线。
 
 `test_sensors.py` 的结构值得单独说一下，它按四层组织，正好对应“新设备接进来要担心
 哪四件事”：

@@ -7,12 +7,13 @@
 ## 已实现
 
 - `src/automation/models.py`：例程、相对动作、运行批次、调度任务和车辆事件模型。
+- `src/automation/planning.py`：LLM 生成动作在入库前的 Schema、工具白名单、设备名和安全边界校验。
 - `src/automation/store.py`：SQLite 持久化、任务去重、取消和状态查询。
 - `src/automation/scheduler.py`：后台 worker 与可注入虚拟时间的 `tick()`。
 - `src/automation/executor.py`：复用现有设备工具和 Verifier。
 - `src/automation/speaker.py`：音响闹钟适配接口与模拟实现。
 - `src/automation/vehicle.py`：车辆 ETA/地理围栏事件与动态到家锚点。
-- `src/tools/automation.py`：起床、车辆回家、列表和取消工具。
+- `src/tools/automation.py`：起床、车辆回家、列表和取消工具；列表工具返回每个动作的设备、参数、提前量、排期时间和执行状态。
 - Automation Agent：独立职责提示词和工具权限。
 - `create_scheduled_routine`：接受 LLM 动态生成的目标时间和任意受支持动作列表。
 - `create_vehicle_arrival_routine`：接受 LLM 动态生成的车辆 ETA 相对动作。
