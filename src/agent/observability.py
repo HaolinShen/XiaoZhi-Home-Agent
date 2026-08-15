@@ -32,6 +32,7 @@ TRACE_EVENTS = (
     "parallel_query_completed",
     "knowledge_rag_completed",
     "agent_completed",
+    "supervisor_finalized",
 )
 
 

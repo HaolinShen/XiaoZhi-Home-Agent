@@ -276,7 +276,6 @@ def build_graph(
         if state.get("messages"):
             content = getattr(state["messages"][-1], "content", "")
             latest_text = content if isinstance(content, str) else ""
-        emit_progress("supervisor_routing", request=latest_text[:80])
         routing_config = getattr(settings, "routing", None)
         routing_enabled = getattr(routing_config, "enabled", False)
         intent = (
@@ -318,6 +317,15 @@ def build_graph(
                 "handoff_count": 1,
                 "collaboration_status": "delegated",
             })
+        emit_progress(
+            "supervisor_routing",
+            request=latest_text[:80],
+            intent=intent.intent,
+            confidence=round(intent.confidence, 3),
+            intent_route=intent_route,
+            delegated_agent=result.get("delegated_agent"),
+            handoff_count=result.get("handoff_count", 0),
+        )
         if not use_planner:
             result["planning_active"] = False
             return result
@@ -639,8 +647,10 @@ def build_graph(
         response = active_llm.invoke(messages)
 
         # 记录决策
-        if hasattr(response, "tool_calls") and response.tool_calls:
-            tool_names = [tc.get("name", "?") for tc in response.tool_calls]
+        tool_names = [
+            tc.get("name", "?") for tc in getattr(response, "tool_calls", [])
+        ]
+        if tool_names:
             logger.info(f"Agent 决策: 调用工具 → {tool_names}")
         else:
             logger.info("Agent 决策: 直接文本回复")
@@ -648,15 +658,28 @@ def build_graph(
         result = {"messages": [response]}
         if role:
             result["collaboration_status"] = "working"
-        emit_progress("agent_completed", role=role or "legacy", has_tool_calls=bool(getattr(response, "tool_calls", [])))
+        emit_progress(
+            "agent_completed",
+            role=role or "legacy",
+            has_tool_calls=bool(tool_names),
+            tool_names=tool_names,
+        )
         return result
 
     def supervisor_finalize_node(state: AgentState) -> dict:
         """Close one bounded delegation after the specialised agent responds."""
         max_handoffs = getattr(getattr(settings, "multi_agent", None), "max_handoffs", 2)
         count = state.get("handoff_count", 0)
+        status = "completed" if count <= max_handoffs else "stopped"
+        emit_progress(
+            "supervisor_finalized",
+            role=state.get("delegated_agent", "chat"),
+            handoff_count=count,
+            max_handoffs=max_handoffs,
+            status=status,
+        )
         return {
-            "collaboration_status": "completed" if count <= max_handoffs else "stopped",
+            "collaboration_status": status,
         }
 
     def approval_node(state: AgentState) -> dict:

@@ -96,6 +96,34 @@ class PhaseTenMultiAgentTests(unittest.TestCase):
         self.assertEqual(chat_result["delegated_agent"], "chat")
         self.assertEqual(chat_fake.invoked_tool_sets[-1], set())
 
+    def test_runtime_trace_exposes_delegation_and_completion(self):
+        fake = MultiAgentFakeLLM()
+        with patch("src.agent.graph.build_llm", return_value=fake):
+            graph = build_graph(self.registry, self.settings, self.directory)
+
+        events = list(graph.stream(
+            {
+                "messages": [HumanMessage(content="打开客厅灯")],
+                **self.context.to_state_input(),
+            },
+            self.context.to_config(),
+            stream_mode="custom",
+        ))
+
+        routing = next(event for event in events if event["event"] == "supervisor_routing")
+        self.assertEqual(routing["intent"], "device_control")
+        self.assertEqual(routing["intent_route"], "react")
+        self.assertEqual(routing["delegated_agent"], "device")
+        self.assertEqual(routing["handoff_count"], 1)
+
+        agent = next(event for event in events if event["event"] == "agent_completed")
+        self.assertEqual(agent["role"], "device")
+        self.assertEqual(agent["tool_names"], [])
+
+        finalized = next(event for event in events if event["event"] == "supervisor_finalized")
+        self.assertEqual(finalized["role"], "device")
+        self.assertEqual(finalized["status"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

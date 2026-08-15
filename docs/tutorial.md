@@ -3366,29 +3366,236 @@ planner → evaluator
 
 #### 6.5.6 使用 Subgraph 拆分复杂流程
 
-随着节点增加，把所有逻辑放在同一个图中会越来越难理解。LangGraph 子图可以把一段完整流程封装起来：
+当主图只有三五个节点时，把所有逻辑写在一起通常没有问题。随着确认、规划、验证、并行查询和知识检索不断加入，主图会同时承担两类职责：
 
-阶段九已经把多设备状态查询封装为 `src/agent/parallel.py` 中的设备查询子图。主图只负责识别 `device_query` 并把请求交给子图；子图内部负责解析目标、并行读取状态和汇总回复。这使并行查询可以脱离完整 Agent 单独测试。
+- 决定请求应该进入哪条业务路径；
+- 描述每条业务路径内部的所有执行步骤。
 
-在学习顺序上，建议先理解 6.5.2 的结构化意图路由，再考虑如何把不同意图对应的流程封装成子图。结构化路由负责回答“这次请求应该进入哪条业务路径”，子图负责回答“这条路径内部如何组织节点”。前者是清晰划分边界的推荐前置，但不是使用 LangGraph `Subgraph` 的硬性技术前提；即使没有 Router，也可以先把一个已经稳定的流程抽成子图。
+这两类职责混在一起后，主图会越来越长，也很难单独测试某一条路径。子图（Subgraph）的作用，就是把一段已经具有明确输入、输出和内部步骤的流程，封装成一张可以独立编译、调用和测试的小图。
+
+可以把它理解成“图版本的函数”：
+
+```text
+普通函数：输入参数 → 函数内部步骤 → 返回值
+子图：    输入状态 → 多个节点和边 → 输出状态
+```
+
+需要注意，LangGraph 并没有要求使用一个名为 `Subgraph` 的特殊类。通常仍然使用 `StateGraph` 构建流程，再通过 `compile()` 得到可调用的小图；当这个小图被另一张图使用时，我们才称它为子图。
+
+##### 当前项目真正拆出的子图
+
+阶段九只把“多设备状态查询”拆成了子图，代码位于 `src/agent/parallel.py`。它的内部结构是：
+
+```text
+dispatch
+   │
+   ├── 根据 targets 动态创建多个 query_device 分支
+   │       ├── query_device(device_1)
+   │       ├── query_device(device_2)
+   │       └── query_device(device_n)
+   │
+   └──────────────────────────────→ aggregate → END
+```
+
+三个节点分别负责：
+
+- `dispatch`：在查询前统一推演一次模拟环境，并准备扇出；
+- `query_device`：每个分支只查询一个设备；
+- `aggregate`：合并全部分支结果，排序后生成最终文本。
+
+它使用独立的 `QueryState`，不需要知道完整 Agent 的记忆、规划、审批等状态：
+
+```python
+class QueryState(TypedDict):
+    query: str
+    targets: list[str]
+    device_id: NotRequired[str]
+    parallel_results: Annotated[list[dict], operator.add]
+    response: NotRequired[str]
+```
+
+构建和编译方式与普通 LangGraph 相同：
+
+```python
+graph = StateGraph(QueryState)
+graph.add_node("dispatch", dispatch_node)
+graph.add_node("query_device", query_device)
+graph.add_node("aggregate", aggregate)
+
+graph.set_entry_point("dispatch")
+graph.add_conditional_edges("dispatch", fan_out, ["query_device"])
+graph.add_edge("query_device", "aggregate")
+graph.add_edge("aggregate", END)
+
+return graph.compile()
+```
+
+所以这里不是把一段代码简单移动到另一个文件，而是真的构建并编译了一张可以独立运行的小图。
+
+##### 子图如何接入主图
+
+当前项目采用“包装节点调用子图”的接入方式，而不是把编译后的子图直接注册成主图节点。真实调用链如下：
+
+```text
+用户消息
+  → task_router 判断为 device_query
+  → should_use_parallel_query 判断目标数量不少于 2
+  → intent_route = "parallel_query"
+  → 主图进入 parallel_query_node
+  → parallel_query_node 调用 device_query_subgraph.invoke(...)
+  → 查询结果写回 AgentState
+  → END
+```
+
+主图中的注册代码是：
+
+```python
+workflow.add_node("device_query_subgraph", parallel_query_node)
+```
+
+这里注册的 `parallel_query_node` 是普通节点函数。它负责连接父图和子图：
+
+```python
+def parallel_query_node(state: AgentState) -> dict:
+    latest_text = getattr(state["messages"][-1], "content", "")
+    targets = extract_query_targets(latest_text, registry)
+
+    result = device_query_subgraph.invoke({
+        "query": latest_text,
+        "targets": targets,
+        "parallel_results": [],
+    })
+
+    return {
+        "messages": [AIMessage(content=result["response"])],
+        "parallel_query_results": result["parallel_results"],
+    }
+```
+
+可以把 `parallel_query_node` 理解为一个“状态转换器”：
+
+```text
+父图 AgentState
+  messages[-1].content
+          │
+          ▼
+包装节点提取 query 和 targets
+          │
+          ▼
+子图 QueryState
+  query、targets、parallel_results
+          │
+          ▼
+子图输出 response 和 parallel_results
+          │
+          ▼
+包装节点写回父图
+  messages、parallel_query_results
+```
+
+这种方式的好处是父图和子图可以使用不同的状态结构。子图只接收完成查询所需的最少字段，边界清晰，也不会意外依赖父图里的用户身份、长期记忆或规划状态。
+
+另一种常见方式是直接把编译后的图作为节点注册：
+
+```python
+workflow.add_node("device_query_subgraph", device_query_subgraph)
+```
+
+直接注册更简洁，但通常要求父图和子图拥有能够兼容或直接映射的状态字段。当前项目的 `AgentState` 和 `QueryState` 职责差异较大，因此使用包装节点显式转换状态，更容易理解和维护。
+
+##### 路由与子图分别解决什么问题
+
+结构化路由和子图经常一起出现，但职责不同：
+
+```text
+结构化路由：这次请求应该走哪条业务路径？
+子图：      进入这条路径后，内部应该按什么步骤执行？
+```
+
+例如“查询客厅和卧室设备状态”先由路由识别为 `device_query`，再进入设备查询子图；子图不再判断这是控制、规划还是知识问答，只专注于完成多设备查询。
+
+因此，建议先学习 6.5.2 的结构化意图路由，再学习子图。不过 Router 并不是使用子图的技术前提：只要某段流程边界稳定，即使没有 Router，也可以先把它抽成独立子图。
+
+##### 如何验证子图确实在运行
+
+项目已经提供三层测试，位于 `tests/test_phase_nine.py`：
+
+```powershell
+# 运行阶段九的全部测试
+python -m pytest -q tests/test_phase_nine.py
+```
+
+测试分别验证：
+
+1. `extract_query_targets` 能正确解析房间和设备目标，并判断是否需要并行查询；
+2. 查询子图可以独立 `invoke`，多个分支结果能够被合并并稳定排序；
+3. 完整主图会进入 `parallel_query` 路径，并且不会调用普通 ReAct LLM。
+
+只运行独立子图测试：
+
+```powershell
+python -m pytest -q tests/test_phase_nine.py::PhaseNineSubgraphParallelTests::test_subgraph_fanout_aggregates_sorted_results
+```
+
+如果想直接观察节点事件和每个并行分支，可以执行：
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+
+@'
+from src.agent.parallel import build_device_query_subgraph
+from src.devices.base import DeviceRegistry
+from src.devices.simulator import SimulatorBackend
+
+registry = DeviceRegistry(SimulatorBackend())
+graph = build_device_query_subgraph(registry)
+
+inputs = {
+    "query": "查询设备",
+    "targets": ["bedroom_ac", "living_room_light"],
+    "parallel_results": [],
+}
+
+for event in graph.stream(inputs, stream_mode="updates"):
+    print(event)
+'@ | python -
+```
+
+输出中应该依次出现一次 `dispatch`、多次 `query_device` 和一次 `aggregate`。例如：
+
+```text
+{'dispatch': None}
+{'query_device': {'parallel_results': [{'device_id': 'bedroom_ac', ...}]}}
+{'query_device': {'parallel_results': [{'device_id': 'living_room_light', ...}]}}
+{'aggregate': {'response': '...'}}
+```
+
+这比只检查最终回答更有价值，因为它同时证明了子图节点顺序、动态分支和结果聚合都实际发生了。
+
+##### 哪些内容尚未拆成子图
+
+当前项目已经实现的是“多设备状态查询子图”，不是完整的“设备控制子图”“场景规划子图”和“记忆管理子图”。下面是未来可以继续演进的架构示意，不代表项目当前已经全部完成：
 
 ```text
 主图
-├── 设备控制子图
+├── 设备控制子图（扩展方向）
 │   └── 定位目标 → 能力校验 → 风险判断 → 执行 → 验证
-├── 场景规划子图
+├── 场景规划子图（扩展方向）
 │   └── 生成计划 → 评价 → 执行 → 汇总
-├── 记忆管理子图
+├── 记忆管理子图（扩展方向）
 │   └── 抽取候选 → 校验 → 冲突判断 → 确认 → 保存
+├── 多设备查询子图（当前已实现）
+│   └── 准备 → 动态并行查询 → 汇总
 └── 通用对话节点
 ```
 
-学习子图时需要区分两种状态：
+判断一段逻辑是否值得拆成子图，可以问三个问题：
 
-- 父图和子图共享的公共状态，例如 `messages`、`request_user_id`；
-- 子图内部使用的私有状态，例如 `current_step`、`risk_result`。
+1. 它是否包含多个节点和明确的内部流程？
+2. 它是否有相对稳定的输入、输出和职责边界？
+3. 它是否值得脱离完整 Agent 单独测试或复用？
 
-子图适合解决“一个流程已经可以单独画成图”的问题。普通的单步工具函数没有必要为了使用 Subgraph 而强行包装成子图。
+如果三个答案大多是“是”，通常适合拆成子图。普通的单步工具函数只有一次输入和一次输出，没有独立工作流，就不必为了使用 Subgraph 而强行包装。
 
 #### 6.5.7 动态并行：Fan-out 与结果聚合
 
@@ -3453,58 +3660,292 @@ parallel_results: Annotated[list[dict], operator.add]
 
 #### 6.5.8 多智能体：按职责协作，而不是堆叠角色
 
-当设备控制、场景规划、记忆管理和安全审查已经形成清晰边界后，可以进一步研究多智能体：
+多智能体并不是“创建几个不同性格的聊天机器人，让它们轮流说话”。真正有价值的拆分是：每个 Agent 拥有不同的职责说明、工具权限和终止边界，由一个 Supervisor 决定本轮应该把任务交给谁。
 
-阶段十已经实现 Supervisor 模式。阶段八的结构化 `task_router` 同时承担 Supervisor：根据意图设置 `delegated_agent`，再把请求交给只拥有对应工具集的专用 Agent。专用 Agent 最终回复后进入 `supervisor_finalize`，记录本轮协作已经完成。
+例如，管理记忆的 Agent 不应该同时拥有开关空调的工具；普通聊天 Agent 也不应该因为一句含糊的话就能启用离家场景。多智能体首先解决的是权限和职责隔离，其次才是协作。
 
-```text
-Supervisor
-├── Device Agent：设备定位、查询和控制
-├── Scene Agent：复杂目标拆解和多设备计划
-├── Memory Agent：记忆检索、候选与冲突分析
-└── Safety Agent：检查操作范围、约束和风险
-```
+##### 当前项目是哪一种多智能体实现
 
-常见协作方式有两种：
+阶段十实现的是一次有界的 Supervisor 委派：`task_router` 同时承担 Supervisor，根据结构化意图设置 `delegated_agent`；普通 ReAct 路径进入共享的 `agent` 节点后，再根据这个字段选择对应的职责提示词和工具集。
+
+这里有一个非常容易误解的地方：Device Agent、Scene Agent、Memory Agent 等角色并不是五个独立的 LangGraph 节点。当前主图中只有一个名为 `agent` 的节点，角色是在运行时动态选择的。
 
 ```text
-Supervisor 模式：
-用户 → Supervisor → 专用 Agent → Supervisor → 最终回答
+静态图看到的结构：
 
-Handoff 模式：
-用户 → Supervisor → Device Agent → Safety Agent → 最终回答
+task_router → compact_context → agent → tools → compact_context → agent
+                                  │                              │
+                                  └──────────────→ supervisor_finalize → END
+
+运行时 agent 节点内部：
+
+delegated_agent == "device"    → Device 职责提示词    + 设备工具集
+delegated_agent == "scene"     → Scene 职责提示词     + 场景工具集
+delegated_agent == "memory"    → Memory 职责提示词    + 记忆工具集
+delegated_agent == "knowledge" → Knowledge 职责提示词 + 无控制工具
+delegated_agent == "chat"      → Chat 职责提示词      + 只读外部工具
 ```
 
-多智能体学习的重点不是创建多个不同人格，而是回答这些问题：
+这种设计可以理解为“共享执行节点，运行时切换能力边界”。它比为每个角色复制一套 `agent → tools → agent` 节点更紧凑，也避免五套几乎相同的循环。
 
-- 每个 Agent 是否拥有明确且互斥的职责；
-- Agent 之间传递完整对话，还是传递结构化任务结果；
-- 谁负责最终回答；
-- 如何限制转交次数，避免互相来回调用；
-- 多 Agent 是否真的比单 Agent 加工具具有更高成功率。
+##### Supervisor 如何选择角色
 
-如果职责尚未清楚，优先使用一个 Agent 加子图；当不同模块确实需要不同工具集、提示词和状态边界时，再拆成多个 Agent。
-
-当前项目实际拆分为：
-
-| Agent | 允许使用的工具 |
-| --- | --- |
-| Device Agent | 四类原子设备控制工具、设备状态查询 |
-| Scene Agent | `activate_scene`、`list_scenes` |
-| Memory Agent | 长期记忆、候选确认和版本管理工具 |
-| Chat Agent | 不绑定工具 |
-
-安全能力没有被包装成一个只输出文字的“角色”。场景副作用继续由阶段六 Human-in-the-loop 拦截，多步骤设备操作继续由阶段七 Verifier 检查真实状态。这些确定性节点共同构成 Safety 层。
-
-协作状态包含：
+角色映射位于 `src/agent/multi_agent.py`：
 
 ```python
-delegated_agent: Literal["device", "scene", "memory", "chat"]
-handoff_count: int
-collaboration_status: Literal["delegated", "working", "completed", "stopped"]
+def agent_for_intent(intent: str) -> AgentRole:
+    if intent in {"device_query", "device_control"}:
+        return "device"
+    if intent == "scene_control":
+        return "scene"
+    if intent == "memory_management":
+        return "memory"
+    if intent == "device_knowledge":
+        return "knowledge"
+    return "chat"
 ```
 
-`MULTI_AGENT_MAX_HANDOFFS` 默认是 2。当前版本每轮只进行一次 Supervisor 委派，该限制为后续跨 Agent handoff 预留终止边界。
+`task_router_node` 将分类结果和协作状态一起写入 `AgentState`：
+
+```python
+{
+    "intent": "device_control",
+    "intent_route": "react",
+    "delegated_agent": "device",
+    "handoff_count": 1,
+    "collaboration_status": "delegated",
+}
+```
+
+这些字段分别回答不同问题：
+
+| 字段 | 回答的问题 | 示例 |
+| --- | --- | --- |
+| `intent` | 用户想做什么 | `device_control` |
+| `intent_route` | 主图实际进入哪条路径 | `react`、`planner`、`parallel_query` |
+| `delegated_agent` | 由哪个职责角色处理 | `device` |
+| `handoff_count` | 已发生几次委派 | `1` |
+| `collaboration_status` | 当前协作进行到哪里 | `delegated`、`working`、`completed` |
+
+不要把 `intent`、`intent_route` 和 `delegated_agent` 当成同一个概念。例如“查询客厅和卧室所有设备状态”的角色仍然是 `device`，但实际路径是 `parallel_query`，请求会直接进入查询子图，而不是进入共享 `agent` 节点。
+
+##### 工具权限如何隔离
+
+构图时会提前为不同角色绑定不同的工具集合：
+
+| Agent | 职责 | 实际可用工具 |
+| --- | --- | --- |
+| Device Agent | 单设备查询和控制 | `control_light`、`control_ac`、`control_tv`、`control_curtain`、`control_humidifier`、`read_sensor`、`get_device_status` |
+| Scene Agent | 查询和启用预定义场景 | `activate_scene`、`list_scenes`、`read_sensor` |
+| Memory Agent | 管理长期记忆和偏好候选 | 保存、查询、更新、删除、候选确认和版本工具 |
+| Knowledge Agent | 根据设备文档回答问题 | 不绑定设备控制工具；启用 RAG 时通常直接进入 `knowledge_rag` 子图 |
+| Chat Agent | 普通对话和生活信息查询 | 只绑定天气等外部只读 MCP 工具；没有外部工具时不绑定工具 |
+
+运行 `agent_node` 时，先追加对应角色的职责提示词，再选择已经绑定好工具的模型：
+
+```python
+role = state.get("delegated_agent", "chat")
+role_context = f"\n\n## 当前专用职责\n{role_prompt(role)}"
+messages.insert(0, SystemMessage(
+    content=system_prompt + context_prompt + role_context
+))
+
+active_llm = specialised_llms[role]
+response = active_llm.invoke(messages)
+```
+
+因此，工具隔离不是只靠提示词要求模型“不要调用”。Memory Agent 实际拿不到 `control_light`，即使模型想生成该工具调用，也没有对应工具 Schema 可供选择。
+
+##### 一次设备控制怎样走完整流程
+
+以“打开客厅灯”为例，典型轨迹是：
+
+```text
+START
+  ↓
+sync_context
+  ↓
+memory_reasoner
+  ↓
+task_router / Supervisor
+  ├── intent = device_control
+  ├── intent_route = react
+  ├── delegated_agent = device
+  └── collaboration_status = delegated
+  ↓
+compact_context
+  ↓
+agent（使用 Device Agent 提示词和设备工具集）
+  ├── collaboration_status = working
+  └── tool_call = control_light(...)
+  ↓
+tools（真实执行设备工具）
+  ↓
+compact_context
+  ↓
+agent（读取 ToolMessage，生成最终回答）
+  ↓
+supervisor_finalize
+  ├── collaboration_status = completed
+  └── 检查 handoff_count 是否越界
+  ↓
+END
+```
+
+如果专用 Agent 不需要工具，第一次进入 `agent` 后就会生成文本，然后直接进入 `supervisor_finalize`。如果它生成工具调用，则继续使用原来的 ReAct 循环，直到生成不带工具调用的最终回答。
+
+场景操作还可能经过 Human-in-the-loop：
+
+```text
+Scene Agent → approval
+                  ├── 批准 → tools → Scene Agent → supervisor_finalize
+                  └── 拒绝 → reject_tools → Scene Agent → supervisor_finalize
+```
+
+##### 并非所有请求都进入专用 Agent 节点
+
+Supervisor 先设置角色，主图随后还会根据 `intent_route` 选择更合适的专用工作流：
+
+| 请求示例 | `delegated_agent` | `intent_route` | 实际执行路径 |
+| --- | --- | --- | --- |
+| 打开客厅灯 | `device` | `react` | Device Agent → tools → finalize |
+| 查询客厅灯状态 | `device` | `react` | Device Agent 查询 |
+| 查询客厅和卧室设备状态 | `device` | `parallel_query` | 多设备查询子图 → END |
+| 启用观影模式 | `scene` | `react` | Scene Agent → approval → tools |
+| 记住我喜欢暖光 | `memory` | `react` | Memory Agent → memory tool |
+| 加湿器怎么清洗 | `knowledge` | `knowledge_rag` | 知识 RAG 子图 → END |
+| 你好 | `chat` | `react` | Chat Agent → finalize |
+| 关闭全屋设备并把卧室调到睡眠状态 | 取决于意图分类 | `planner` | Planner → Executor → Verifier |
+
+这张表很重要。多智能体角色表示职责归属，子图和 Planner 表示具体执行机制，两者可以同时存在。
+
+##### Safety 为什么不是一个只会评论的 Agent
+
+当前项目没有额外创建 Safety Agent。安全约束由确定性节点负责：
+
+- 场景等批量副作用由 `approval` 节点暂停并等待用户确认；
+- 多步骤设备操作由 Verifier 查询真实状态；
+- 用户身份和家庭范围来自可信 `AgentContext`，不能由模型从文本中改写；
+- Agent 的工具集合在构图时已经限制。
+
+这种 Safety 层比增加一句“你是安全审查员，请谨慎”更可靠，因为它能够真正阻止工具执行或发现状态不一致。
+
+##### 三层可视化：从可能路径到实际路径
+
+要看懂多智能体流程，最好不要只依赖一张总图。可以分三层观察。
+
+第一层是静态拓扑图，用来回答“主图可能走哪些节点”。项目中的 `tests/visualize_graph.ipynb` 已经可以绘制完整主图，也可以直接获取 Mermaid：
+
+```python
+print(graph.get_graph().draw_mermaid())
+```
+
+静态图会显示 `task_router → agent → tools → agent → supervisor_finalize`，但不会把 Device Agent 和 Memory Agent画成两个节点，因为它们共用 `agent` 节点。静态图适合看结构，不适合判断某一次请求实际选择了哪个角色。
+
+第二层是语义诊断事件，用来回答“Supervisor 委派给了谁、Agent 做了什么、何时结束”。启动 CLI 时增加 `--trace`：
+
+```powershell
+python -m src.main --trace
+```
+
+输入“打开客厅灯”后，可以看到类似诊断信息：
+
+```text
+· supervisor_routing request=打开客厅灯 intent=device_control confidence=0.95
+  intent_route=react delegated_agent=device handoff_count=1
+· agent_completed role=device has_tool_calls=True tool_names=['control_light']
+· agent_completed role=device has_tool_calls=False tool_names=[]
+· supervisor_finalized role=device handoff_count=1 max_handoffs=2 status=completed
+```
+
+这组事件表达的是业务语义，但为了避免输出过多，它不会列出每个普通图节点。
+
+第三层是 `updates` 节点更新流，用来回答“这一次实际经过了哪些 LangGraph 节点”。调试代码可以同时订阅 `custom` 和 `updates`：
+
+```python
+important = {
+    "intent", "intent_route", "delegated_agent",
+    "handoff_count", "collaboration_status",
+}
+
+for mode, chunk in graph.stream(
+    payload,
+    config,
+    stream_mode=["custom", "updates"],
+):
+    if mode == "custom":
+        print("事件:", chunk)
+        continue
+
+    node_name, update = next(iter(chunk.items()))
+    summary = {
+        key: value
+        for key, value in (update or {}).items()
+        if key in important
+    }
+    print(f"节点: {node_name:20} 状态: {summary}")
+```
+
+一次不调用工具的 Device Agent 请求可能输出：
+
+```text
+节点: sync_context         状态: {}
+节点: memory_reasoner      状态: {}
+节点: task_router          状态: {'intent': 'device_control',
+                                  'intent_route': 'react',
+                                  'delegated_agent': 'device',
+                                  'handoff_count': 1,
+                                  'collaboration_status': 'delegated'}
+节点: compact_context      状态: {}
+节点: agent                状态: {'collaboration_status': 'working'}
+节点: supervisor_finalize 状态: {'collaboration_status': 'completed'}
+```
+
+如果 Agent 调用了工具，中间还会出现 `tools → compact_context → agent`。这种运行时轨迹比给静态图上的边加颜色更可靠，因为它来自本次执行真实产生的节点更新。
+
+三层信息可以这样配合：
+
+```text
+静态 Mermaid：有哪些可能路径？
+custom 事件： 每个阶段在业务上做了什么？
+updates 流：  这次请求实际经过了哪些节点？
+```
+
+##### 如何测试职责隔离和运行轨迹
+
+阶段十测试位于 `tests/test_phase_ten.py`：
+
+```powershell
+python -m pytest -q tests/test_phase_ten.py
+```
+
+测试不仅检查最终回答，还检查以下行为：
+
+- `device_control` 是否映射到 Device Agent；
+- Device Agent 是否拿不到场景和记忆工具；
+- Memory Agent 是否拿不到设备控制工具；
+- Chat Agent 在没有外部工具时是否为空工具集；
+- `supervisor_routing` 是否记录实际意图、路径和委派角色；
+- `supervisor_finalized` 是否记录协作正常结束。
+
+只测试运行时轨迹事件：
+
+```powershell
+python -m pytest -q tests/test_phase_ten.py::PhaseTenMultiAgentTests::test_runtime_trace_exposes_delegation_and_completion
+```
+
+##### 当前实现的边界
+
+配置项为：
+
+```text
+MULTI_AGENT_ENABLED=true
+MULTI_AGENT_MAX_HANDOFFS=2
+```
+
+当前版本每轮只由 Supervisor 委派一次，并没有实现 Device Agent 再主动转交给 Safety Agent、Memory Agent 再转交给 Chat Agent 这样的连续 handoff。`handoff_count` 和 `MULTI_AGENT_MAX_HANDOFFS` 目前主要提供状态记录和终止边界，为后续真正的跨 Agent 转交预留空间。
+
+因此，当前实现更准确的名称是“Supervisor 选择专用能力边界”，而不是“多个 Agent 自由对话”。这种受控设计更适合智能家居：路径容易测试、工具权限清晰，也更容易从运行轨迹中判断任务究竟交给了谁。
 
 #### 6.5.9 让长期记忆显式参与推理
 
