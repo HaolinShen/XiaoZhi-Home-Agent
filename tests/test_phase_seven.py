@@ -10,6 +10,8 @@ from langgraph.types import Command
 from src.agent.context import AgentContext, SpaceDirectory
 from src.agent.graph import build_graph
 from src.agent.planning import (
+    DEVICE_ACTION_SPECS,
+    PLANNING_TOOL_NAMES,
     TOOL_ACTIONS,
     ExecutionPlan,
     PlanStep,
@@ -126,39 +128,108 @@ class PhaseSevenPlannerExecutorVerifierTests(unittest.TestCase):
         self.assertFalse(should_use_planner("我要出门了"))
         self.assertFalse(should_use_planner("开启离家模式"))
 
-    def test_tool_actions_stay_in_sync_with_expected_state_for_step(self):
-        """TOOL_ACTIONS 词表（喂给 Planner）必须和 expected_state_for_step 的
-        if/elif（执行前校验）逐一对上：文档里写的每个合法 action 都不能被判成
-        unsupported，否则 Planner 照做反而失败。三处枚举靠手写同步，用这条钉住。
-        """
-        import re
+    def _sample_device_name(self, device_type) -> str:
+        """从模拟器里取一台该类型的真实设备名。
 
-        # 每个工具挑一个真实存在的设备名，让 device 能被解析（否则会先撞 device_not_found）。
-        device_for_tool = {
-            "control_light": "客厅灯",
-            "control_ac": "客厅空调",
-            "control_tv": "客厅电视",
-            "control_curtain": "客厅窗帘",
-            "control_humidifier": "客厅加湿器",
-            "control_water_heater": "卫生间电热水器",
-            "control_lock": "玄关门锁",
-            "control_kettle": "厨房烧水壶",
+        故意不写死映射表：新增设备类型时这些一致性用例应该自动覆盖到，
+        而不是又多一处需要手工同步的清单。
+        """
+        devices = self.registry.get_by_type(device_type)
+        self.assertTrue(devices, f"模拟器里没有注册 {device_type} 设备")
+        return next(iter(devices.values())).name
+
+    def test_planning_literal_and_derived_views_match_the_action_specs(self):
+        """PlanStep.tool_name 的 Literal 必须和 DEVICE_ACTION_SPECS 的键集相等。
+
+        Literal 只能手写（structured output 靠它生成 JSON Schema 的 enum，无法从 dict
+        派生），所以新增设备时它是最容易漏的一处。漏加的表现是 Planner 明明该用新工具
+        却被 pydantic 拒掉，这里让它在测试阶段就失败。
+        """
+        from typing import get_args
+
+        literal_tools = set(get_args(PlanStep.model_fields["tool_name"].annotation))
+        self.assertEqual(literal_tools, set(DEVICE_ACTION_SPECS))
+        # 这两个是派生视图，顺手确认它们没有被手写覆盖过。
+        self.assertEqual(set(PLANNING_TOOL_NAMES), set(DEVICE_ACTION_SPECS))
+        self.assertEqual(set(TOOL_ACTIONS), set(DEVICE_ACTION_SPECS))
+
+    def test_every_declared_action_passes_expected_state_resolution(self):
+        """DEVICE_ACTION_SPECS 里声明的每个 action 都不能被判成 unsupported。
+
+        喂给 Planner 的合法值列表就是从这份声明派生的，所以只要有一个对不上，
+        Planner 照着做反而失败。
+        """
+        for tool_name, spec in DEVICE_ACTION_SPECS.items():
+            device_name = self._sample_device_name(spec.device_type)
+            for action in spec.actions:
+                with self.subTest(tool=tool_name, action=action):
+                    step = {
+                        "tool_name": tool_name,
+                        "arguments": {"device_name": device_name, "action": action},
+                    }
+                    _, expected, error = expected_state_for_step(step, self.registry)
+                    self.assertIsNone(error, f"{tool_name}/{action} 被判成了错误：{error}")
+                    self.assertTrue(expected, f"{tool_name}/{action} 没有给出任何期望状态")
+
+    def test_action_specs_match_what_the_tools_actually_accept(self):
+        """声明的 action 集合必须和工具实现的 if/elif 双向一致。
+
+        工具实现那份枚举带各自的副作用文本与前置检查，没法从声明派生，是三处副本里
+        唯一剩下的手写副本。这里靠"调用真实工具、看它是否回『不支持的操作』"来反射，
+        双向钉住：声明里有的工具必须认，工具不认的声明里也不能有。
+        以前只对得上"喂 Planner 的词表 ↔ expected_state_for_step"，工具实现漏改
+        不会被任何用例发现。
+        """
+        from src.tools import get_all_tools
+
+        tools_by_name = {tool.name: tool for tool in get_all_tools()}
+        rejection_marker = "不支持的操作"
+
+        for tool_name, spec in DEVICE_ACTION_SPECS.items():
+            tool = tools_by_name[tool_name]
+            device_name = self._sample_device_name(spec.device_type)
+            for action in spec.actions:
+                with self.subTest(tool=tool_name, action=action):
+                    result = str(tool.invoke({"device_name": device_name, "action": action}))
+                    self.assertNotIn(
+                        rejection_marker, result,
+                        f"{tool_name} 声明支持 {action!r}，但实现拒绝了它：{result}",
+                    )
+            # 反向：其他平台的命名必须被实现拒绝，也不能悄悄出现在声明里。
+            for foreign_action in ("turn_on", "turn_off", "toggle", "enable"):
+                with self.subTest(tool=tool_name, action=foreign_action):
+                    self.assertNotIn(foreign_action, spec.actions)
+                    result = str(
+                        tool.invoke({"device_name": device_name, "action": foreign_action})
+                    )
+                    self.assertIn(rejection_marker, result)
+
+    def test_unparsable_numeric_argument_becomes_feedback_instead_of_crashing(self):
+        """参数写成非数字时必须转成 preparation_error 回喂 Planner。
+
+        expected_state_for_step 在 executor 的 try 块之外被调用，裸 int() 抛出的
+        ValueError 会掀翻整张图；静默套用默认值又会把"调到很亮"执行成 50% 再报成功。
+        """
+        step = {
+            "tool_name": "control_light",
+            "arguments": {
+                "device_name": self._sample_device_name(
+                    DEVICE_ACTION_SPECS["control_light"].device_type
+                ),
+                "action": "set_brightness",
+                "brightness": "很亮",
+            },
         }
-        for tool_name, spec in TOOL_ACTIONS.items():
-            # spec 形如 "on / off / set_temp(temperature) / ..."；按 " / " 切段，
-            # 每段去掉括号里的参数说明，剩下的裸词就是合法 action 名。
-            for segment in spec.split("/"):
-                action = re.sub(r"\(.*?\)", "", segment).strip()
-                self.assertTrue(action, f"{tool_name} 的 spec 段为空：{segment!r}")
-                step = {
-                    "tool_name": tool_name,
-                    "arguments": {"device_name": device_for_tool[tool_name], "action": action},
-                }
-                _, _, error = expected_state_for_step(step, self.registry)
-                self.assertIsNone(
-                    error,
-                    f"{tool_name} 的合法 action {action!r} 被判成了错误：{error}",
-                )
+        device_id, expected, error = expected_state_for_step(step, self.registry)
+        self.assertIsNotNone(device_id)
+        self.assertEqual(expected, {})
+        self.assertIn("invalid argument", error)
+        self.assertIn("brightness", error)
+        # 字符串形式的数字仍应照常接受，不能把容错做成一刀切的拒绝。
+        step["arguments"]["brightness"] = "30"
+        _, expected, error = expected_state_for_step(step, self.registry)
+        self.assertIsNone(error)
+        self.assertEqual(expected["brightness"], 30)
 
     def test_invalid_action_is_rejected_with_valid_choices_listed(self):
         """turn_off 这类其他平台命名必须被判 unsupported，且错误信息带上合法值列表，

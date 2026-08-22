@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -11,43 +12,188 @@ from ..devices.base import DeviceRegistry
 from ..models import DeviceType
 
 
-PLANNING_TOOL_NAMES = (
-    "control_light",
-    "control_ac",
-    "control_tv",
-    "control_curtain",
-    "control_humidifier",
-    "control_water_heater",
-    "control_lock",
-    "control_kettle",
-)
+class _InvalidArgument(ValueError):
+    """计划里的参数无法解析成设备可接受的值。
 
-# 每个工具的合法 action 及其附带参数。
+    单独立一个异常类型，是为了把"参数写错"和真正的程序 bug 分开：前者应该变成
+    preparation_error 回喂给 Planner 重写，后者才该往上抛。
+    """
+
+
+def _int_arg(args: dict[str, Any], name: str, default: int, low: int, high: int) -> int:
+    """读取整数参数并夹到合法区间，无法解析时报错而不是崩溃。
+
+    这里必须容错：`expected_state_for_step()` 在 executor 的 try 块之外被调用，
+    模型只要写出 brightness="很亮" 这种值，裸 `int()` 抛出的 ValueError 就会掀翻
+    整张图。转成 preparation_error 后会被判成确定性错误直接 replan —— 既不崩，
+    也不会静默套用默认值把"调到很亮"悄悄执行成"调到 50%"再报告成功。
+    """
+    raw = args.get(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _InvalidArgument(
+            f"invalid argument: {name} 需要 {low}-{high} 之间的整数，收到 {raw!r}"
+        ) from None
+    return max(low, min(high, value))
+
+
+@dataclass(frozen=True)
+class ActionSpec:
+    """一个 action 的完整声明。
+
+    signature 是喂给 Planner 的合法值文本（括号内为该 action 需附带的参数），
+    expected 接收 (arguments, device) 返回执行后设备应达到的状态 —— Verifier 拿它
+    跟注册中心的真实状态比对。
+    """
+
+    signature: str
+    expected: Callable[[dict[str, Any], Any], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """一个规划工具操作的设备类型及其全部合法 action。"""
+
+    device_type: DeviceType
+    actions: dict[str, ActionSpec]
+
+
+# 规划分支的单一数据源：工具 → 设备类型 → 合法 action → 期望状态。
 #
-# 为什么要单独维护这份词表：Planner 走 `llm.with_structured_output(ExecutionPlan)`，
+# 为什么这份声明必须存在：Planner 走 `llm.with_structured_output(ExecutionPlan)`，
 # 不像 ReAct 分支那样 `bind_tools`，所以工具 docstring 里写的 "on / off / ..."
 # 一个字都到不了模型面前。模型只能凭常识猜 action，于是会写出 Home Assistant
 # 风格的 turn_on / turn_off —— 这正是规划第一版反复失败的根因。把合法值显式喂给
 # 它，第一版就该是对的。
 #
-# 三处 action 枚举必须保持同步：工具实现的 if/elif、expected_state_for_step 的
-# if/elif、以及这里。它们都靠手写（if/elif 无法反射），tests 用一致性用例钉住。
+# 为什么合并成一张表：这份信息以前散成三份手写副本（喂 Planner 的词表、
+# expected_state_for_step 的近百行 if/elif、工具实现的 if/elif），漏改一处的表现
+# 是 Planner 第一版计划稳定失败，且不报错。现在前两者都从这里派生，只剩工具实现
+# 那份仍是手写（它带各自的副作用文本与前置检查，无法反射），由
+# tests/test_phase_seven.py 的一致性用例双向钉住。
+DEVICE_ACTION_SPECS: dict[str, ToolSpec] = {
+    "control_light": ToolSpec(DeviceType.LIGHT, {
+        "on": ActionSpec("on", lambda args, device: {"power": True}),
+        "off": ActionSpec("off", lambda args, device: {"power": False}),
+        "set_brightness": ActionSpec(
+            "set_brightness(brightness)",
+            lambda args, device: {
+                "power": True,
+                "brightness": _int_arg(args, "brightness", 50, 0, 100),
+            },
+        ),
+        "set_color": ActionSpec(
+            "set_color(color)",
+            lambda args, device: {"power": True, "color": args.get("color", "暖白")},
+        ),
+    }),
+    "control_ac": ToolSpec(DeviceType.AC, {
+        "on": ActionSpec(
+            "on(可带 temperature、mode)",
+            lambda args, device: {
+                "power": True,
+                "temperature": _int_arg(args, "temperature", 26, 16, 30),
+                "mode": args.get("mode", "cool"),
+            },
+        ),
+        "off": ActionSpec("off", lambda args, device: {"power": False}),
+        "set_temp": ActionSpec(
+            "set_temp(temperature)",
+            lambda args, device: {
+                "power": True,
+                "temperature": _int_arg(args, "temperature", 26, 16, 30),
+            },
+        ),
+        "set_mode": ActionSpec(
+            "set_mode(mode)",
+            lambda args, device: {"power": True, "mode": args.get("mode", "cool")},
+        ),
+        "set_fan": ActionSpec(
+            "set_fan(fan_speed)",
+            lambda args, device: {"fan_speed": args.get("fan_speed", "auto")},
+        ),
+    }),
+    "control_tv": ToolSpec(DeviceType.TV, {
+        "on": ActionSpec("on", lambda args, device: {"power": True}),
+        "off": ActionSpec("off", lambda args, device: {"power": False}),
+        "set_volume": ActionSpec(
+            "set_volume(volume)",
+            lambda args, device: {"volume": _int_arg(args, "volume", 30, 0, 100)},
+        ),
+        # mute 是翻转语义，所以期望状态依赖执行前的设备状态。
+        "mute": ActionSpec("mute", lambda args, device: {"muted": not device.muted}),
+        "set_channel": ActionSpec(
+            "set_channel(channel)",
+            lambda args, device: {
+                "power": True,
+                "channel": args.get("channel", "HDMI 1"),
+            },
+        ),
+    }),
+    "control_curtain": ToolSpec(DeviceType.CURTAIN, {
+        "open": ActionSpec("open", lambda args, device: {"position": 100}),
+        "close": ActionSpec("close", lambda args, device: {"position": 0}),
+        "set_position": ActionSpec(
+            "set_position(percentage)",
+            lambda args, device: {"position": _int_arg(args, "percentage", 100, 0, 100)},
+        ),
+    }),
+    "control_humidifier": ToolSpec(DeviceType.HUMIDIFIER, {
+        "on": ActionSpec("on", lambda args, device: {"power": True}),
+        "off": ActionSpec("off", lambda args, device: {"power": False}),
+        "set_humidity": ActionSpec(
+            "set_humidity(target_humidity)",
+            lambda args, device: {
+                "power": True,
+                "target_humidity": _int_arg(args, "target_humidity", 60, 30, 80),
+            },
+        ),
+        "set_mist_level": ActionSpec(
+            "set_mist_level(mist_level)",
+            lambda args, device: {
+                "power": True,
+                "mist_level": args.get("mist_level", "auto"),
+            },
+        ),
+    }),
+    "control_water_heater": ToolSpec(DeviceType.WATER_HEATER, {
+        "on": ActionSpec("on", lambda args, device: {"power": True}),
+        "off": ActionSpec("off", lambda args, device: {"power": False}),
+        "set_temp": ActionSpec(
+            "set_temp(target_temp)",
+            lambda args, device: {
+                "power": True,
+                "target_temp": _int_arg(args, "target_temp", 45, 35, 75),
+            },
+        ),
+    }),
+    "control_lock": ToolSpec(DeviceType.LOCK, {
+        "lock": ActionSpec("lock", lambda args, device: {"locked": True}),
+        "unlock": ActionSpec("unlock", lambda args, device: {"locked": False}),
+    }),
+    "control_kettle": ToolSpec(DeviceType.KETTLE, {
+        "on": ActionSpec("on", lambda args, device: {"power": True}),
+        "off": ActionSpec("off", lambda args, device: {"power": False}),
+        "set_temp": ActionSpec(
+            "set_temp(target_temp)",
+            lambda args, device: {
+                "power": True,
+                "target_temp": _int_arg(args, "target_temp", 100, 40, 100),
+            },
+        ),
+        "boil": ActionSpec(
+            "boil",
+            lambda args, device: {"power": True, "target_temp": 100},
+        ),
+    }),
+}
+
+# 以下两个常量都是 DEVICE_ACTION_SPECS 的派生视图，不要手写。
+PLANNING_TOOL_NAMES = tuple(DEVICE_ACTION_SPECS)
 TOOL_ACTIONS: dict[str, str] = {
-    "control_light": "on / off / set_brightness(brightness) / set_color(color)",
-    "control_ac": (
-        "on(可带 temperature、mode) / off / set_temp(temperature) / "
-        "set_mode(mode) / set_fan(fan_speed)"
-    ),
-    "control_tv": "on / off / set_volume(volume) / mute / set_channel(channel)",
-    "control_curtain": "open / close / set_position(percentage)",
-    "control_humidifier": (
-        "on / off / set_humidity(target_humidity) / set_mist_level(mist_level)"
-    ),
-    "control_water_heater": (
-        "on / off / set_temp(target_temp)"
-    ),
-    "control_lock": "lock / unlock",
-    "control_kettle": "on / off / set_temp(target_temp) / boil",
+    tool_name: " / ".join(action.signature for action in spec.actions.values())
+    for tool_name, spec in DEVICE_ACTION_SPECS.items()
 }
 
 
@@ -56,6 +202,10 @@ class PlanStep(BaseModel):
 
     step_id: int = Field(ge=1)
     description: str = Field(min_length=1)
+    # 这里必须是静态字面量：structured output 靠它生成 JSON Schema 的 enum，
+    # 从而在模型侧就约束住工具名。所以它无法从 DEVICE_ACTION_SPECS 派生，
+    # 只能手写 + 由一致性用例钉住两者的键集相等（漏加时测试失败，而非运行时静默）。
+    # 传感器故意不在其中：规划分支只做写操作，read_sensor 不该出现在计划里。
     tool_name: Literal[
         "control_light", "control_ac", "control_tv", "control_curtain",
         "control_humidifier", "control_water_heater", "control_lock",
@@ -188,125 +338,21 @@ def expected_state_for_step(
     """Resolve the target and expected state before executing a plan step."""
     tool_name = step.get("tool_name")
     args = step.get("arguments", {})
-    mapping = {
-        "control_light": DeviceType.LIGHT,
-        "control_ac": DeviceType.AC,
-        "control_tv": DeviceType.TV,
-        "control_curtain": DeviceType.CURTAIN,
-        "control_humidifier": DeviceType.HUMIDIFIER,
-        "control_water_heater": DeviceType.WATER_HEATER,
-        "control_lock": DeviceType.LOCK,
-        "control_kettle": DeviceType.KETTLE,
-    }
-    device_type = mapping.get(tool_name)
-    if device_type is None:
+    spec = DEVICE_ACTION_SPECS.get(tool_name)
+    if spec is None:
         return None, {}, "unsupported tool"
-    device = registry.find(str(args.get("device_name", "")), device_type)
+    device = registry.find(str(args.get("device_name", "")), spec.device_type)
     if device is None:
         return None, {}, "device not found or ambiguous"
 
     action = args.get("action")
-    expected: dict[str, Any]
-    if tool_name == "control_light":
-        if action == "on":
-            expected = {"power": True}
-        elif action == "off":
-            expected = {"power": False}
-        elif action == "set_brightness":
-            expected = {"power": True, "brightness": max(0, min(100, int(args.get("brightness", 50))))}
-        elif action == "set_color":
-            expected = {"power": True, "color": args.get("color", "暖白")}
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    elif tool_name == "control_ac":
-        if action == "on":
-            expected = {
-                "power": True,
-                "temperature": max(16, min(30, int(args.get("temperature", 26)))),
-                "mode": args.get("mode", "cool"),
-            }
-        elif action == "off":
-            expected = {"power": False}
-        elif action == "set_temp":
-            expected = {"power": True, "temperature": max(16, min(30, int(args.get("temperature", 26))))}
-        elif action == "set_mode":
-            expected = {"power": True, "mode": args.get("mode", "cool")}
-        elif action == "set_fan":
-            expected = {"fan_speed": args.get("fan_speed", "auto")}
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    elif tool_name == "control_tv":
-        if action == "on":
-            expected = {"power": True}
-        elif action == "off":
-            expected = {"power": False}
-        elif action == "set_volume":
-            expected = {"volume": max(0, min(100, int(args.get("volume", 30))))}
-        elif action == "mute":
-            expected = {"muted": not device.muted}
-        elif action == "set_channel":
-            expected = {"power": True, "channel": args.get("channel", "HDMI 1")}
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    elif tool_name == "control_curtain":
-        if action == "open":
-            expected = {"position": 100}
-        elif action == "close":
-            expected = {"position": 0}
-        elif action == "set_position":
-            expected = {"position": max(0, min(100, int(args.get("percentage", 100))))}
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    elif tool_name == "control_humidifier":
-        if action == "on":
-            expected = {"power": True}
-        elif action == "off":
-            expected = {"power": False}
-        elif action == "set_humidity":
-            expected = {
-                "power": True,
-                "target_humidity": max(30, min(80, int(args.get("target_humidity", 60)))),
-            }
-        elif action == "set_mist_level":
-            expected = {"power": True, "mist_level": args.get("mist_level", "auto")}
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    elif tool_name == "control_water_heater":
-        if action == "on":
-            expected = {"power": True}
-        elif action == "off":
-            expected = {"power": False}
-        elif action == "set_temp":
-            expected = {
-                "power": True,
-                "target_temp": max(35, min(75, int(args.get("target_temp", 45)))),
-            }
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    elif tool_name == "control_lock":
-        if action == "lock":
-            expected = {"locked": True}
-        elif action == "unlock":
-            expected = {"locked": False}
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    elif tool_name == "control_kettle":
-        if action == "on":
-            expected = {"power": True}
-        elif action == "off":
-            expected = {"power": False}
-        elif action == "set_temp":
-            expected = {
-                "power": True,
-                "target_temp": max(40, min(100, int(args.get("target_temp", 100)))),
-            }
-        elif action == "boil":
-            expected = {"power": True, "target_temp": 100}
-        else:
-            return device.device_id, {}, _unsupported_action(tool_name, action)
-    else:
-        return device.device_id, {}, f"unsupported tool: {tool_name}"
-    return device.device_id, expected, None
+    action_spec = spec.actions.get(action) if isinstance(action, str) else None
+    if action_spec is None:
+        return device.device_id, {}, _unsupported_action(tool_name, action)
+    try:
+        return device.device_id, action_spec.expected(args, device), None
+    except _InvalidArgument as exc:
+        return device.device_id, {}, str(exc)
 
 
 def verify_step(
