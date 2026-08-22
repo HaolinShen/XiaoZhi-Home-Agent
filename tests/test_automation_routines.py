@@ -24,11 +24,14 @@ from src.automation.store import AutomationStore
 from src.automation.vehicle import ArrivalOrchestrator, VehicleEvent, VehicleSimulator
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
+from src.memory import MemoryRepository, MemoryService
 from src.tools import (
+    control_light,
     create_scheduled_routine,
     list_automation_routines,
     schedule_wake_routine,
     set_automation_runtime,
+    set_memory_service,
     set_registry,
 )
 
@@ -39,6 +42,12 @@ UTC = timezone.utc
 class AutomationRoutineTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        # 目录删除必须排在所有 SQLite 连接关闭之后，否则 Windows 会抛
+        # PermissionError: [WinError 32]，测试断言全过也判失败。
+        # unittest 先跑完整个 tearDown 才轮到 doCleanups，所以放在 tearDown 里
+        # 会早于测试方法内 addCleanup 注册的 close；而 doCleanups 是 LIFO，
+        # 在 setUp 最先注册就能保证它最后执行。
+        self.addCleanup(self.temp_dir.cleanup)
         self.registry = DeviceRegistry(SimulatorBackend())
         set_registry(self.registry)
         self.store = AutomationStore(str(Path(self.temp_dir.name) / "automation.db"))
@@ -54,7 +63,6 @@ class AutomationRoutineTests(unittest.TestCase):
         set_automation_runtime(None)
         self.scheduler.stop()
         self.store.close()
-        self.temp_dir.cleanup()
 
     def test_wake_routine_arms_alarm_and_executes_relative_actions(self):
         wake_at = datetime(2026, 8, 16, 6, 0, tzinfo=UTC)
@@ -83,6 +91,72 @@ class AutomationRoutineTests(unittest.TestCase):
         self.assertEqual(self.registry.get("bedroom_curtain").position, 100)
         self.assertTrue(self.registry.get("bedroom_light").power)
         self.assertTrue(all(task.status == "completed" for task in self.store.list_tasks(routine.id)))
+
+    def test_routine_actions_survive_missing_identity_and_skip_preference_learning(self):
+        """长期记忆开启时，后台执行的例程动作仍须成功。
+
+        回归 `KeyError: 'home_id'`：执行器走 `tool.invoke(arguments)`，不携带可信身份，
+        但 LangChain 仍会注入一个 `configurable` 为空的 config。当时 devices.py 每个
+        写偏好的分支都有一道 `if config is not None` 守卫，看着像在防这种无身份调用，
+        实际恒为真、一个字都拦不住，`_context()` 的下标访问照样抛错，把热水器、烧水壶
+        和灯光全判成 failed。窗帘的 `open` 分支不记录偏好，所以当时唯独它成功 ——
+        这个"只有一个动作活下来"的形态就是本 bug 的指纹。守卫已经删除，身份校验收敛
+        到 `record_preference_operation()` 内部，本用例钉住那里的行为。
+
+        上面那个起床测试没能抓到，是因为它从不调用 `set_memory_service`，
+        `_service is None` 直接提前返回，绕过了出错的那一行。
+        """
+        repository = MemoryRepository(str(Path(self.temp_dir.name) / "memory.db"))
+        self.addCleanup(repository.close)
+        self.addCleanup(set_memory_service, None)
+        service = MemoryService(
+            repository,
+            SpaceDirectory.from_registry(self.registry, "home-a"),
+        )
+        observed: list[tuple[str, dict]] = []
+        real_record = service.record_operation
+
+        def counting_record(context, memory_key, memory_value, **kwargs):
+            observed.append((memory_key, memory_value))
+            return real_record(context, memory_key, memory_value, **kwargs)
+
+        service.record_operation = counting_record
+        set_memory_service(service)
+
+        wake_at = datetime(2026, 8, 16, 6, 0, tzinfo=UTC)
+        routine = self.store.save_routine(build_wake_routine("home-a", "user-a"))
+        self.scheduler.schedule(
+            routine, anchor_at=wake_at, trigger_key="wake-1", now=wake_at - timedelta(hours=8)
+        )
+        # 单次 tick 追平全部到期任务，正是应用停机后重启的补偿执行形态。
+        self.scheduler.tick(wake_at)
+
+        tasks = self.store.list_tasks(routine.id)
+        self.assertEqual(
+            [task.status for task in tasks],
+            ["completed"] * len(tasks),
+            msg=[(task.payload.get("tool_name"), task.error) for task in tasks],
+        )
+        heater = self.registry.get("bathroom_water_heater")
+        self.assertTrue(heater.power)
+        self.assertEqual(heater.target_temp, 45)
+        self.assertEqual(self.registry.get("kitchen_kettle").target_temp, 80)
+        self.assertEqual(self.registry.get("bedroom_light").brightness, 40)
+        self.assertEqual(self.registry.get("bedroom_curtain").position, 100)
+
+        # 自动化是机器触发的，计入"重复手动操作"会凭空造出用户没设过的偏好。
+        self.assertEqual(observed, [])
+
+        # 但同一个工具走正常对话路径（带可信身份）时必须照常记录，
+        # 否则这个修复就退化成"把偏好学习关掉了"。
+        control_light.invoke(
+            {"device_name": "卧室灯", "action": "set_brightness", "brightness": 70},
+            config={"configurable": {
+                "home_id": "home-a", "user_id": "user-a",
+                "thread_id": "session-a", "client_id": "phone",
+            }},
+        )
+        self.assertEqual(observed, [("lighting.brightness", {"brightness": 70})])
 
     def test_vehicle_eta_schedules_and_executes_arrival_preparation(self):
         routine = build_arrival_routine("home-a", "user-a")
@@ -668,9 +742,16 @@ class AutomationRoutineTests(unittest.TestCase):
             speaker=SimulatorSpeakerBackend(),
         )
         set_automation_runtime(runtime)
+        # 这里必须用相对时间：schedule_wake 会拒绝早于当前时间的目标，原先硬编码的
+        # 2026-08-16 在该日过去后就让本用例永久失败。保留"带时区的 ISO 8601 + 早上
+        # 6 点"这个真实入参形态（工具 docstring 要求的格式），只把日期取成次日。
+        zone = timezone(timedelta(hours=8))
+        wake_at = (datetime.now(zone) + timedelta(days=1)).replace(
+            hour=6, minute=0, second=0, microsecond=0
+        )
         try:
             result = schedule_wake_routine.invoke(
-                {"wake_at_iso": "2026-08-16T06:00:00+08:00"},
+                {"wake_at_iso": wake_at.isoformat()},
                 config={"configurable": {"home_id": "home-a", "user_id": "user-a"}},
             )
             self.assertIn("已创建起床例程", result)

@@ -36,14 +36,30 @@ def _is_admin(config: RunnableConfig) -> bool:
     return config.get("configurable", {}).get("is_admin") is True
 
 
+_OPERATION_IDENTITY_KEYS = ("home_id", "user_id", "thread_id", "client_id")
+
+
 def record_preference_operation(
     config: RunnableConfig,
     device_id: str,
     memory_key: str,
     memory_value: dict[str, Any],
 ) -> None:
-    """Record a successful device setting without exposing identity to the model."""
+    """Record a successful device setting without exposing identity to the model.
+
+    行为观察是尽力而为的副作用，绝不能让设备控制本身失败。后台自动化执行器
+    直接 `tool.invoke(arguments)`，不携带可信身份；LangChain 仍会注入一个
+    `configurable` 为空的 config，所以调用方那句 `if config is not None` 拦不住，
+    再往下 `_context()` 的下标访问就会抛 KeyError，把整个定时动作判成失败。
+    缺少可信身份时应当安静跳过，而不是让热水器烧不上水。
+
+    跳过也是语义上正确的：`record_operation` 服务于"重复手动操作 → 候选偏好"
+    的抽取，而自动化动作是机器触发的，计入重复次数会凭空造出用户从未设过的偏好。
+    """
     if _service is None:
+        return
+    configurable = (config or {}).get("configurable", {})
+    if not all(configurable.get(key) for key in _OPERATION_IDENTITY_KEYS):
         return
     context = _context(config).model_copy(update={"room_id": None, "device_id": device_id})
     _service.record_operation(context, memory_key, memory_value)

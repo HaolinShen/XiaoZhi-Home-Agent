@@ -19,6 +19,14 @@
   执行器（灯/空调/电视/窗帘/加湿器）→ control_xxx 工具，可读可写
   传感器（温湿度/人体存在）        → read_sensor 工具，只读
   传感器故意不做成 control_xxx，这样 LLM 从工具名就知道它改不了状态。
+
+关于 config 参数:
+  `config: RunnableConfig = None` 的默认值是给类型标注用的，运行时拿不到 None ——
+  LangChain 总会注入一个 config，后台自动化执行器那种 `tool.invoke(arguments)`
+  的无身份调用注入的是 `configurable` 为空的 config。所以**不要**在这里写
+  `if config is not None:` 来"保护"依赖身份的副作用，那个判断恒为真，一个字都拦
+  不住（曾因此把定时热水器动作整个判成失败）。身份校验的责任在被调用方内部，
+  见 `record_preference_operation()`。
 """
 
 from typing import Optional
@@ -114,18 +122,16 @@ def control_light(
     elif action == "set_brightness":
         brightness = max(0, min(100, brightness))
         registry.update(device.device_id, brightness=brightness, power=True)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "lighting.brightness", {"brightness": brightness}
-            )
+        record_preference_operation(
+            config, device.device_id, "lighting.brightness", {"brightness": brightness}
+        )
         return f"✅ {device.name}亮度已调至 {brightness}%。"
 
     elif action == "set_color":
         registry.update(device.device_id, color=color, power=True)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "lighting.color", {"color": color}
-            )
+        record_preference_operation(
+            config, device.device_id, "lighting.color", {"color": color}
+        )
         return f"✅ {device.name}色温已调至「{color}」。"
 
     else:
@@ -190,10 +196,9 @@ def control_ac(
     elif action == "set_temp":
         temperature = max(16, min(30, temperature))
         registry.update(device.device_id, temperature=temperature, power=True)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "ac.temperature", {"temperature": temperature}
-            )
+        record_preference_operation(
+            config, device.device_id, "ac.temperature", {"temperature": temperature}
+        )
         return f"✅ {device.name}温度已设为 {temperature}°C。"
 
     elif action == "set_mode":
@@ -201,10 +206,9 @@ def control_ac(
         if mode not in valid_modes:
             return f"❌ 无效的模式「{mode}」。支持: cool(制冷), heat(制热), fan(送风), dry(除湿)"
         registry.update(device.device_id, mode=mode, power=True)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "ac.mode", {"mode": mode}
-            )
+        record_preference_operation(
+            config, device.device_id, "ac.mode", {"mode": mode}
+        )
         mode_cn = {"cool": "制冷", "heat": "制热", "fan": "送风", "dry": "除湿"}
         return f"✅ {device.name}已切换至{mode_cn[mode]}模式。"
 
@@ -213,10 +217,9 @@ def control_ac(
         if fan_speed not in valid_speeds:
             return f"❌ 无效的风速「{fan_speed}」。支持: auto(自动), low(低), mid(中), high(高)"
         registry.update(device.device_id, fan_speed=fan_speed)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "ac.fan_speed", {"fan_speed": fan_speed}
-            )
+        record_preference_operation(
+            config, device.device_id, "ac.fan_speed", {"fan_speed": fan_speed}
+        )
         speed_cn = {"auto": "自动", "low": "低", "mid": "中", "high": "高"}
         return f"✅ {device.name}风速已设为{speed_cn[fan_speed]}。"
 
@@ -276,10 +279,9 @@ def control_tv(
     elif action == "set_volume":
         volume = max(0, min(100, volume))
         registry.update(device.device_id, volume=volume)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "tv.volume", {"volume": volume}
-            )
+        record_preference_operation(
+            config, device.device_id, "tv.volume", {"volume": volume}
+        )
         return f"✅ {device.name}音量已调至 {volume}%。"
 
     elif action == "mute":
@@ -289,10 +291,9 @@ def control_tv(
 
     elif action == "set_channel":
         registry.update(device.device_id, channel=channel, power=True)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "tv.channel", {"channel": channel}
-            )
+        record_preference_operation(
+            config, device.device_id, "tv.channel", {"channel": channel}
+        )
         return f"✅ {device.name}已切换至 {channel}。"
 
     else:
@@ -346,10 +347,9 @@ def control_curtain(
     elif action == "set_position":
         percentage = max(0, min(100, percentage))
         registry.update(device.device_id, position=percentage)
-        if config is not None:
-            record_preference_operation(
-                config, device.device_id, "curtain.position", {"percentage": percentage}
-            )
+        record_preference_operation(
+            config, device.device_id, "curtain.position", {"percentage": percentage}
+        )
         if percentage == 0:
             desc = "完全关闭"
         elif percentage == 100:
@@ -404,13 +404,12 @@ def control_humidifier(
     if action == "set_humidity":
         target_humidity = max(30, min(80, target_humidity))
         registry.update(device.device_id, target_humidity=target_humidity, power=True)
-        if config is not None:
-            record_preference_operation(
-                config,
-                device.device_id,
-                "humidifier.target_humidity",
-                {"target_humidity": target_humidity},
-            )
+        record_preference_operation(
+            config,
+            device.device_id,
+            "humidifier.target_humidity",
+            {"target_humidity": target_humidity},
+        )
         return f"✅ {device.name}目标湿度已设为 {target_humidity}%。"
 
     if action == "set_mist_level":
@@ -418,13 +417,12 @@ def control_humidifier(
         if mist_level not in valid_levels:
             return "❌ 无效的雾量档位。支持: auto(自动), low(低), mid(中), high(高)"
         registry.update(device.device_id, mist_level=mist_level, power=True)
-        if config is not None:
-            record_preference_operation(
-                config,
-                device.device_id,
-                "humidifier.mist_level",
-                {"mist_level": mist_level},
-            )
+        record_preference_operation(
+            config,
+            device.device_id,
+            "humidifier.mist_level",
+            {"mist_level": mist_level},
+        )
         level_cn = {"auto": "自动", "low": "低", "mid": "中", "high": "高"}
         return f"✅ {device.name}雾量已设为{level_cn[mist_level]}。"
 
@@ -468,13 +466,12 @@ def control_water_heater(
     elif action == "set_temp":
         target_temp = max(35, min(75, target_temp))
         registry.update(device.device_id, target_temp=target_temp, power=True)
-        if config is not None:
-            record_preference_operation(
-                config,
-                device.device_id,
-                "water_heater.target_temp",
-                {"target_temp": target_temp},
-            )
+        record_preference_operation(
+            config,
+            device.device_id,
+            "water_heater.target_temp",
+            {"target_temp": target_temp},
+        )
         return f"✅ {device.name}目标水温已设为 {target_temp}°C。"
     return "❌ 不支持的操作。电热水器支持: on / off / set_temp"
 
@@ -558,13 +555,12 @@ def control_kettle(
     elif action == "set_temp":
         target_temp = max(40, min(100, target_temp))
         registry.update(device.device_id, target_temp=target_temp, power=True)
-        if config is not None:
-            record_preference_operation(
-                config,
-                device.device_id,
-                "kettle.target_temp",
-                {"target_temp": target_temp},
-            )
+        record_preference_operation(
+            config,
+            device.device_id,
+            "kettle.target_temp",
+            {"target_temp": target_temp},
+        )
         return f"✅ {device.name}目标水温已设为 {target_temp}°C。"
     return "❌ 不支持的操作。烧水壶支持: on / off / set_temp / boil"
 
