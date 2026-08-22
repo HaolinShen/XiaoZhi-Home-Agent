@@ -33,13 +33,19 @@
 | 特性 | 说明 |
 |------|------|
 | 🧠 **ReAct 智能体** | LangGraph 状态图驱动的「思考-行动」循环，自动决策何时调用工具 |
-| 💡 **多设备控制** | 灯光、空调、电视、窗帘、加湿器的完整控制能力 |
+| 🗺️ **结构化意图路由** | 模型分类 + 确定性兜底，动态选择 ReAct / 规划 / 并行查询 / RAG / 澄清五条路径 |
+| 📋 **Planner–Executor–Verifier** | 多步骤任务先出计划、逐步执行、按真实设备状态验证，失败自动重试/重新规划 |
+| 💡 **多设备控制** | 灯光、空调、电视、窗帘、加湿器、热水器、门锁、烧水壶，能力声明单一数据源自动生成工具 |
 | 🌡️ **环境传感器** | 温湿度 + 人体存在传感器（只读），读数随执行器状态变化，让「先看数据再动手」成为可能 |
 | 🎬 **场景模式** | 回家 / 离家 / 睡眠 / 观影 / 起床，一句话一键执行多个设备操作 |
+| ⏰ **事件驱动自动化** | 定时 / 起床 / 车辆 ETA 例程持久化调度，动作在图外执行并验证 |
+| 🤝 **多智能体协作** | 6 个角色按工具集隔离（device / scene / memory / automation / knowledge / chat） |
+| 📚 **Agentic RAG** | 本地设备知识库检索 + 引用溯源，答不出时明确拒绝 |
 | 💬 **多轮对话记忆** | 基于 LangGraph Checkpoint，默认 SQLite 持久化，重启不丢上下文 |
 | 🧠 **结构化长期记忆** | SQLite 保存家庭规则与个人偏好，支持范围隔离、查看、修改和删除 |
 | 🔌 **MCP 集成** | 通过 Model Context Protocol 将工具暴露给 Claude Desktop 等外部 AI |
-| 🛡️ **中间件体系** | 日志记录 + 失败自动重试（指数退避），装饰器模式可自由组合 |
+| 🛡️ **人工审批** | 敏感动作（解锁门锁、批量场景、自动化例程）执行前需用户确认 |
+| 📈 **可观测性** | 进度事件双写（stream + 结构化日志），LLM 调用级 token/延迟采集 |
 | 🖥️ **现代化 CLI** | Typer + Rich 构建，支持 Markdown 渲染、彩色面板、交互式命令 |
 | 📦 **类型安全** | Pydantic v2 严格数据模型，枚举约束杜绝魔法字符串 Bug |
 
@@ -61,34 +67,24 @@
 
 ## 🧠 Agent 工作原理
 
-项目采用经典的 **ReAct（Reasoning + Acting）循环**：
+单次请求经过三段前置处理后，按意图进入**五条互斥业务路径**之一：
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                   LangGraph Agent 状态图                   │
-│                                                          │
-│   用户输入                                                │
-│      │                                                   │
-│      ▼                                                   │
-│  ┌─────────┐  有 tool_calls?   ┌──────────┐             │
-│  │  Agent  │ ────────────────→ │  Tools   │             │
-│  │  (LLM)  │                   │ (执行工具) │             │
-│  │         │ ←──────────────── │          │             │
-│  └────┬────┘   返回执行结果     └──────────┘             │
-│       │                                                   │
-│       │  没有 tool_calls                                   │
-│       ▼                                                   │
-│    最终回复 → 返回给用户                                    │
-│                                                          │
-│   记忆层: MemorySaver / SqliteSaver（跨轮次状态保持）       │
-└──────────────────────────────────────────────────────────┘
+sync_context → memory_reasoner → task_router ─┬→ planner ⇄ 审批 ⇄ executor ⇄ verifier   （多步任务）
+                                              ├→ compact_context → agent ⇄ 审批 ⇄ tools  （ReAct 主路）
+                                              ├→ device_query_subgraph                   （多设备并行查询）
+                                              ├→ knowledge_rag                           （设备知识 RAG）
+                                              └→ clarification                           （信息不足反问）
 ```
 
 **关键设计：**
-1. 使用 LangGraph 预置的 `ToolNode`，无需手动解析 tool_calls
-2. `SystemMessage` 每次追加在消息列表最前，防止 LLM 遗忘角色
-3. 检查点机制实现多轮对话记忆（内存 / SQLite 可切换）
-4. 工具函数通过类型注解 + docstring 自动生成 LLM 可见的 JSON Schema
+1. 意图分类 = 模型结构化输出 + 确定性兜底；「未来时间 + 自动化词」等硬信号直接短路，不让模型误判
+2. Planner–Executor–Verifier 是显式状态机：`planning_status` 驱动全部条件边，
+   验证读**注册中心的真实设备状态**，不靠 LLM 自述成败
+3. 身份永远来自 `RunnableConfig["configurable"]`，绝不接受模型生成的 `home_id` / `user_id`
+4. 多智能体开启时 6 个角色各自 `bind_tools` 一个工具子集（工具集隔离）
+5. 自动化子系统运行在图外：持久化例程由后台调度器执行，动作同样经 `verify_step` 验证
+6. 完整的架构演进见 [docs/tutorial.md](docs/tutorial.md) 与 [docs/iterations](docs/iterations)
 
 ---
 
@@ -194,6 +190,13 @@ python -m src.main --home-id demo-home --user-id admin-001 --admin
 | 📺 电视 | `打开电视` · `音量调到 50` · `静音` · `切换到 HDMI 2` |
 | 🪟 窗帘 | `打开窗帘` · `关上窗帘` · `窗帘打开一半` |
 | 💧 加湿器 | `开加湿器` · `湿度设到 60%` · `雾量调低` |
+| 🚿 电热水器 | `打开热水器` · `热水器调到 50 度` |
+| 🔒 门锁 | `把门锁上` · `解锁门锁`（需人工审批） |
+| ☕ 烧水壶 | `把水烧开` · `烧水到 80 度` |
+
+> 每个设备的工具、合法动作、参数 Schema、Planner 词表、模拟器默认实例全部从
+> `src/devices/capabilities.py` 的能力声明**自动派生**——新增设备只需在那一处声明，
+> 一致性由 `tests/test_capabilities.py` 在测试阶段兜底（详见迭代 011）。
 
 **传感器**（只读，只有 `read_sensor` 工具）
 
@@ -308,10 +311,11 @@ CAIYUN_WEATHER_TOKEN=你的彩云 token
 
 ```
 langgraph/
-├── pyproject.toml              # 项目元数据 & 依赖声明
+├── pyproject.toml              # 项目元数据 & 依赖 & ruff/mypy 配置
 ├── .env.example                # 环境变量模板
 ├── docs/
-│   └── tutorial.md             # 45 分钟开发教程（强烈推荐阅读）
+│   ├── tutorial.md             # 45 分钟开发教程（强烈推荐阅读）
+│   └── iterations/             # 迭代方案与实现记录（001-011）
 │
 ├── src/
 │   ├── main.py                 # CLI 入口（Typer + Rich 交互界面）
@@ -321,35 +325,56 @@ langgraph/
 │   ├── agent/
 │   │   ├── context.py          # 可信请求身份与空间归属校验
 │   │   ├── graph.py            # ★ LangGraph 工作流（Agent 核心）
+│   │   ├── routing.py          # 结构化意图路由（模型 + 确定性兜底）
+│   │   ├── planning.py         # Planner–Executor–Verifier 规划侧
+│   │   ├── heuristics.py       # 确定性启发式判定（路由/规划/自动化共用词表）
+│   │   ├── telemetry.py        # LLM 调用级 token / 延迟采集
+│   │   ├── observability.py    # 进度事件（stream + 结构化日志双写）
+│   │   ├── multi_agent.py      # 多智能体角色与工具集隔离
+│   │   ├── parallel.py         # 设备并行查询子图
+│   │   ├── approval.py         # 敏感动作人工审批判定
+│   │   ├── reasoning.py        # 记忆适用性推理
 │   │   ├── session.py          # 会话创建、恢复与结束
 │   │   ├── state.py            # Agent 状态定义
 │   │   └── prompts.py          # 系统提示词
 │   │
 │   ├── devices/
-│   │   ├── base.py             # 设备后端抽象接口
+│   │   ├── capabilities.py     # ★ 设备能力单一数据源（工具/规划/场景由此派生）
+│   │   ├── base.py             # 设备后端抽象接口 + 注册中心
 │   │   └── simulator.py        # 内存模拟器（默认后端）
 │   │
 │   ├── tools/
-│   │   ├── devices.py          # 设备控制工具（灯光/空调/电视/窗帘/加湿器）+ 传感器读取
-│   │   └── scenes.py           # 场景模式工具
+│   │   ├── __init__.py         # build_all_tools 工厂（显式依赖注入）
+│   │   ├── devices.py          # 设备工具工厂（从能力声明生成 control_xxx）
+│   │   ├── scenes.py           # 场景模式工具工厂
+│   │   ├── memory.py           # 长期记忆工具工厂
+│   │   └── automation.py       # 自动化例程工具工厂
 │   │
-│   ├── mcp/
-│   │   ├── server.py           # MCP 服务器（stdio / SSE）
-│   │   └── client.py           # MCP 客户端
+│   ├── automation/             # 图外的持久化调度子系统
+│   │   ├── runtime.py          # 运行时组装（store / executor / scheduler）
+│   │   ├── executor.py         # 例程动作执行 + 验证（显式关闭偏好观察）
+│   │   ├── scheduler.py        # 可注入虚拟时间的确定性调度
+│   │   ├── store.py            # SQLite 持久化（data/automation.db）
+│   │   └── ...
+│   │
+│   ├── knowledge/              # 本地设备知识库 + Agentic RAG 子图
+│   ├── evaluation/             # 离线轨迹评测
 │   │
 │   ├── memory/
 │   │   ├── models.py           # 长期记忆数据模型
 │   │   ├── repository.py       # SQLite Repository
 │   │   ├── service.py          # 隔离、权限与范围规则
 │   │   └── store.py            # 检查点记忆（内存 / SQLite）
-│   ├── tools/
-│   │   └── memory.py           # 受可信上下文约束的记忆工具
+│   │
+│   ├── mcp/
+│   │   ├── server.py           # MCP 服务器（复用图内同一份工具实现）
+│   │   ├── client.py           # MCP 客户端
+│   │   └── weather_server.py   # 彩云天气 MCP
 │   │
 │   └── middleware/
 │       └── interceptors.py     # 中间件（日志 + 重试）—— 教学演示，未接入运行路径
 │
-└── tests/
-    └── visualize_graph.ipynb   # LangGraph 图可视化 Notebook
+└── tests/                      # 全量 unittest 回归（capabilities/heuristics/telemetry 等）
 ```
 
 ---
@@ -358,14 +383,26 @@ langgraph/
 
 ### 新增一个设备类型
 
-只需 4 步（以「智能门锁」为例）：
+P0 改造后只需 **1 步**：在 `src/devices/capabilities.py` 的 `CAPABILITIES` 里加一条
+能力声明（设备类型、工具名、合法 action 及其副作用实现、期望状态、参数、类型关键词、
+默认实例、场景归属）。
 
-1. **`src/models.py`**：定义 `LockDevice(BaseDevice)` 数据模型
-2. **`src/devices/simulator.py`**：注册默认设备实例
-3. **`src/tools/devices.py`**：添加 `@tool def control_lock(...)` 工具函数
-4. **`src/tools/__init__.py`**：在 `get_all_tools()` 中注册
+其余全部自动派生：
 
-> LLM 会自动通过工具名称和 docstring 学会何时调用、怎么传参。
+- 控制工具的 JSON Schema / docstring（`src/tools/devices.py`）
+- Planner 合法 action 词表与 `PlanStep.tool_name` 的枚举（`src/agent/planning.py`）
+- `registry.find()` 的类型关键词（`src/devices/base.py`）
+- 模拟器默认设备（`src/devices/simulator.py`）
+- 场景批量开关的设备类型集合（`src/tools/scenes.py`）
+- 自动化例程允许的工具名（`src/automation/planning.py`）
+- MCP 服务器暴露的控制工具（`src/mcp/server.py`）
+
+仍需要手工做的只有两件（与能力声明本身无关）：在 `src/models.py` 定义设备数据模型；
+若动作对外敏感（如解锁），在 `src/agent/approval.py` 加审批判定。
+`tests/test_capabilities.py` 会把所有派生点逐一钉住，漏任何一处都在测试阶段失败。
+
+> 改造前这条路径要手工同步 9 处（含两处无法反射的副本），漏改的表现是
+> 「Planner 第一版计划稳定失败，且不报错」。
 
 ### 接入真实设备
 
@@ -396,6 +433,11 @@ langgraph/
 | `CHECKPOINT_TOOL_RESULT_MAX_CHARS` | `1200` | 单条工具结果保留字符上限 |
 | `CHECKPOINT_SUMMARY_MAX_CHARS` | `1800` | 滚动摘要字符上限 |
 | `CHECKPOINT_SESSION_TTL_HOURS` | `168` | 无活动会话检查点保留小时数 |
+| `PLANNING_ENABLED` / `PLANNING_MAX_STEPS` 等 | `true` / `8` | Planner–Executor–Verifier 开关与步数/重试上限 |
+| `ROUTING_ENABLED` / `ROUTING_CONFIDENCE_THRESHOLD` | `true` / `0.6` | 结构化意图路由开关与置信阈值 |
+| `MULTI_AGENT_ENABLED` / `MULTI_AGENT_MAX_HANDOFFS` | `true` / `2` | 多智能体协作开关与交接上限 |
+| `RAG_ENABLED` / `RAG_TOP_K` | `true` / `3` | 本地知识 RAG 开关与检索条数 |
+| `AUTOMATION_ENABLED` / `AUTOMATION_DB_PATH` | `true` / `data/automation.db` | 事件驱动自动化开关与持久化路径 |
 
 ---
 

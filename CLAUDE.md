@@ -10,7 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 常用命令
 
 ```bash
-# 全量测试（当前基线 158 项，含 subtests）
+# 全量测试（当前基线 189 项 + 137 subtests；tests/test_weather_mcp.py 的 stdio 用例
+# 在受限沙箱里会因子进程被拦截而失败，真实环境可全绿）
 PYTHONIOENCODING=utf-8 "F:/Software/Anaconda/envs/langgraph/python.exe" -m pytest -q
 
 # 单文件 / 单个测试
@@ -30,11 +31,11 @@ python -m src.mcp.server                              # stdio
 python -m src.mcp.server --transport sse --port 8765  # SSE
 ```
 
-没有 lint / format / typecheck 配置，也没有 `conftest.py`；`pyproject.toml` 里除 pytest 依赖外无 pytest 配置节。
+`pyproject.toml` 里有 `[tool.ruff]` / `[tool.mypy]` 配置（011 起，渐进式不 strict；环境未安装这两者时先 `pip install -e ".[dev]"` 再 `ruff check src tests` / `mypy src`）。没有 `conftest.py`。
 
 ## 架构大局
 
-`README.md` 描述的是阶段十二之前的形态。实际实现已经到阶段十三（事件驱动自动化），迭代方案记录在 `docs/iterations/NNN-*.md`，`docs/tutorial.md` 是最完整的架构长文。
+实际实现已到阶段十三（事件驱动自动化）+ 011 工程收口（能力单一数据源/显式注入/可观测性），迭代方案记录在 `docs/iterations/NNN-*.md`，`docs/tutorial.md` 是最完整的架构长文。
 
 ### 一次请求走过的图
 
@@ -50,7 +51,7 @@ sync_context → memory_reasoner → task_router → ┬→ planner ⇄ plan_app
 
 - `sync_context`（graph.py:246）落定本轮的可信空间（`active_room_id` / `active_device_id`），并检索长期记忆写入 `memory_context`。
 - `task_router`（graph.py:343）先用 `src/agent/routing.py` 分类意图，再决定走哪条路。**注意 `classify_intent()` 会在确定性信号命中 `automation_management` 时直接返回 fallback，不问 LLM** —— 这是防止模型把「明天 6 点回家前开空调」误判成预定义「回家模式」的硬约束。
-- `should_use_planner()`（`src/agent/planning.py:245`）是纯正则判断：≥2 个动作词 且（≥2 类设备 或 出现连接词）。命中预定义场景关键词则一律不走 Planner。
+- `should_use_planner()`（`src/agent/heuristics.py`，`planning.py` 保留再导出）是纯正则判断：≥2 个动作词 且（≥2 类设备 或 出现连接词）。命中预定义场景关键词则一律不走 Planner。
 
 ### Planner–Executor–Verifier 是显式状态机
 
@@ -68,11 +69,11 @@ sync_context → memory_reasoner → task_router → ┬→ planner ⇄ plan_app
 - `AgentContext.to_config()`（`src/agent/context.py:42`）把 `session_id` 同时用作 LangGraph `thread_id`，并把身份塞进 `configurable`。
 - 工具从 `config` 反解身份：`src/tools/automation.py:_identity()`、`src/tools/memory.py:_context()`。
 - `SpaceDirectory.validate()` 校验 `room_id` / `device_id` 的住宅归属；`MemoryService` 另有作用域与管理员权限规则（家庭/房间/设备共享记忆需 `is_admin`）。
-- **陷阱**：后台自动化执行器直接 `tool.invoke(arguments)` 时不带身份，但 LangChain 仍会注入一个 `configurable` 为空的 config，`if config is not None` 拦不住。凡是从 config 取身份的**尽力而为型**副作用（如 `record_preference_operation`）必须逐键检查后安静跳过，否则会把整个定时动作判成失败。
+- **011 起**：偏好观察是**构造期的显式选择**。图路径 `build_device_tools(registry, service)` 开启观察，缺身份直接 `RuntimeError`（fail-fast）；后台执行器 / MCP 用 `enable_preference_tracking=False` 显式关闭。旧陷阱（空 configurable 的 config 让 `if config is not None` 恒为真）已随模块级单例一并移除，不要再写「逐键检查后安静跳过」的兜底。
 
-### 工具通过模块级单例拿依赖
+### 工具通过工厂显式注入依赖（011 起）
 
-工具函数不接收 registry / service 参数，靠启动时注入：`set_registry()`（`src/tools/__init__.py:44`，同时注入 devices 和 scenes）、`set_memory_service()`、`set_automation_runtime()`。测试里改完必须在 `tearDown` 复位（尤其 `set_automation_runtime(None)`）。
+工具不读模块级单例：`src/tools/__init__.py:build_all_tools(registry, *, memory_service, automation_runtime, external_tools, enable_preference_tracking)` 按依赖构建全部工具并闭包持有。`build_graph` 新增 `automation_runtime` 参数；`automation_runtime=None`（自动化未启用）时自动化工具不出现在 Agent 面前。`set_registry` / `set_memory_service` / `set_automation_runtime` 已删除——测试别再 import 它们。
 
 ### 自动化子系统运行在图之外
 
@@ -83,43 +84,38 @@ sync_context → memory_reasoner → task_router → ┬→ planner ⇄ plan_app
 - 任务按 `dedupe_key` 去重；车辆 ETA 更新只移动**尚未执行**的任务。
 - 数据落 `data/automation.db`（`data/` 与 `*.db` 均被 gitignore）。
 - 创建例程一律走人工审批，且自动化动作**不含门锁解锁**。
+- `RoutineExecutor` 构造自己的设备工具集（偏好观察关闭）；动作仍经 `verify_step` 按真实设备状态验证。
 
 ### 多智能体是工具集隔离
 
-`multi_agent.enabled` 时，`graph.py:201` 为 6 个角色（device / scene / memory / automation / knowledge / chat）各 `bind_tools` 一个子集，`agent_node` 按 `delegated_agent` 选用。**新增工具若不加进对应角色的名字集合，该角色就永远调不到它。**
+`multi_agent.enabled` 时，`graph.py` 为 6 个角色（device / scene / memory / automation / knowledge / chat）各 `bind_tools` 一个子集，`agent_node` 按 `delegated_agent` 选用。device 角色的工具名从 `capabilities.CONTROL_TOOL_NAMES` 派生（新增设备自动进入）；**新增非设备工具若不加进对应角色的名字集合，该角色就永远调不到它。**
 
-`automation` 角色额外有一层强制：`_required_automation_tool()`（graph.py:98）在识别出「未来触发信号 + 设备动作信号」同时出现时锁定必须调用的创建工具，模型没调就补一条纠正 SystemMessage 重试一次。该函数默认必须返回 `None` —— 查询类和取消类请求绝不能被判成创建请求。
+`automation` 角色额外有一层强制：`required_automation_tool()`（`src/agent/heuristics.py`，graph.py 里保留 `_required_automation_tool` 别名）在识别出「未来触发信号 + 设备动作信号」同时出现时锁定必须调用的创建工具，模型没调就补一条纠正 SystemMessage 重试一次。该函数默认必须返回 `None` —— 查询类和取消类请求绝不能被判成创建请求。
 
 ## 改代码时容易漏的同步点
 
-### 新增一种设备要改 9 处
+### 新增一种设备：1 处声明 + 2 处手工（011 起）
 
-`README.md` 说 4 步，实际上（参照 `git show bcbf8b9` 新增热水器/门锁/烧水壶）需要：
+旧规则「要改 9 处」已作废。现在只在 `src/devices/capabilities.py` 的 `CAPABILITIES`
+加一条 `DeviceCapability` 声明（action 的 handler/expected/参数/关键词/默认实例/
+scene_exit），工具 Schema、Planner 词表、`PlanStep` Literal、`registry.find` 关键词、
+模拟器默认实例、场景批量类型、自动化工具名、MCP 工具全部自动派生。
+仍需手工的只有两件：
 
-1. `src/models.py` — 设备模型 + `DeviceType` 枚举 + 字段范围约束
-2. `src/devices/simulator.py` — 注册默认实例
-3. `src/devices/base.py` — `DeviceRegistry.find()` 的 `keywords_map` 加关键词
-4. `src/tools/devices.py` — `@tool def control_xxx`
-5. `src/tools/__init__.py` — 导入 + `get_all_tools()` + `__all__`
-6. `src/agent/graph.py` — `device_tool_names` 集合（否则 device 角色拿不到）
-7. `src/agent/planning.py` — `DEVICE_ACTION_SPECS` 加一个 `ToolSpec` 条目，外加 `PlanStep.tool_name` 的 `Literal`（`PLANNING_TOOL_NAMES`、`TOOL_ACTIONS`、`expected_state_for_step()` 都从声明派生，不用动）
-8. `src/mcp/server.py` — 对应 MCP 工具
-9. `src/tools/scenes.py` — 相关场景（如离家模式该不该关它）
+1. `src/models.py` — 设备数据模型 + `DeviceType` 枚举 + 字段范围约束
+2. `src/agent/approval.py` — 对外敏感动作（如解锁）的审批判定
 
-对外敏感动作（如解锁）还要在 `src/agent/approval.py` 加审批判定。
+一致性由 `tests/test_capabilities.py` 的生成式断言兜底；漏一处 = 测试失败，而非运行期静默。
 
-### action 枚举还剩两处副本
+### action 枚举已无副本（011 起）
 
-`DEVICE_ACTION_SPECS`（`planning.py:75`）是规划侧的单一数据源，`TOOL_ACTIONS`、`PLANNING_TOOL_NAMES`、`expected_state_for_step()` 全从它派生。剩下两处仍需手工对齐：
+`DEVICE_ACTION_SPECS`、`TOOL_ACTIONS`、`PLANNING_TOOL_NAMES`、`expected_state_for_step()`、`PlanStep.tool_name` 的 `Literal`、工具实现、MCP 工具现在**同源于** `devices/capabilities.py`。旧的两处手写副本（工具 if/elif、Literal）已不存在；`tests/test_capabilities.py` + `tests/test_phase_seven.py` 的双向反射用例继续钉住「声明 ↔ 工具实现」的一致性。
 
-1. **工具实现的 `if/elif`**（`src/tools/devices.py`）—— 带各自的副作用文本和前置检查，无法反射。
-2. **`PlanStep.tool_name` 的 `Literal`** —— structured output 靠它生成 JSON Schema 的 enum，无法从 dict 派生。
+### 进度事件双写 + token/延迟度量（011 起）
 
-`tests/test_phase_seven.py` 用一致性用例双向钉住这两处：实际调用工具看是否回「不支持的操作」，并用 `get_args()` 比对 `Literal` 与声明的键集。漏一处的表现是 Planner 第一版计划稳定失败，且不报错。
+`emit_progress()`（`src/agent/observability.py`）双写：stream 通道（CLI 实时渲染不变，CLI 仍用 `graph.stream(..., stream_mode=["custom", "updates"])`）+ loguru 结构化日志（`channel=graph_progress`，DEBUG 级），invoke/后台路径也有痕迹。事件分两级：`PLANNING_EVENTS` 默认显示，`TRACE_EVENTS` 需 `--trace`。
 
-### 进度事件只在 stream 模式存在
-
-`emit_progress()`（`src/agent/observability.py`）走 `get_stream_writer()`。`graph.invoke()` 下 LangGraph 给一个空写入器，事件被静默丢弃。CLI 因此必须用 `graph.stream(..., stream_mode=["custom", "updates"])`（`src/main.py:_stream_segment`）。事件分两级：`PLANNING_EVENTS` 默认显示，`TRACE_EVENTS` 需 `--trace`。
+LLM 调用级 token/延迟由 `src/agent/telemetry.py:UsageTracer` 采集（挂在 `build_llm`，落 `channel=llm_usage` 日志）；`traced_node` 装饰器给关键节点计时（`channel=node_latency`）。
 
 ### 传感器是只读的，这个约束靠多处协同
 
@@ -138,4 +134,4 @@ sync_context → memory_reasoner → task_router → ┬→ planner ⇄ plan_app
 
 - 提交信息用中文，`feat:` / `docs:` 前缀，body 说明**根因**而非现象（参见 `git log`）。修 bug 时找根因改，不做表面兜底。
 - 新迭代方案写 `docs/iterations/NNN-主题.md`，序号递增不复用，并同步 `docs/iterations/README.md` 的索引表。
-- 代码注释用中文，写「为什么这样」而不是「这是什么」；曾经踩过的坑就地记在注释里（如 `planning.py:62` 解释为何要单独维护一份 action 声明、为何把三处副本合成一处）。
+- 代码注释用中文，写「为什么这样」而不是「这是什么」；曾经踩过的坑就地记在注释里（如 `capabilities.py` 顶部解释为何要把设备能力收敛成单一数据源、`tools/memory.py:make_preference_recorder` 解释旧「逐键检查后安静跳过」的陷阱为何被构造期显式选择取代）。

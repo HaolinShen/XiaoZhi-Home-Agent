@@ -23,3 +23,4 @@
 | 008 | Agentic RAG 与轨迹评测 | 已实现 | [008-agentic-rag-evaluation.md](008-agentic-rag-evaluation.md) |
 | 009 | 规划过程的运行时可见性 | 已实现 | [009-runtime-planning-visibility.md](009-runtime-planning-visibility.md) |
 | 010 | 事件驱动家庭自动化 | 已实现 | [010-event-driven-automation.md](010-event-driven-automation.md) |
+| 011 | 工程收口：单一能力数据源、显式依赖注入与统一可观测性 | 已实现 | [011-engineering-hardening.md](011-engineering-hardening.md) |
