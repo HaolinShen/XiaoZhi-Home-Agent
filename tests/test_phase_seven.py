@@ -21,7 +21,6 @@ from src.agent.planning import (
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.memory.store import close_checkpointer
-from src.tools import set_registry
 
 
 class StructuredPlanner:
@@ -83,7 +82,6 @@ class PhaseSevenPlannerExecutorVerifierTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.registry = DeviceRegistry(SimulatorBackend())
-        set_registry(self.registry)
         self.directory = SpaceDirectory.from_registry(self.registry, "home-a")
         self.context = AgentContext(
             home_id="home-a",
@@ -141,9 +139,9 @@ class PhaseSevenPlannerExecutorVerifierTests(unittest.TestCase):
     def test_planning_literal_and_derived_views_match_the_action_specs(self):
         """PlanStep.tool_name 的 Literal 必须和 DEVICE_ACTION_SPECS 的键集相等。
 
-        Literal 只能手写（structured output 靠它生成 JSON Schema 的 enum，无法从 dict
-        派生），所以新增设备时它是最容易漏的一处。漏加的表现是 Planner 明明该用新工具
-        却被 pydantic 拒掉，这里让它在测试阶段就失败。
+        P0 改造后 Literal 用 Literal[tuple(PLANNING_TOOL_NAMES)] 从能力声明派生，
+        不再手写；这个用例退化为"派生链路的最终防线"——能力声明、规划词表、
+        Literal 三者的键集必须一致，漏任何一环都在测试阶段失败而不是运行期静默。
         """
         from typing import get_args
 
@@ -172,17 +170,19 @@ class PhaseSevenPlannerExecutorVerifierTests(unittest.TestCase):
                     self.assertTrue(expected, f"{tool_name}/{action} 没有给出任何期望状态")
 
     def test_action_specs_match_what_the_tools_actually_accept(self):
-        """声明的 action 集合必须和工具实现的 if/elif 双向一致。
+        """声明的 action 集合必须和工具实现双向一致。
 
-        工具实现那份枚举带各自的副作用文本与前置检查，没法从声明派生，是三处副本里
-        唯一剩下的手写副本。这里靠"调用真实工具、看它是否回『不支持的操作』"来反射，
-        双向钉住：声明里有的工具必须认，工具不认的声明里也不能有。
-        以前只对得上"喂 Planner 的词表 ↔ expected_state_for_step"，工具实现漏改
-        不会被任何用例发现。
+        P0 改造后工具实现直接从同一份能力声明生成，理论上不会漂移；这个用例
+        退化成运行时反射的双向钉住：声明里有的工具必须认，工具不认的声明里
+        也不能有。以前只有"喂 Planner 的词表 ↔ expected_state_for_step"对得上，
+        工具实现的 if/elif 副本漏改不会被任何用例发现。
         """
-        from src.tools import get_all_tools
+        from src.tools import build_device_tools
 
-        tools_by_name = {tool.name: tool for tool in get_all_tools()}
+        tools_by_name = {
+            tool.name: tool
+            for tool in build_device_tools(self.registry, enable_preference_tracking=False)
+        }
         rejection_marker = "不支持的操作"
 
         for tool_name, spec in DEVICE_ACTION_SPECS.items():

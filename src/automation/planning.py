@@ -11,17 +11,9 @@ from ..agent.planning import PLANNING_TOOL_NAMES, expected_state_for_step
 from ..devices.base import DeviceRegistry
 
 
-AutomationToolName = Literal[
-    "control_light",
-    "control_ac",
-    "control_tv",
-    "control_curtain",
-    "control_humidifier",
-    "control_water_heater",
-    "control_lock",
-    "control_kettle",
-    "set_alarm",
-]
+# 自动化允许的工具名 = 规划控制工具 + 闹钟（P0：从 PLANNING_TOOL_NAMES 派生，
+# 以前这里手抄一份 control_xxx 清单，是第 11 处需要同步的副本）。
+AutomationToolName = Literal[tuple((*PLANNING_TOOL_NAMES, "set_alarm"))]  # type: ignore[valid-type]
 
 
 # Defaults are planning guidance, not hidden execution rules. The Automation

@@ -23,6 +23,12 @@ MCP 是 Anthropic 推出的开放协议，用于标准化 AI 应用与外部工�
 参考:
   - MCP 规范: https://modelcontextprotocol.io/
   - Python SDK: https://github.com/modelcontextprotocol/python-sdk
+
+P0 改造: 本文件以前把 8 个 control_xxx 的 if/elif 副作用**又抄了一遍**
+（第 10 处副本），设备行为在 MCP 与图里会悄悄漂移。现在 MCP 工具只是
+工厂构建出的 LangChain 工具的薄包装：入参 Schema 一致，副作用全部复用
+能力声明里的同一份实现。MCP 调用方没有可信身份，因此构造时显式关闭
+偏好观察（enable_preference_tracking=False）。
 """
 
 import sys
@@ -30,7 +36,6 @@ import asyncio
 from typing import Optional
 from loguru import logger
 
-from ..models import DeviceType
 from ..devices.base import DeviceRegistry
 from ..devices.simulator import SimulatorBackend
 
@@ -54,8 +59,8 @@ def create_mcp_server(
       配置好的 FastMCP 服务器实例，包含所有智能家居工具
 
     工作原理:
-      1. 将每个 LangChain @tool 函数包装为 MCP tool
-      2. MCP 客户端（如 Claude Desktop）可以发现并调用这些工具
+      1. 用 build_all_tools 构建与图内**同一份实现**的工具（无偏好观察）
+      2. 每个 MCP 工具是它的薄包装：保持对外签名与 docstring 不变
       3. 工具调用结果通过 MCP 协议返回给客户端
 
     使用示例:
@@ -65,10 +70,18 @@ def create_mcp_server(
     """
     from mcp.server import FastMCP  # type: ignore[import-untyped]
 
+    from ..tools import build_all_tools
+
     # 如果没有传入注册中心，自动创建
     if registry is None:
         backend = SimulatorBackend()
         registry = DeviceRegistry(backend)
+
+    # 只取控制/查询/场景工具；MCP 调用方无可信身份，显式关闭偏好观察。
+    built = {
+        tool.name: tool
+        for tool in build_all_tools(registry, enable_preference_tracking=False)
+    }
 
     mcp = FastMCP(server_name)
 
@@ -92,21 +105,10 @@ def create_mcp_server(
         :param brightness: 亮度 0-100
         :param color: 色温描述，如"暖白"、"白光"
         """
-        device = registry.find(device_name, DeviceType.LIGHT)
-        if device is None:
-            return f"❌ 找不到灯光设备「{device_name}」"
-
-        if action == "on":
-            registry.update(device.device_id, power=True)
-        elif action == "off":
-            registry.update(device.device_id, power=False)
-        elif action == "set_brightness":
-            registry.update(device.device_id, brightness=max(0, min(100, brightness)), power=True)
-        elif action == "set_color":
-            registry.update(device.device_id, color=color, power=True)
-        else:
-            return f"❌ 不支持的操作: {action}"
-        return f"✅ {device.name}操作成功"
+        return built["control_light"].invoke({
+            "device_name": device_name, "action": action,
+            "brightness": brightness, "color": color,
+        })
 
     @mcp.tool()
     async def control_ac_mcp(
@@ -124,22 +126,10 @@ def create_mcp_server(
         :param mode: 模式: cool(制冷), heat(制热), fan(送风), dry(除湿)
         :param fan_speed: 风速: auto, low, mid, high
         """
-        device = registry.find(device_name, DeviceType.AC)
-        if device is None:
-            return f"❌ 找不到空调设备「{device_name}」"
-
-        mapping = {
-            "on": lambda: registry.update(device.device_id, power=True, temperature=temperature, mode=mode, fan_speed=fan_speed),
-            "off": lambda: registry.update(device.device_id, power=False),
-            "set_temp": lambda: registry.update(device.device_id, temperature=max(16, min(30, temperature)), power=True),
-            "set_mode": lambda: registry.update(device.device_id, mode=mode if mode in ("cool","heat","fan","dry") else "cool", power=True),
-            "set_fan": lambda: registry.update(device.device_id, fan_speed=fan_speed if fan_speed in ("auto","low","mid","high") else "auto"),
-        }
-        fn = mapping.get(action)
-        if fn is None:
-            return f"❌ 不支持的操作: {action}"
-        fn()
-        return f"✅ {device.name}操作成功"
+        return built["control_ac"].invoke({
+            "device_name": device_name, "action": action,
+            "temperature": temperature, "mode": mode, "fan_speed": fan_speed,
+        })
 
     @mcp.tool()
     async def control_tv_mcp(
@@ -155,23 +145,10 @@ def create_mcp_server(
         :param volume: 音量 0-100
         :param channel: 输入源名称
         """
-        device = registry.find(device_name, DeviceType.TV)
-        if device is None:
-            return f"❌ 找不到电视设备「{device_name}」"
-
-        if action == "on":
-            registry.update(device.device_id, power=True)
-        elif action == "off":
-            registry.update(device.device_id, power=False)
-        elif action == "set_volume":
-            registry.update(device.device_id, volume=max(0, min(100, volume)))
-        elif action == "mute":
-            registry.update(device.device_id, muted=not device.muted)
-        elif action == "set_channel":
-            registry.update(device.device_id, channel=channel, power=True)
-        else:
-            return f"❌ 不支持的操作: {action}"
-        return f"✅ {device.name}操作成功"
+        return built["control_tv"].invoke({
+            "device_name": device_name, "action": action,
+            "volume": volume, "channel": channel,
+        })
 
     @mcp.tool()
     async def control_curtain_mcp(
@@ -185,19 +162,9 @@ def create_mcp_server(
         :param action: 操作: open, close, set_position
         :param percentage: 开合度 0-100
         """
-        device = registry.find(device_name, DeviceType.CURTAIN)
-        if device is None:
-            return f"❌ 找不到窗帘设备「{device_name}」"
-
-        if action == "open":
-            registry.update(device.device_id, position=100)
-        elif action == "close":
-            registry.update(device.device_id, position=0)
-        elif action == "set_position":
-            registry.update(device.device_id, position=max(0, min(100, percentage)))
-        else:
-            return f"❌ 不支持的操作: {action}"
-        return f"✅ {device.name}操作成功"
+        return built["control_curtain"].invoke({
+            "device_name": device_name, "action": action, "percentage": percentage,
+        })
 
     @mcp.tool()
     async def control_humidifier_mcp(
@@ -213,30 +180,10 @@ def create_mcp_server(
         :param target_humidity: 目标湿度 30-80%
         :param mist_level: auto, low, mid, high
         """
-        device = registry.find(device_name, DeviceType.HUMIDIFIER)
-        if device is None:
-            return f"❌ 找不到加湿器设备「{device_name}」"
-
-        if action in {"on", "set_humidity", "set_mist_level"} and device.water_level <= 0:
-            return f"❌ {device.name}水箱已空，请加水后再开启。"
-
-        if action == "on":
-            registry.update(device.device_id, power=True)
-        elif action == "off":
-            registry.update(device.device_id, power=False)
-        elif action == "set_humidity":
-            registry.update(
-                device.device_id,
-                target_humidity=max(30, min(80, target_humidity)),
-                power=True,
-            )
-        elif action == "set_mist_level":
-            if mist_level not in {"auto", "low", "mid", "high"}:
-                return f"❌ 无效的雾量档位: {mist_level}"
-            registry.update(device.device_id, mist_level=mist_level, power=True)
-        else:
-            return f"❌ 不支持的操作: {action}"
-        return f"✅ {device.name}操作成功"
+        return built["control_humidifier"].invoke({
+            "device_name": device_name, "action": action,
+            "target_humidity": target_humidity, "mist_level": mist_level,
+        })
 
     @mcp.tool()
     async def control_water_heater_mcp(
@@ -250,23 +197,9 @@ def create_mcp_server(
         :param action: on, off, set_temp
         :param target_temp: 目标水温 35-75°C
         """
-        device = registry.find(device_name, DeviceType.WATER_HEATER)
-        if device is None:
-            return f"❌ 找不到电热水器设备「{device_name}」"
-
-        if action == "on":
-            registry.update(device.device_id, power=True)
-        elif action == "off":
-            registry.update(device.device_id, power=False)
-        elif action == "set_temp":
-            registry.update(
-                device.device_id,
-                target_temp=max(35, min(75, target_temp)),
-                power=True,
-            )
-        else:
-            return f"❌ 不支持的操作: {action}"
-        return f"✅ {device.name}操作成功"
+        return built["control_water_heater"].invoke({
+            "device_name": device_name, "action": action, "target_temp": target_temp,
+        })
 
     @mcp.tool()
     async def control_lock_mcp(device_name: str, action: str) -> str:
@@ -275,19 +208,9 @@ def create_mcp_server(
         :param device_name: 设备名称，如“玄关门锁”
         :param action: lock(上锁), unlock(解锁)
         """
-        device = registry.find(device_name, DeviceType.LOCK)
-        if device is None:
-            return f"❌ 找不到门锁设备「{device_name}」"
-        if not device.power:
-            return f"❌ {device.name}离线，无法操作"
-
-        if action == "lock":
-            registry.update(device.device_id, locked=True)
-        elif action == "unlock":
-            registry.update(device.device_id, locked=False)
-        else:
-            return f"❌ 不支持的操作: {action}"
-        return f"✅ {device.name}操作成功"
+        return built["control_lock"].invoke({
+            "device_name": device_name, "action": action,
+        })
 
     @mcp.tool()
     async def control_kettle_mcp(
@@ -301,25 +224,9 @@ def create_mcp_server(
         :param action: on, off, set_temp, boil
         :param target_temp: 目标水温 40-100°C
         """
-        device = registry.find(device_name, DeviceType.KETTLE)
-        if device is None:
-            return f"❌ 找不到电热水壶设备「{device_name}」"
-
-        if action == "boil":
-            registry.update(device.device_id, power=True, target_temp=100)
-        elif action == "on":
-            registry.update(device.device_id, power=True)
-        elif action == "off":
-            registry.update(device.device_id, power=False)
-        elif action == "set_temp":
-            registry.update(
-                device.device_id,
-                target_temp=max(40, min(100, target_temp)),
-                power=True,
-            )
-        else:
-            return f"❌ 不支持的操作: {action}"
-        return f"✅ {device.name}操作成功"
+        return built["control_kettle"].invoke({
+            "device_name": device_name, "action": action, "target_temp": target_temp,
+        })
 
     @mcp.tool()
     async def read_sensor_mcp(sensor_type: str, location: str = "") -> str:
@@ -328,32 +235,14 @@ def create_mcp_server(
         :param sensor_type: temp_humidity(温湿度) 或 presence(人体存在)
         :param location: 可选房间名，如“客厅”“玄关”。留空返回全部
         """
-        type_map = {
-            "temp_humidity": DeviceType.TEMP_HUMIDITY_SENSOR,
-            "presence": DeviceType.PRESENCE_SENSOR,
-        }
-        device_type = type_map.get(sensor_type)
-        if device_type is None:
-            return f"❌ 不支持的传感器类型: {sensor_type}"
-
-        # 读取前推演一次，让读数反映执行器当前状态。
-        registry.tick_environment()
-
-        sensors = registry.get_by_type(device_type)
-        wanted = location.strip()
-        if wanted:
-            sensors = {
-                dev_id: dev for dev_id, dev in sensors.items()
-                if wanted in dev.location or wanted in dev.name
-            }
-        if not sensors:
-            return f"❌ 找不到{device_type.label_cn}"
-        return "\n".join(dev.to_status_text() for dev in sensors.values())
+        return built["read_sensor"].invoke({
+            "sensor_type": sensor_type, "location": location,
+        })
 
     @mcp.tool()
     async def get_device_status_mcp() -> str:
         """查询所有智能家居设备的当前状态"""
-        return registry.get_status_summary()
+        return built["get_device_status"].invoke({})
 
     @mcp.tool()
     async def activate_scene_mcp(scene_name: str) -> str:
@@ -361,9 +250,7 @@ def create_mcp_server(
 
         :param scene_name: 场景名称
         """
-        # 复用 scenes 模块的逻辑
-        from ..tools.scenes import activate_scene as scene_fn
-        return scene_fn.invoke({"name": "activate_scene", "arguments": {"scene_name": scene_name}})
+        return built["activate_scene"].invoke({"scene_name": scene_name})
 
     logger.info(f"MCP 服务器已创建 | name={server_name} | 工具数=11")
     return mcp

@@ -25,15 +25,7 @@ from src.automation.vehicle import ArrivalOrchestrator, VehicleEvent, VehicleSim
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.memory import MemoryRepository, MemoryService
-from src.tools import (
-    control_light,
-    create_scheduled_routine,
-    list_automation_routines,
-    schedule_wake_routine,
-    set_automation_runtime,
-    set_memory_service,
-    set_registry,
-)
+from src.tools import build_automation_tools, build_device_tools
 
 
 UTC = timezone.utc
@@ -49,7 +41,6 @@ class AutomationRoutineTests(unittest.TestCase):
         # 在 setUp 最先注册就能保证它最后执行。
         self.addCleanup(self.temp_dir.cleanup)
         self.registry = DeviceRegistry(SimulatorBackend())
-        set_registry(self.registry)
         self.store = AutomationStore(str(Path(self.temp_dir.name) / "automation.db"))
         self.speaker = SimulatorSpeakerBackend()
         self.events = []
@@ -60,9 +51,13 @@ class AutomationRoutineTests(unittest.TestCase):
         )
 
     def tearDown(self):
-        set_automation_runtime(None)
         self.scheduler.stop()
         self.store.close()
+
+    @staticmethod
+    def automation_tools(runtime):
+        """P1: 自动化工具由工厂显式构建（闭包持有 runtime，无模块级单例）。"""
+        return {tool.name: tool for tool in build_automation_tools(runtime)}
 
     def test_wake_routine_arms_alarm_and_executes_relative_actions(self):
         wake_at = datetime(2026, 8, 16, 6, 0, tzinfo=UTC)
@@ -100,15 +95,18 @@ class AutomationRoutineTests(unittest.TestCase):
         写偏好的分支都有一道 `if config is not None` 守卫，看着像在防这种无身份调用，
         实际恒为真、一个字都拦不住，`_context()` 的下标访问照样抛错，把热水器、烧水壶
         和灯光全判成 failed。窗帘的 `open` 分支不记录偏好，所以当时唯独它成功 ——
-        这个"只有一个动作活下来"的形态就是本 bug 的指纹。守卫已经删除，身份校验收敛
-        到 `record_preference_operation()` 内部，本用例钉住那里的行为。
+        这个"只有一个动作活下来"的形态就是本 bug 的指纹。
 
-        上面那个起床测试没能抓到，是因为它从不调用 `set_memory_service`，
-        `_service is None` 直接提前返回，绕过了出错的那一行。
+        P1 根因修复后：执行器在**构造期**显式关闭偏好观察
+        （build_device_tools(..., enable_preference_tracking=False)），
+        "无身份"不再是调用期靠逐键检查去猜的情况；而图路径的工具开启偏好观察，
+        缺身份会直接 raise 而不是静默吞掉。本用例钉住两侧的行为。
+
+        上面那个起床测试没能抓到，是因为它从不给设备工具注入记忆服务，
+        记录器在构造期就是 no-op，绕过了出错的那一行。
         """
         repository = MemoryRepository(str(Path(self.temp_dir.name) / "memory.db"))
         self.addCleanup(repository.close)
-        self.addCleanup(set_memory_service, None)
         service = MemoryService(
             repository,
             SpaceDirectory.from_registry(self.registry, "home-a"),
@@ -121,7 +119,11 @@ class AutomationRoutineTests(unittest.TestCase):
             return real_record(context, memory_key, memory_value, **kwargs)
 
         service.record_operation = counting_record
-        set_memory_service(service)
+        # 图路径语义：偏好观察开启，身份来自 RunnableConfig。
+        device_tools = {
+            tool.name: tool
+            for tool in build_device_tools(self.registry, service)
+        }
 
         wake_at = datetime(2026, 8, 16, 6, 0, tzinfo=UTC)
         routine = self.store.save_routine(build_wake_routine("home-a", "user-a"))
@@ -149,7 +151,7 @@ class AutomationRoutineTests(unittest.TestCase):
 
         # 但同一个工具走正常对话路径（带可信身份）时必须照常记录，
         # 否则这个修复就退化成"把偏好学习关掉了"。
-        control_light.invoke(
+        device_tools["control_light"].invoke(
             {"device_name": "卧室灯", "action": "set_brightness", "brightness": 70},
             config={"configurable": {
                 "home_id": "home-a", "user_id": "user-a",
@@ -331,7 +333,7 @@ class AutomationRoutineTests(unittest.TestCase):
             db_path=str(Path(self.temp_dir.name) / "list-automation.db"),
             speaker=SimulatorSpeakerBackend(),
         )
-        set_automation_runtime(runtime)
+        tools = self.automation_tools(runtime)
         trusted = {"configurable": {"home_id": "home-a", "user_id": "user-a"}}
         try:
             # 用相对时间，避免硬编码日期在未来某天变成"目标时间早于当前时间"。
@@ -365,7 +367,7 @@ class AutomationRoutineTests(unittest.TestCase):
                 ],
             )
 
-            payload = json.loads(list_automation_routines.invoke({}, config=trusted))
+            payload = json.loads(tools["list_automation_routines"].invoke({}, config=trusted))
             self.assertEqual(len(payload), 1)
             entry = payload[0]
             self.assertEqual(entry["name"], "下午5点回家准备")
@@ -385,7 +387,7 @@ class AutomationRoutineTests(unittest.TestCase):
 
             # 到期执行后，明细里要能看到已完成状态和实际执行时间。
             runtime.scheduler.tick(anchor - timedelta(minutes=29))
-            refreshed = json.loads(list_automation_routines.invoke({}, config=trusted))
+            refreshed = json.loads(tools["list_automation_routines"].invoke({}, config=trusted))
             done, pending = refreshed[0]["actions"]
             self.assertEqual(done["status"], "已完成")
             self.assertIsNotNone(done["executed_at"])
@@ -400,7 +402,7 @@ class AutomationRoutineTests(unittest.TestCase):
             db_path=str(Path(self.temp_dir.name) / "list-alarm.db"),
             speaker=SimulatorSpeakerBackend(),
         )
-        set_automation_runtime(runtime)
+        tools = self.automation_tools(runtime)
         trusted = {"configurable": {"home_id": "home-a", "user_id": "user-a"}}
         try:
             runtime.schedule_wake(
@@ -408,7 +410,7 @@ class AutomationRoutineTests(unittest.TestCase):
             )
             runtime.enable_vehicle_arrival("home-a", "user-a", "car-1")
 
-            payload = json.loads(list_automation_routines.invoke({}, config=trusted))
+            payload = json.loads(tools["list_automation_routines"].invoke({}, config=trusted))
             by_name = {item["name"]: item for item in payload}
             self.assertEqual(set(by_name), {"起床准备", "车辆回家准备"})
 
@@ -448,9 +450,9 @@ class AutomationRoutineTests(unittest.TestCase):
             db_path=str(Path(self.temp_dir.name) / "generic-plan.db"),
             speaker=SimulatorSpeakerBackend(),
         )
-        set_automation_runtime(runtime)
+        tools = self.automation_tools(runtime)
         try:
-            result = create_scheduled_routine.invoke(
+            result = tools["create_scheduled_routine"].invoke(
                 {
                     "name": "打球回家准备",
                     "anchor_at_iso": anchor_at.isoformat(),
@@ -505,9 +507,9 @@ class AutomationRoutineTests(unittest.TestCase):
             db_path=str(Path(self.temp_dir.name) / "model-style-plan.db"),
             speaker=SimulatorSpeakerBackend(),
         )
-        set_automation_runtime(runtime)
+        tools = self.automation_tools(runtime)
         try:
-            result = create_scheduled_routine.invoke(
+            result = tools["create_scheduled_routine"].invoke(
                 {
                     "name": "下午5点回家准备",
                     "anchor_at_iso": anchor_at.isoformat(),
@@ -598,9 +600,9 @@ class AutomationRoutineTests(unittest.TestCase):
             db_path=str(Path(self.temp_dir.name) / "string-actions.db"),
             speaker=SimulatorSpeakerBackend(),
         )
-        set_automation_runtime(runtime)
+        tools = self.automation_tools(runtime)
         try:
-            result = create_scheduled_routine.invoke(
+            result = tools["create_scheduled_routine"].invoke(
                 {
                     "name": "字符串动作计划",
                     "anchor_at_iso": (datetime.now(UTC) + timedelta(hours=4)).isoformat(),
@@ -620,7 +622,6 @@ class AutomationRoutineTests(unittest.TestCase):
             db_path=str(Path(self.temp_dir.name) / "graph-generic.db"),
             speaker=SimulatorSpeakerBackend(),
         )
-        set_automation_runtime(runtime)
 
         class BoundAutomationAgent:
             def __init__(self, tool_names):
@@ -701,10 +702,12 @@ class AutomationRoutineTests(unittest.TestCase):
         )
         try:
             with patch("src.agent.graph.build_llm", return_value=AutomationFakeLLM()):
+                # P1: 自动化运行时经构造参数显式注入图，取代模块级单例。
                 graph = build_graph(
                     self.registry,
                     settings,
                     SpaceDirectory.from_registry(self.registry, "home-a"),
+                    automation_runtime=runtime,
                 )
             interrupted = graph.invoke(
                 {
@@ -741,7 +744,7 @@ class AutomationRoutineTests(unittest.TestCase):
             db_path=str(Path(self.temp_dir.name) / "tool-automation.db"),
             speaker=SimulatorSpeakerBackend(),
         )
-        set_automation_runtime(runtime)
+        tools = self.automation_tools(runtime)
         # 这里必须用相对时间：schedule_wake 会拒绝早于当前时间的目标，原先硬编码的
         # 2026-08-16 在该日过去后就让本用例永久失败。保留"带时区的 ISO 8601 + 早上
         # 6 点"这个真实入参形态（工具 docstring 要求的格式），只把日期取成次日。
@@ -750,7 +753,7 @@ class AutomationRoutineTests(unittest.TestCase):
             hour=6, minute=0, second=0, microsecond=0
         )
         try:
-            result = schedule_wake_routine.invoke(
+            result = tools["schedule_wake_routine"].invoke(
                 {"wake_at_iso": wake_at.isoformat()},
                 config={"configurable": {"home_id": "home-a", "user_id": "user-a"}},
             )

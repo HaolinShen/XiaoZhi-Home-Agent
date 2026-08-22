@@ -6,10 +6,10 @@
 场景设计原则:
   - 每个场景控制 3-6 个设备，提供完整的场景体验
   - 场景之间互不冲突（激活新场景会覆盖旧场景的设置）
-  - 新增场景只需在 activate_scene 中添加一个 elif 分支
-  - 只操作执行器，绝不碰只读传感器。下面按 DeviceType 逐一匹配而不是
-    "把所有设备都关掉"，正是为了让温湿度、人体传感器天然被排除在外——
-    "离家模式"不该把温湿度计也关了。
+  - 只操作执行器，绝不碰只读传感器。批量关闭按 `devices/capabilities.py`
+    的 scene_exit 分组派生（P0）：新增设备类型时，只要声明了 scene_exit，
+    "离家/睡眠"模式就会自动处理它，不用再手改这里的类型清单——
+    "离家模式"也因此永远不会把温湿度计关了。
 
 当前场景:
   - 回家模式: 开客厅灯 + 客厅空调 + 开窗帘
@@ -17,29 +17,25 @@
   - 睡眠模式: 关灯关电视 + 卧室空调低风速 + 关窗帘
   - 观影模式: 氛围灯光 + 开电视 + 关窗帘
   - 起床模式: 开卧室窗帘 + 关空调 + 渐亮灯光
+
+P1 改造: `build_scene_tools(registry)` 工厂以闭包持有 registry，
+不再经过模块级单例。
 """
 
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool
 from loguru import logger
 
 from ..models import DeviceType
 from ..devices.base import DeviceRegistry
+from ..devices.capabilities import SCENE_EXIT_TYPES
 
-# 全局注册中心（由 tools/devices.py 的 set_registry 设置）
-_registry: DeviceRegistry = None  # type: ignore[assignment]
+# 离家/睡眠批量操作按 scene_exit 分组的类型集合（从能力声明派生，禁止手写）。
+_POWER_OFF_ON_EXIT = SCENE_EXIT_TYPES["power_off"]
+_CURTAINS_ON_EXIT = SCENE_EXIT_TYPES["curtain_close"]
+_LOCKS_ON_EXIT = SCENE_EXIT_TYPES["lock"]
 
-
-def set_registry(registry: DeviceRegistry) -> None:
-    """注入设备注册中心（与 tools/devices.py 保持一致的接口）"""
-    global _registry
-    _registry = registry
-
-
-def _r() -> DeviceRegistry:
-    """获取注册中心"""
-    if _registry is None:
-        raise RuntimeError("DeviceRegistry 尚未注入")
-    return _registry
+# 睡眠模式只关灯/电视/加湿器和窗帘：空调单独设置，热水器/烧水壶睡眠时不强制关。
+_SLEEP_POWER_OFF = frozenset({DeviceType.LIGHT, DeviceType.TV, DeviceType.HUMIDIFIER})
 
 
 # ============================================================
@@ -71,165 +67,180 @@ SCENE_META = {
 }
 
 
-@tool
-def activate_scene(scene_name: str) -> str:
-    """
-    激活智能场景模式。一键设置多个设备到预设状态。
+def _activate_scene(registry: DeviceRegistry) -> str:
 
-    可用的场景模式:
-      🏠 回家模式 — 打开客厅灯和空调，打开窗帘
-      👋 离家模式 — 关闭所有电器，关窗帘（安全节能）
-      🌙 睡眠模式 — 关灯关电视，卧室空调低风速，关窗帘
-      🎬 观影模式 — 氛围灯光，开电视，关窗帘
-      🌅 起床模式 — 开窗帘，关空调，开卧室灯
+    def activate_scene(scene_name: str) -> str:
+        """
+        激活智能场景模式。一键设置多个设备到预设状态。
 
-    何时使用:
-      - 用户说"我回来了"、"到家了" → 推荐回家模式
-      - 用户说"我要出门了"、"走了" → 推荐离家模式
-      - 用户说"我要睡了"、"困了" → 推荐睡眠模式
-      - 用户说"我要看电影"、"看剧" → 推荐观影模式
-      - 用户说"早上好"、"起床了" → 推荐起床模式
+        可用的场景模式:
+          🏠 回家模式 — 打开客厅灯和空调，打开窗帘
+          👋 离家模式 — 关闭所有电器，关窗帘（安全节能）
+          🌙 睡眠模式 — 关灯关电视，卧室空调低风速，关窗帘
+          🎬 观影模式 — 氛围灯光，开电视，关窗帘
+          🌅 起床模式 — 开窗帘，关空调，开卧室灯
 
-    参数:
-        scene_name: 场景名称，如"回家模式"、"睡眠模式"等
+        何时使用:
+          - 用户说"我回来了"、"到家了" → 推荐回家模式
+          - 用户说"我要出门了"、"走了" → 推荐离家模式
+          - 用户说"我要睡了"、"困了" → 推荐睡眠模式
+          - 用户说"我要看电影"、"看剧" → 推荐观影模式
+          - 用户说"早上好"、"起床了" → 推荐起床模式
 
-    返回:
-        场景执行结果的文本描述。
-    """
-    registry = _r()
-    logger.info(f"激活场景: {scene_name}")
+        参数:
+            scene_name: 场景名称，如"回家模式"、"睡眠模式"等
 
-    results: list[str] = []
+        返回:
+            场景执行结果的文本描述。
+        """
+        logger.info(f"激活场景: {scene_name}")
 
-    # ========================================
-    # 🏠 回家模式
-    # ========================================
-    if scene_name == "回家模式":
-        registry.update("living_room_light", power=True, brightness=80, color="暖白")
-        registry.update("living_room_ac", power=True, temperature=26, mode="cool")
-        registry.update("living_room_curtain", position=100)
-        results = [
-            "✅ 已激活「🏠 回家模式」",
-            "  · 客厅灯已打开（亮度 80%，暖白）",
-            "  · 客厅空调已开启（制冷 26°C）",
-            "  · 客厅窗帘已完全打开",
-            "🏠 欢迎回家！",
-        ]
+        results: list[str] = []
 
-    # ========================================
-    # 👋 离家模式
-    # ========================================
-    elif scene_name == "离家模式":
-        all_devices = registry.get_all()
-        for dev_id, dev in all_devices.items():
-            if dev.device_type in (
-                DeviceType.LIGHT,
-                DeviceType.AC,
-                DeviceType.TV,
-                DeviceType.HUMIDIFIER,
-                DeviceType.WATER_HEATER,
-                DeviceType.KETTLE,
-            ):
-                registry.update(dev_id, power=False)
-            elif dev.device_type == DeviceType.CURTAIN:
-                registry.update(dev_id, position=0)
-        # 门锁单独处理：离家要"上锁"而不是"关闭"（power 表示在线，必须保持）。
-        for dev_id, dev in all_devices.items():
-            if dev.device_type == DeviceType.LOCK:
-                registry.update(dev_id, locked=True)
-        results = [
-            "✅ 已激活「👋 离家模式」",
-            "  · 所有灯光、空调、电视、加湿器、热水器和烧水壶已关闭",
-            "  · 所有窗帘已关闭",
-            "  · 所有门锁已上锁",
-            "👋 再见，所有设备已安全关闭！",
-        ]
+        # ========================================
+        # 🏠 回家模式
+        # ========================================
+        if scene_name == "回家模式":
+            registry.update("living_room_light", power=True, brightness=80, color="暖白")
+            registry.update("living_room_ac", power=True, temperature=26, mode="cool")
+            registry.update("living_room_curtain", position=100)
+            results = [
+                "✅ 已激活「🏠 回家模式」",
+                "  · 客厅灯已打开（亮度 80%，暖白）",
+                "  · 客厅空调已开启（制冷 26°C）",
+                "  · 客厅窗帘已完全打开",
+                "🏠 欢迎回家！",
+            ]
 
-    # ========================================
-    # 🌙 睡眠模式
-    # ========================================
-    elif scene_name == "睡眠模式":
-        all_devices = registry.get_all()
-        for dev_id, dev in all_devices.items():
-            if dev.device_type == DeviceType.LIGHT:
-                registry.update(dev_id, power=False)
-            elif dev.device_type == DeviceType.TV:
-                registry.update(dev_id, power=False)
-            elif dev.device_type == DeviceType.HUMIDIFIER:
-                registry.update(dev_id, power=False)
-            elif dev.device_type == DeviceType.CURTAIN:
-                registry.update(dev_id, position=0)
-        # 卧室空调特殊设置
-        registry.update("bedroom_ac", power=True, temperature=26, mode="cool", fan_speed="low")
-        registry.update("living_room_ac", power=False)
-        results = [
-            "✅ 已激活「🌙 睡眠模式」",
-            "  · 所有灯光、电视和加湿器已关闭",
-            "  · 所有窗帘已关闭",
-            "  · 卧室空调已设为 26°C 低风速制冷",
-            "  · 客厅空调已关闭",
-            "🌙 晚安，好梦！",
-        ]
+        # ========================================
+        # 👋 离家模式
+        # ========================================
+        elif scene_name == "离家模式":
+            all_devices = registry.get_all()
+            for dev_id, dev in all_devices.items():
+                if dev.device_type in _POWER_OFF_ON_EXIT:
+                    registry.update(dev_id, power=False)
+                elif dev.device_type in _CURTAINS_ON_EXIT:
+                    registry.update(dev_id, position=0)
+            # 门锁单独处理：离家要"上锁"而不是"关闭"（power 表示在线，必须保持）。
+            for dev_id, dev in all_devices.items():
+                if dev.device_type in _LOCKS_ON_EXIT:
+                    registry.update(dev_id, locked=True)
+            results = [
+                "✅ 已激活「👋 离家模式」",
+                "  · 所有灯光、空调、电视、加湿器、热水器和烧水壶已关闭",
+                "  · 所有窗帘已关闭",
+                "  · 所有门锁已上锁",
+                "👋 再见，所有设备已安全关闭！",
+            ]
 
-    # ========================================
-    # 🎬 观影模式
-    # ========================================
-    elif scene_name == "观影模式":
-        registry.update("living_room_light", power=True, brightness=10, color="暖黄")
-        registry.update("bedroom_light", power=False)
-        registry.update("kitchen_light", power=False)
-        registry.update("living_room_tv", power=True)
-        registry.update("living_room_curtain", position=0)
-        registry.update("bedroom_curtain", position=0)
-        registry.update("living_room_ac", power=True, temperature=25, mode="cool", fan_speed="low")
-        results = [
-            "✅ 已激活「🎬 观影模式」",
-            "  · 客厅灯已调暗至 10%（氛围光）",
-            "  · 其他灯光已关闭",
-            "  · 客厅电视已打开",
-            "  · 所有窗帘已关闭",
-            "  · 客厅空调已设为 25°C 低风速",
-            "🎬 享受你的观影时光！",
-        ]
+        # ========================================
+        # 🌙 睡眠模式
+        # ========================================
+        elif scene_name == "睡眠模式":
+            all_devices = registry.get_all()
+            for dev_id, dev in all_devices.items():
+                if dev.device_type in _SLEEP_POWER_OFF:
+                    registry.update(dev_id, power=False)
+                elif dev.device_type in _CURTAINS_ON_EXIT:
+                    registry.update(dev_id, position=0)
+            # 卧室空调特殊设置
+            registry.update("bedroom_ac", power=True, temperature=26, mode="cool", fan_speed="low")
+            registry.update("living_room_ac", power=False)
+            results = [
+                "✅ 已激活「🌙 睡眠模式」",
+                "  · 所有灯光、电视和加湿器已关闭",
+                "  · 所有窗帘已关闭",
+                "  · 卧室空调已设为 26°C 低风速制冷",
+                "  · 客厅空调已关闭",
+                "🌙 晚安，好梦！",
+            ]
 
-    # ========================================
-    # 🌅 起床模式
-    # ========================================
-    elif scene_name == "起床模式":
-        registry.update("bedroom_curtain", position=100)
-        registry.update("bedroom_ac", power=False)
-        registry.update("bedroom_light", power=True, brightness=50, color="暖白")
-        results = [
-            "✅ 已激活「🌅 起床模式」",
-            "  · 卧室窗帘已完全打开，阳光洒进来",
-            "  · 卧室空调已关闭",
-            "  · 卧室灯已打开（亮度 50%，暖白）",
-            "🌅 早上好，新的一天开始了！",
-        ]
+        # ========================================
+        # 🎬 观影模式
+        # ========================================
+        elif scene_name == "观影模式":
+            registry.update("living_room_light", power=True, brightness=10, color="暖黄")
+            registry.update("bedroom_light", power=False)
+            registry.update("kitchen_light", power=False)
+            registry.update("living_room_tv", power=True)
+            registry.update("living_room_curtain", position=0)
+            registry.update("bedroom_curtain", position=0)
+            registry.update("living_room_ac", power=True, temperature=25, mode="cool", fan_speed="low")
+            results = [
+                "✅ 已激活「🎬 观影模式」",
+                "  · 客厅灯已调暗至 10%（氛围光）",
+                "  · 其他灯光已关闭",
+                "  · 客厅电视已打开",
+                "  · 所有窗帘已关闭",
+                "  · 客厅空调已设为 25°C 低风速",
+                "🎬 享受你的观影时光！",
+            ]
 
-    else:
-        available = "、".join(SCENE_META.keys())
-        return f"❌ 未知场景「{scene_name}」。当前支持: {available}"
+        # ========================================
+        # 🌅 起床模式
+        # ========================================
+        elif scene_name == "起床模式":
+            registry.update("bedroom_curtain", position=100)
+            registry.update("bedroom_ac", power=False)
+            registry.update("bedroom_light", power=True, brightness=50, color="暖白")
+            results = [
+                "✅ 已激活「🌅 起床模式」",
+                "  · 卧室窗帘已完全打开，阳光洒进来",
+                "  · 卧室空调已关闭",
+                "  · 卧室灯已打开（亮度 50%，暖白）",
+                "🌅 早上好，新的一天开始了！",
+            ]
 
-    return "\n".join(results)
+        else:
+            available = "、".join(SCENE_META.keys())
+            return f"❌ 未知场景「{scene_name}」。当前支持: {available}"
+
+        return "\n".join(results)
+
+    return activate_scene
 
 
-@tool
-def list_scenes(query: str = "") -> str:
-    """
-    列出所有可用的场景模式及其功能描述。
+def _list_scenes() -> str:
 
-    当用户不确定有哪些场景，或想了解场景功能时调用。
+    def list_scenes(query: str = "") -> str:
+        """
+        列出所有可用的场景模式及其功能描述。
 
-    参数:
-        query: 保留参数，当前未使用
+        当用户不确定有哪些场景，或想了解场景功能时调用。
 
-    返回:
-        场景列表和对应的描述。
-    """
-    lines = ["📋 **可用的场景模式:**", ""]
-    for name, meta in SCENE_META.items():
-        lines.append(f"  {meta['emoji']} **{name}**: {meta['description']}")
-    lines.append("")
-    lines.append('说出场景名称即可激活，如"我要开启回家模式"。')
-    return "\n".join(lines)
+        参数:
+            query: 保留参数，当前未使用
+
+        返回:
+            场景列表和对应的描述。
+        """
+        lines = ["📋 **可用的场景模式:**", ""]
+        for name, meta in SCENE_META.items():
+            lines.append(f"  {meta['emoji']} **{name}**: {meta['description']}")
+        lines.append("")
+        lines.append('说出场景名称即可激活，如"我要开启回家模式"。')
+        return "\n".join(lines)
+
+    return list_scenes
+
+
+def build_scene_tools(registry: DeviceRegistry) -> list[StructuredTool]:
+    """构建场景工具集（activate_scene + list_scenes）。"""
+    activate_scene = _activate_scene(registry)
+    list_scenes = _list_scenes()
+    return [
+        StructuredTool.from_function(
+            activate_scene,
+            name="activate_scene",
+            description=activate_scene.__doc__,
+        ),
+        StructuredTool.from_function(
+            list_scenes,
+            name="list_scenes",
+            description=list_scenes.__doc__,
+        ),
+    ]
+
+
+__all__ = ["SCENE_META", "build_scene_tools"]

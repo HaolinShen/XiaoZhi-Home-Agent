@@ -16,7 +16,6 @@ LangGraph Agent 工作流
   4. 支持升级为 SqliteSaver 实现持久化记忆
 """
 
-import re
 from datetime import datetime
 from typing import Literal, Sequence
 from zoneinfo import ZoneInfo
@@ -31,8 +30,9 @@ from langchain_core.runnables import RunnableConfig
 
 from .state import AgentState
 from .prompts import build_system_prompt
-from ..tools import get_all_tools, set_memory_service
+from ..tools import build_all_tools
 from ..devices.base import DeviceRegistry
+from ..devices.capabilities import CONTROL_TOOL_NAMES
 from ..config import Settings
 from ..memory import create_checkpointer
 from ..memory import MemoryRepository, MemoryService
@@ -60,6 +60,10 @@ from .parallel import (
 from .multi_agent import agent_for_intent, role_prompt
 from .reasoning import format_memory_decision, reason_about_memories
 from .observability import emit_progress
+from .telemetry import UsageTracer, traced_node
+# P3: 自动化创建请求的强制工具判定已迁至 heuristics.py，
+# 保留旧名 `_required_automation_tool` 以兼容既有导入（tests 等）。
+from .heuristics import required_automation_tool as _required_automation_tool
 from ..knowledge import KnowledgeBase, build_knowledge_rag_subgraph
 
 
@@ -70,57 +74,6 @@ def _current_datetime(settings: Settings) -> str:
     except Exception:
         zone = ZoneInfo("Asia/Shanghai")
     return datetime.now(zone).isoformat(timespec="seconds")
-
-
-_AUTOMATION_READ_MARKERS = (
-    "有哪些", "有多少", "多少个", "多少条", "几个", "几条", "查看", "看看",
-    "看一下", "列出", "列表", "查询", "有没有", "是否有", "都有什么",
-    "什么任务", "哪些任务", "什么例程",
-)
-_AUTOMATION_CANCEL_MARKERS = ("取消", "删除", "停用", "撤销", "清空", "不要了")
-_AUTOMATION_TRIGGER_MARKERS = (
-    "提前", "定时", "闹钟", "起床", "叫我", "到家前", "回家前",
-    "车辆", "汽车", "车快到", "eta", "地理围栏",
-)
-_AUTOMATION_ACTION_MARKERS = (
-    "打开", "开启", "关闭", "关掉", "调到", "调高", "调低", "设置", "设为",
-    "准备", "预热", "烧水", "降温", "升温", "制冷", "制热", "启动", "叫我",
-)
-_AUTOMATION_TIME_PATTERN = re.compile(
-    r"\d{1,2}\s*[:：]\d{2}"
-    r"|\d{1,2}\s*[点時时]"
-    r"|\d{1,3}\s*(?:分钟|个小时|小时)后"
-    r"|今天|今晚|明天|明早|明晚|后天"
-    r"|周[一二三四五六日天]|星期[一二三四五六日天]"
-)
-
-
-def _required_automation_tool(text: str) -> str | None:
-    """Return the mutation tool a creation request must call, if any.
-
-    强制机制的默认值必须是"不强制"：只有同时出现未来触发信号和设备动作信号
-    时才锁定创建工具。查询和取消类请求（例如"当前有多少个定时任务"）必须返回
-    None，否则 Agent 会被反复要求为一个问句创建例程，两轮都失败后只能对用户
-    报错，而它本来应该调用 list_automation_routines。
-    """
-    normalized = text.strip().lower()
-    if not normalized:
-        return None
-    if any(marker in normalized for marker in _AUTOMATION_READ_MARKERS):
-        return None
-    if any(marker in normalized for marker in _AUTOMATION_CANCEL_MARKERS):
-        return None
-    has_trigger = bool(_AUTOMATION_TIME_PATTERN.search(normalized)) or any(
-        marker in normalized for marker in _AUTOMATION_TRIGGER_MARKERS
-    )
-    has_action = any(marker in normalized for marker in _AUTOMATION_ACTION_MARKERS)
-    if not (has_trigger and has_action):
-        return None
-    if any(marker in normalized for marker in ("车辆", "汽车", "车快到", "eta", "地理围栏")):
-        return "create_vehicle_arrival_routine"
-    if any(marker in normalized for marker in ("起床", "闹钟", "叫我起床")):
-        return "schedule_wake_routine"
-    return "create_scheduled_routine"
 
 
 def build_llm(settings: Settings) -> ChatOpenAI:
@@ -140,6 +93,8 @@ def build_llm(settings: Settings) -> ChatOpenAI:
         f"初始化 LLM | model={settings.model} | "
         f"base_url={settings.base_url}"
     )
+    # P2: 挂 token/延迟采集回调。callbacks 会随 bind_tools / with_structured_output
+    # 一路传播，所以路由、Planner、ReAct Agent 的每一次 LLM 调用都会被记录。
     return ChatOpenAI(
         model=settings.model,
         api_key=settings.api_key,
@@ -147,6 +102,7 @@ def build_llm(settings: Settings) -> ChatOpenAI:
         timeout=settings.llm_timeout,
         temperature=0.3,  # 低温度确保工具调用的稳定性和一致性
         max_retries=2,    # 失败自动重试 2 次
+        callbacks=[UsageTracer()],
     )
 
 
@@ -155,6 +111,7 @@ def build_graph(
     settings: Settings,
     space_directory: SpaceDirectory | None = None,
     external_tools: Sequence | None = None,
+    automation_runtime=None,
 ) -> StateGraph:
     """
     构建 LangGraph Agent 工作流图。
@@ -164,6 +121,10 @@ def build_graph(
     参数:
       registry: 设备注册中心（工具函数需要它来操作设备）
       settings: 应用配置
+      space_directory: 空间目录（房间/设备归属）
+      external_tools: 外部 MCP 工具（天气等只读服务）
+      automation_runtime: 自动化运行时；None 表示自动化未启用，
+        自动化工具不会出现在 Agent 面前（P1 显式注入，取代模块级单例）
 
     返回:
       编译好的 LangGraph 图（可调用 .invoke() / .stream() 运行）
@@ -176,16 +137,32 @@ def build_graph(
     # ---- 第 1 步: 初始化 LLM ----
     llm = build_llm(settings)
 
-    # ---- 第 2 步: 获取工具列表并绑定到 LLM ----
+    # ---- 第 2 步: 构建长期记忆服务 ----
+    # 必须先于工具：工具工厂以闭包持有 memory_service（P1 显式注入），
+    # 不再是 build_graph 先 get_all_tools()、再用 set_memory_service 改全局。
+    memory_service = None
+    memory_repository = None
+    if settings.memory.enable_long_term:
+        memory_repository = MemoryRepository(settings.memory.long_term_db_path)
+        memory_repository.cleanup_expired()
+        memory_service = MemoryService(
+            memory_repository,
+            space_directory or SpaceDirectory.from_registry(registry, "default-home"),
+        )
+
+    # ---- 第 3 步: 按依赖显式构建工具并绑定到 LLM ----
     external_tools = list(external_tools or [])
-    tools = [*get_all_tools(), *external_tools]
+    tools = build_all_tools(
+        registry,
+        memory_service=memory_service,
+        automation_runtime=automation_runtime,
+        external_tools=external_tools,
+    )
     tools_by_name = {tool.name: tool for tool in tools}
     llm_with_tools = llm.bind_tools(tools)
-    device_tool_names = {
-        "control_light", "control_ac", "control_tv", "control_curtain",
-        "control_humidifier", "control_water_heater", "control_lock", "control_kettle",
-        "read_sensor", "get_device_status",
-    }
+    # device 角色的工具名集合从能力声明派生（P0）：新增设备自动进入该角色，
+    # 不再需要手工同步 control_xxx 清单。
+    device_tool_names = {*CONTROL_TOOL_NAMES, "read_sensor", "get_device_status"}
     # 场景分支也要能读传感器：离家模式前需要先确认家里没人。
     scene_tool_names = {"activate_scene", "list_scenes", "read_sensor"}
     memory_tool_names = {
@@ -208,7 +185,7 @@ def build_graph(
     }
     logger.info(f"已绑定 {len(tools)} 个工具到 LLM")
 
-    # ---- 第 3 步: 生成系统提示词 ----
+    # ---- 第 4 步: 生成系统提示词 ----
     system_prompt = build_system_prompt(registry)
     if external_tools:
         external_descriptions = "\n".join(
@@ -219,16 +196,6 @@ def build_graph(
             "以下工具用于天气等只读生活信息查询。需要实时信息时应调用工具，"
             "不要依据模型记忆猜测：\n" + external_descriptions
         )
-    memory_service = None
-    memory_repository = None
-    if settings.memory.enable_long_term:
-        memory_repository = MemoryRepository(settings.memory.long_term_db_path)
-        memory_repository.cleanup_expired()
-        memory_service = MemoryService(
-            memory_repository,
-            space_directory or SpaceDirectory.from_registry(registry, "default-home"),
-        )
-    set_memory_service(memory_service)
     device_query_subgraph = build_device_query_subgraph(registry)
     rag_config = getattr(settings, "rag", None)
     knowledge_base = KnowledgeBase(getattr(rag_config, "knowledge_path", "docs/knowledge"))
@@ -297,6 +264,7 @@ def build_graph(
         emit_progress("context_synced", intent_text=latest_text[:80])
         return result
 
+    @traced_node("memory_reasoner")
     def memory_reasoner_node(state: AgentState) -> dict:
         decision = reason_about_memories(
             state.get("retrieved_memories", []),
@@ -340,6 +308,7 @@ def build_graph(
             result["messages"] = updates
         return result
 
+    @traced_node("task_router")
     def task_router_node(state: AgentState) -> dict:
         """Classify the request, then select planning or the normal ReAct path."""
         latest_text = ""
@@ -418,6 +387,7 @@ def build_graph(
         })
         return result
 
+    @traced_node("planner")
     def planner_node(state: AgentState) -> dict:
         """Generate or revise a structured plan without executing tools."""
         structured_planner = llm.with_structured_output(ExecutionPlan)
@@ -533,6 +503,7 @@ def build_graph(
             "approval_request": None,
         }
 
+    @traced_node("verifier")
     def verifier_node(state: AgentState) -> dict:
         """Check the actual device state and select the next control action."""
         execution = state["last_execution"]
@@ -680,6 +651,7 @@ def build_graph(
             "collaboration_status": "completed",
         }
 
+    @traced_node("agent")
     def agent_node(state: AgentState) -> dict:
         """
         Agent 节点: 调用 LLM 进行推理。

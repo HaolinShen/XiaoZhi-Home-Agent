@@ -9,20 +9,22 @@ from src.agent.planning import expected_state_for_step
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.models import KettleDevice, LockDevice, WaterHeaterDevice
-from src.tools import (
-    activate_scene,
-    control_kettle,
-    control_lock,
-    control_water_heater,
-    set_registry,
-)
+from src.tools import build_all_tools
+
+
+def _build_tools(registry):
+    """P1: 工具由工厂按依赖显式构建；本文件不测偏好观察，显式关闭。"""
+    return {
+        tool.name: tool
+        for tool in build_all_tools(registry, enable_preference_tracking=False)
+    }
 
 
 class WaterHeaterDeviceTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = _build_tools(self.registry)
 
     def test_model_accepts_in_range_and_rejects_out_of_range_temp(self):
         device = WaterHeaterDevice(
@@ -36,25 +38,25 @@ class WaterHeaterDeviceTests(unittest.TestCase):
                 )
 
     def test_control_tool_on_off_and_set_temp(self):
-        on_result = control_water_heater.invoke({
+        on_result = self.tools["control_water_heater"].invoke({
             "device_name": "卫生间电热水器", "action": "on",
         })
         self.assertTrue(on_result.startswith("✅"))
         self.assertTrue(self.registry.get("bathroom_water_heater").power)
 
-        temp_result = control_water_heater.invoke({
+        temp_result = self.tools["control_water_heater"].invoke({
             "device_name": "卫生间电热水器", "action": "set_temp", "target_temp": 50,
         })
         self.assertIn("50°C", temp_result)
         self.assertEqual(self.registry.get("bathroom_water_heater").target_temp, 50)
 
-        off_result = control_water_heater.invoke({
+        off_result = self.tools["control_water_heater"].invoke({
             "device_name": "卫生间电热水器", "action": "off",
         })
         self.assertFalse(self.registry.get("bathroom_water_heater").power)
 
     def test_invalid_action_is_rejected(self):
-        result = control_water_heater.invoke({
+        result = self.tools["control_water_heater"].invoke({
             "device_name": "卫生间电热水器", "action": "boil",
         })
         self.assertTrue(result.startswith("❌"))
@@ -64,7 +66,7 @@ class LockDeviceTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = _build_tools(self.registry)
 
     def test_factory_default_is_locked(self):
         lock = self.registry.get("entryway_lock")
@@ -73,13 +75,13 @@ class LockDeviceTests(unittest.TestCase):
 
     def test_control_tool_switches_locked_state(self):
         self.assertTrue(self.registry.get("entryway_lock").locked)
-        unlock_result = control_lock.invoke({
+        unlock_result = self.tools["control_lock"].invoke({
             "device_name": "玄关门锁", "action": "unlock",
         })
         self.assertTrue(unlock_result.startswith("✅"))
         self.assertFalse(self.registry.get("entryway_lock").locked)
 
-        lock_result = control_lock.invoke({
+        lock_result = self.tools["control_lock"].invoke({
             "device_name": "玄关门锁", "action": "lock",
         })
         self.assertTrue(lock_result.startswith("✅"))
@@ -103,7 +105,7 @@ class KettleDeviceTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = _build_tools(self.registry)
 
     def test_model_accepts_in_range_and_rejects_out_of_range_temp(self):
         device = KettleDevice(device_id="test_k", name="测试水壶", target_temp=60)
@@ -115,20 +117,20 @@ class KettleDeviceTests(unittest.TestCase):
                 )
 
     def test_boil_is_a_single_step_composite_action(self):
-        result = control_kettle.invoke({"device_name": "厨房烧水壶", "action": "boil"})
+        result = self.tools["control_kettle"].invoke({"device_name": "厨房烧水壶", "action": "boil"})
         self.assertTrue(result.startswith("✅"))
         kettle = self.registry.get("kitchen_kettle")
         self.assertTrue(kettle.power)
         self.assertEqual(kettle.target_temp, 100)
 
     def test_set_temp_and_off(self):
-        control_kettle.invoke({
+        self.tools["control_kettle"].invoke({
             "device_name": "厨房烧水壶", "action": "set_temp", "target_temp": 80,
         })
         self.assertEqual(self.registry.get("kitchen_kettle").target_temp, 80)
         self.assertTrue(self.registry.get("kitchen_kettle").power)
 
-        control_kettle.invoke({"device_name": "厨房烧水壶", "action": "off"})
+        self.tools["control_kettle"].invoke({"device_name": "厨房烧水壶", "action": "off"})
         self.assertFalse(self.registry.get("kitchen_kettle").power)
 
 
@@ -136,7 +138,7 @@ class NewDevicesPlanningTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = _build_tools(self.registry)
 
     def test_expected_state_for_step_resolves_new_devices(self):
         cases = [
@@ -173,14 +175,14 @@ class NewDevicesSceneTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = _build_tools(self.registry)
 
     def test_leaving_scene_turns_off_new_actuators_and_locks_door(self):
         self.registry.update("bathroom_water_heater", power=True)
         self.registry.update("kitchen_kettle", power=True)
         self.registry.update("entryway_lock", locked=False)
 
-        result = activate_scene.invoke({"scene_name": "离家模式"})
+        result = self.tools["activate_scene"].invoke({"scene_name": "离家模式"})
 
         self.assertIn("热水器和烧水壶已关闭", result)
         self.assertIn("门锁已上锁", result)

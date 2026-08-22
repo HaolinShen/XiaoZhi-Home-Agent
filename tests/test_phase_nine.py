@@ -15,14 +15,12 @@ from src.agent.parallel import (
 )
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
-from src.tools import set_registry
 
 
 class PhaseNineSubgraphParallelTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.registry = DeviceRegistry(SimulatorBackend())
-        set_registry(self.registry)
         self.directory = SpaceDirectory.from_registry(self.registry, "home-a")
         self.context = AgentContext(
             home_id="home-a", user_id="user-a", session_id="parallel-session", client_id="test"

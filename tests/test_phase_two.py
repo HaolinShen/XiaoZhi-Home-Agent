@@ -20,14 +20,7 @@ from src.memory import (
     MemoryType,
     MemoryWrite,
 )
-from src.tools.memory import (
-    delete_personal_memory,
-    list_personal_memories,
-    save_home_rule,
-    save_personal_memory,
-    set_memory_service,
-    update_personal_memory,
-)
+from src.tools.memory import build_memory_tools
 
 
 class MemoryPhaseTwoTests(unittest.TestCase):
@@ -49,9 +42,15 @@ class MemoryPhaseTwoTests(unittest.TestCase):
         self.service = MemoryService(self.repository, self.directory)
 
     def tearDown(self) -> None:
-        set_memory_service(None)
         self.repository.close()
         self.temp_dir.cleanup()
+
+    def memory_tools(self):
+        """P1: 记忆工具由工厂按依赖显式构建，不再经模块级单例。"""
+        return {
+            tool.name: tool
+            for tool in build_memory_tools(self.service)
+        }
 
     @staticmethod
     def context(
@@ -284,9 +283,9 @@ class MemoryPhaseTwoTests(unittest.TestCase):
         self.assertNotIn("蓝光", prompt)
 
     def test_tools_use_identity_from_runnable_config(self) -> None:
-        set_memory_service(self.service)
+        tools = self.memory_tools()
         config = self.context().to_config()
-        saved_message = save_personal_memory.invoke(
+        saved_message = tools["save_personal_memory"].invoke(
             {
                 "memory_key": "lighting.color",
                 "memory_value": {"color": "暖光"},
@@ -295,11 +294,11 @@ class MemoryPhaseTwoTests(unittest.TestCase):
             config=config,
         )
         self.assertIn("已保存个人记忆", saved_message)
-        listed = list_personal_memories.invoke({}, config=config)
+        listed = tools["list_personal_memories"].invoke({}, config=config)
         self.assertIn("lighting.color", listed)
 
         record = self.service.list(self.context())[0]
-        updated = update_personal_memory.invoke(
+        updated = tools["update_personal_memory"].invoke(
             {
                 "memory_id": record.id,
                 "memory_value": {"color": "冷白光"},
@@ -307,24 +306,24 @@ class MemoryPhaseTwoTests(unittest.TestCase):
             config=config,
         )
         self.assertIn("已更新个人记忆", updated)
-        deleted = delete_personal_memory.invoke(
+        deleted = tools["delete_personal_memory"].invoke(
             {"memory_id": record.id},
             config=config,
         )
         self.assertEqual(deleted, "记忆已删除")
 
     def test_home_rule_tool_requires_trusted_admin_flag(self) -> None:
-        set_memory_service(self.service)
+        tools = self.memory_tools()
         payload = {
             "memory_key": "quiet_hours",
             "memory_value": {"after": "23:00"},
             "source": "记住晚上十一点后使用安静模式",
         }
         with self.assertRaises(MemoryPermissionError):
-            save_home_rule.invoke(payload, config=self.context().to_config())
+            tools["save_home_rule"].invoke(payload, config=self.context().to_config())
 
         admin_config = self.context(is_admin=True).to_config()
-        result = save_home_rule.invoke(payload, config=admin_config)
+        result = tools["save_home_rule"].invoke(payload, config=admin_config)
         self.assertIn("已保存家庭规则", result)
 
     def test_graph_injects_accessible_memory_before_model_call(self) -> None:

@@ -28,6 +28,7 @@ from ..models import (
     CurtainDevice,
     SENSOR_DEVICE_TYPES,
 )
+from .capabilities import TYPE_KEYWORDS
 
 
 # 设备名模糊匹配时忽略的助词与量词。
@@ -176,25 +177,10 @@ class DeviceRegistry:
                 return device
 
         # ---- 策略 3: 类型关键词匹配 ----
-        keywords_map = {
-            DeviceType.LIGHT: ["灯", "灯光", "照明"],
-            DeviceType.AC: ["空调", "冷气", "暖气", "制冷", "制热"],
-            DeviceType.TV: ["电视", "电视机"],
-            DeviceType.CURTAIN: ["窗帘", "帘", "遮阳"],
-            DeviceType.HUMIDIFIER: ["加湿器", "加湿", "雾化器"],
-            DeviceType.WATER_HEATER: ["热水器", "电热水器", "洗澡"],
-            DeviceType.LOCK: ["门锁", "锁", "大门", "门"],
-            DeviceType.KETTLE: ["烧水壶", "热水壶", "水壶", "烧水"],
-            DeviceType.TEMP_HUMIDITY_SENSOR: [
-                "温湿度传感器", "温湿度计", "温湿度", "温度计", "湿度计",
-                "温度", "湿度",
-            ],
-            DeviceType.PRESENCE_SENSOR: [
-                "人体传感器", "人体存在传感器", "存在传感器", "人体感应",
-                "人体", "有没有人", "有人",
-            ],
-        }
-        keywords = keywords_map.get(device_type, [])
+        # 关键词表来自 capabilities.TYPE_KEYWORDS（P0 单一数据源）：
+        # 新增设备类型时在那里声明一次，find 的匹配、工具 docstring、模拟器
+        # 默认实例全部自动跟上，不用再手改本文件。
+        keywords = TYPE_KEYWORDS.get(device_type, [])
         for kw in keywords:
             if kw in user_input:
                 # 多候选时拒绝猜测，让 Agent 向用户澄清。

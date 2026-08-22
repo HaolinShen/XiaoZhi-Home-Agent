@@ -1,115 +1,53 @@
-"""工具模块"""
+"""工具包（P0/P1 改造后的统一入口）。
 
-from .devices import (
-    control_light,
-    control_ac,
-    control_tv,
-    control_curtain,
-    control_humidifier,
-    control_water_heater,
-    control_lock,
-    control_kettle,
-    read_sensor,
-    get_device_status,
-    set_registry as set_device_tools_registry,
-)
-from .scenes import (
-    activate_scene,
-    list_scenes,
-    set_registry as set_scene_tools_registry,
-)
-from .memory import (
-    delete_personal_memory,
-    list_preference_candidates,
-    confirm_preference_candidate,
-    reject_preference_candidate,
-    list_memory_versions,
-    list_personal_memories,
-    save_home_rule,
-    save_personal_memory,
-    set_memory_service,
-    update_personal_memory,
-)
-from .automation import (
-    cancel_automation_routine,
-    create_scheduled_routine,
-    create_vehicle_arrival_routine,
-    enable_vehicle_arrival_routine,
-    list_automation_routines,
-    schedule_wake_routine,
-    set_automation_runtime,
-)
+所有工具由 `build_all_tools()` 工厂按依赖（registry / memory_service /
+automation_runtime）显式构建，不再存在模块级可变单例：
+  - 工具以闭包持有依赖，调用方无需先"注入全局"再"记得复位"；
+  - 后台执行器 / MCP 等无可信身份的调用方在构造期显式关闭偏好观察。
+
+`build_all_tools` 返回的工具列表顺序即图里 bind_tools 的顺序；
+新增设备/工具只需改各子工厂内部的能力声明，本文件不再需要登记任何清单。
+"""
+
+from .automation import build_automation_tools
+from .devices import build_device_tools
+from .memory import build_memory_tools
+from .scenes import SCENE_META, build_scene_tools
 
 
-def set_registry(registry) -> None:
-    """同时注入注册中心到所有工具模块"""
-    set_device_tools_registry(registry)
-    set_scene_tools_registry(registry)
+def build_all_tools(
+    registry,
+    *,
+    memory_service=None,
+    automation_runtime=None,
+    external_tools=None,
+    enable_preference_tracking: bool = True,
+) -> list:
+    """构建 Agent 可见的全部工具（含可选外部 MCP 工具）。
 
-
-def get_all_tools() -> list:
-    """获取所有已注册的工具（用于 bind_tools）"""
-    return [
-        control_light,
-        control_ac,
-        control_tv,
-        control_curtain,
-        control_humidifier,
-        control_water_heater,
-        control_lock,
-        control_kettle,
-        activate_scene,
-        list_scenes,
-        read_sensor,
-        get_device_status,
-        save_personal_memory,
-        save_home_rule,
-        list_personal_memories,
-        update_personal_memory,
-        delete_personal_memory,
-        list_preference_candidates,
-        confirm_preference_candidate,
-        reject_preference_candidate,
-        list_memory_versions,
-        create_scheduled_routine,
-        create_vehicle_arrival_routine,
-        schedule_wake_routine,
-        enable_vehicle_arrival_routine,
-        list_automation_routines,
-        cancel_automation_routine,
+    enable_preference_tracking: 图路径保持 True（偏好观察需要可信身份，
+    缺身份会 fail-fast）；后台执行器与 MCP 服务器应显式传 False。
+    """
+    tools = [
+        *build_device_tools(
+            registry,
+            memory_service,
+            enable_preference_tracking=enable_preference_tracking,
+        ),
+        *build_scene_tools(registry),
+        *build_memory_tools(memory_service),
+        *build_automation_tools(automation_runtime),
     ]
+    if external_tools:
+        tools.extend(external_tools)
+    return tools
 
 
 __all__ = [
-    "get_all_tools",
-    "set_registry",
-    "control_light",
-    "control_ac",
-    "control_tv",
-    "control_curtain",
-    "control_humidifier",
-    "control_water_heater",
-    "control_lock",
-    "control_kettle",
-    "activate_scene",
-    "list_scenes",
-    "read_sensor",
-    "get_device_status",
-    "set_memory_service",
-    "save_personal_memory",
-    "save_home_rule",
-    "list_personal_memories",
-    "update_personal_memory",
-    "delete_personal_memory",
-    "list_preference_candidates",
-    "confirm_preference_candidate",
-    "reject_preference_candidate",
-    "list_memory_versions",
-    "schedule_wake_routine",
-    "create_scheduled_routine",
-    "create_vehicle_arrival_routine",
-    "enable_vehicle_arrival_routine",
-    "list_automation_routines",
-    "cancel_automation_routine",
-    "set_automation_runtime",
+    "build_all_tools",
+    "build_device_tools",
+    "build_scene_tools",
+    "build_memory_tools",
+    "build_automation_tools",
+    "SCENE_META",
 ]

@@ -12,7 +12,6 @@ from src.agent.graph import build_graph
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.memory.store import close_checkpointer
-from src.tools import set_registry
 
 
 class ApprovalAwareFakeLLM:
@@ -40,7 +39,6 @@ class PhaseSixHumanInTheLoopTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.registry = DeviceRegistry(SimulatorBackend())
-        set_registry(self.registry)
         self.directory = SpaceDirectory.from_registry(self.registry, "home-a")
         self.context = AgentContext(
             home_id="home-a",

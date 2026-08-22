@@ -47,8 +47,6 @@ from loguru import logger
 from src.config import get_settings, Settings
 from src.devices import DeviceRegistry, SimulatorBackend
 from src.progress_view import PlanProgressView, format_arguments, format_state
-from src.tools import set_registry as set_tools_registry
-from src.tools import set_automation_runtime
 from src.automation.runtime import AutomationRuntime
 from src.mcp import load_external_tools
 from src.agent import (
@@ -317,7 +315,6 @@ def _release_runtime_resources(automation_runtime, graph) -> None:
     """
     if automation_runtime is not None:
         automation_runtime.close()
-        set_automation_runtime(None)
     repository = getattr(graph, "memory_repository", None)
     if repository is not None:
         repository.close()
@@ -499,9 +496,6 @@ def chat(
     backend = SimulatorBackend()
     registry = DeviceRegistry(backend)
 
-    # ---- 注入注册中心到工具层 ----
-    set_tools_registry(registry)
-
     automation_runtime = None
     if settings.automation.enabled:
         automation_runtime = AutomationRuntime(
@@ -512,7 +506,6 @@ def chat(
         )
         automation_runtime.scheduler.poll_seconds = settings.automation.poll_seconds
         automation_runtime.scheduler.start()
-        set_automation_runtime(automation_runtime)
 
     space_directory = SpaceDirectory.from_registry(registry, home_id=home_id)
 
@@ -521,7 +514,14 @@ def chat(
     graph = None
     try:
         external_tools = load_external_tools(settings.external_mcp_servers)
-        graph = build_graph(registry, settings, space_directory, external_tools=external_tools)
+        # P1: 工具与自动化运行时都通过构造参数显式注入，不再有模块级单例。
+        graph = build_graph(
+            registry,
+            settings,
+            space_directory,
+            external_tools=external_tools,
+            automation_runtime=automation_runtime,
+        )
         sessions = SessionManager(
             space_directory,
             graph.checkpointer,

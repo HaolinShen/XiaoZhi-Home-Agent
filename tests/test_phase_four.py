@@ -6,15 +6,10 @@ from pathlib import Path
 from src.agent.context import AgentContext, DeviceLocation, SpaceDirectory
 from src.memory import MemoryRepository, MemoryScope, MemoryService, MemoryType, MemoryWrite
 from src.memory.models import utc_now
-from src.tools.memory import (
-    confirm_preference_candidate,
-    list_preference_candidates,
-    reject_preference_candidate,
-    set_memory_service,
-)
+from src.tools.memory import build_memory_tools
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
-from src.tools.devices import control_ac, set_registry
+from src.tools.devices import build_device_tools
 
 
 class PhaseFourTests(unittest.TestCase):
@@ -32,9 +27,12 @@ class PhaseFourTests(unittest.TestCase):
         )
 
     def tearDown(self):
-        set_memory_service(None)
         self.repository.close()
         self.temp_dir.cleanup()
+
+    def memory_tools(self):
+        """P1: 记忆工具由工厂显式构建（闭包持有 service，无模块级单例）。"""
+        return {tool.name: tool for tool in build_memory_tools(self.service)}
 
     def test_repeated_operations_create_candidate_but_not_memory(self):
         self.assertIsNone(self.service.record_operation(
@@ -52,15 +50,18 @@ class PhaseFourTests(unittest.TestCase):
 
     def test_successful_device_settings_feed_candidate_observations(self):
         registry = DeviceRegistry(SimulatorBackend())
-        set_registry(registry)
         graph_directory = SpaceDirectory.from_registry(registry, "home-a")
         self.service.spaces = graph_directory
-        set_memory_service(self.service)
+        # P1: 设备工具显式持有 memory_service，偏好观察开启（图路径语义）。
+        device_tools = {
+            tool.name: tool
+            for tool in build_device_tools(registry, self.service)
+        }
         tool_context = self.context.model_copy(update={
             "room_id": "living_room", "device_id": "living_room_ac"
         })
         for _ in range(3):
-            control_ac.invoke(
+            device_tools["control_ac"].invoke(
                 {"device_name": "客厅空调", "action": "set_temp", "temperature": 25},
                 config=tool_context.to_config(),
             )
@@ -94,10 +95,10 @@ class PhaseFourTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.service.confirm_candidate(other, candidate.id)
 
-        set_memory_service(self.service)
-        listed = list_preference_candidates.invoke({}, config=self.context.to_config())
+        tools = self.memory_tools()
+        listed = tools["list_preference_candidates"].invoke({}, config=self.context.to_config())
         self.assertIn(candidate.id, listed)
-        confirmed = confirm_preference_candidate.invoke(
+        confirmed = tools["confirm_preference_candidate"].invoke(
             {"candidate_id": candidate.id}, config=self.context.to_config()
         )
         self.assertIn("已确认并保存偏好", confirmed)
@@ -152,8 +153,8 @@ class PhaseFourTests(unittest.TestCase):
             candidate = self.service.record_operation(
                 self.context, "ac.temperature", {"temperature": 25}
             )
-        set_memory_service(self.service)
-        result = reject_preference_candidate.invoke(
+        tools = self.memory_tools()
+        result = tools["reject_preference_candidate"].invoke(
             {"candidate_id": candidate.id}, config=self.context.to_config()
         )
         self.assertEqual(result, "已拒绝该偏好候选")

@@ -12,14 +12,12 @@ from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.evaluation import evaluate_rag_trajectory
 from src.knowledge import KnowledgeBase, build_knowledge_rag_subgraph
-from src.tools import set_registry
 
 
 class PhaseTwelveAgenticRAGTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.registry = DeviceRegistry(SimulatorBackend())
-        set_registry(self.registry)
         self.directory = SpaceDirectory.from_registry(self.registry, "home-a")
         self.context = AgentContext(
             home_id="home-a", user_id="user-a", session_id="rag-session", client_id="test"

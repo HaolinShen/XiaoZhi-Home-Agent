@@ -14,10 +14,16 @@ class RoutineExecutor:
     def __init__(self, registry: DeviceRegistry, speaker: SpeakerBackend):
         self.registry = registry
         self.speaker = speaker
-        # Import only after the tools package has finished initializing. Automation
-        # tools themselves import this runtime, so a module-level import cycles.
-        from ..tools import get_all_tools
-        self.tools = {tool.name: tool for tool in get_all_tools()}
+        # P1: 执行器构造自己的工具集（闭包注入 registry），并且**显式关闭
+        # 偏好观察**——机器触发的动作不计入"重复手动操作"，否则会凭空造出
+        # 用户从未设过的偏好。这也是对旧 bug（无身份调用下 record_preference
+        # 抛 KeyError 把整个定时动作判成失败）的根因修复：现在"无身份"是
+        # 构造期的显式选择，而不是调用期靠逐键检查去猜。
+        from ..tools import build_device_tools
+        self.tools = {
+            tool.name: tool
+            for tool in build_device_tools(registry, enable_preference_tracking=False)
+        }
 
     def execute(self, payload: dict[str, Any]) -> dict[str, Any]:
         tool_name = payload["tool_name"]

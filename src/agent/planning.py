@@ -2,49 +2,27 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 from ..devices.base import DeviceRegistry
+from ..devices.capabilities import CAPABILITIES, InvalidPlanArgument
 from ..models import DeviceType
+from .heuristics import should_use_planner  # noqa: F401  (P3 迁移后的再导出)
 
-
-class _InvalidArgument(ValueError):
-    """计划里的参数无法解析成设备可接受的值。
-
-    单独立一个异常类型，是为了把"参数写错"和真正的程序 bug 分开：前者应该变成
-    preparation_error 回喂给 Planner 重写，后者才该往上抛。
-    """
-
-
-def _int_arg(args: dict[str, Any], name: str, default: int, low: int, high: int) -> int:
-    """读取整数参数并夹到合法区间，无法解析时报错而不是崩溃。
-
-    这里必须容错：`expected_state_for_step()` 在 executor 的 try 块之外被调用，
-    模型只要写出 brightness="很亮" 这种值，裸 `int()` 抛出的 ValueError 就会掀翻
-    整张图。转成 preparation_error 后会被判成确定性错误直接 replan —— 既不崩，
-    也不会静默套用默认值把"调到很亮"悄悄执行成"调到 50%"再报告成功。
-    """
-    raw = args.get(name, default)
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        raise _InvalidArgument(
-            f"invalid argument: {name} 需要 {low}-{high} 之间的整数，收到 {raw!r}"
-        ) from None
-    return max(low, min(high, value))
+# should_use_planner 已迁至 heuristics.py（P3：判定逻辑单一模块）。
+# 这里保留再导出，让既有导入路径 from src.agent.planning import should_use_planner
+# 继续可用；新代码请直接 import src.agent.heuristics。
 
 
 @dataclass(frozen=True)
-class ActionSpec:
-    """一个 action 的完整声明。
+class PlanningActionSpec:
+    """一个 action 在规划侧的视图（喂 Planner 的文本 + 期望状态）。
 
-    signature 是喂给 Planner 的合法值文本（括号内为该 action 需附带的参数），
-    expected 接收 (arguments, device) 返回执行后设备应达到的状态 —— Verifier 拿它
-    跟注册中心的真实状态比对。
+    与 capabilities.ActionSpec 的分工：capabilities 是完整声明（含副作用实现），
+    这里只取规划分支需要的两样东西。两处都从 CAPABILITIES 派生，不手写。
     """
 
     signature: str
@@ -52,14 +30,14 @@ class ActionSpec:
 
 
 @dataclass(frozen=True)
-class ToolSpec:
+class PlanningToolSpec:
     """一个规划工具操作的设备类型及其全部合法 action。"""
 
     device_type: DeviceType
-    actions: dict[str, ActionSpec]
+    actions: dict[str, PlanningActionSpec]
 
 
-# 规划分支的单一数据源：工具 → 设备类型 → 合法 action → 期望状态。
+# 规划分支的单一数据源现在在 devices/capabilities.py（P0）。
 #
 # 为什么这份声明必须存在：Planner 走 `llm.with_structured_output(ExecutionPlan)`，
 # 不像 ReAct 分支那样 `bind_tools`，所以工具 docstring 里写的 "on / off / ..."
@@ -67,126 +45,19 @@ class ToolSpec:
 # 风格的 turn_on / turn_off —— 这正是规划第一版反复失败的根因。把合法值显式喂给
 # 它，第一版就该是对的。
 #
-# 为什么合并成一张表：这份信息以前散成三份手写副本（喂 Planner 的词表、
-# expected_state_for_step 的近百行 if/elif、工具实现的 if/elif），漏改一处的表现
-# 是 Planner 第一版计划稳定失败，且不报错。现在前两者都从这里派生，只剩工具实现
-# 那份仍是手写（它带各自的副作用文本与前置检查，无法反射），由
-# tests/test_phase_seven.py 的一致性用例双向钉住。
-DEVICE_ACTION_SPECS: dict[str, ToolSpec] = {
-    "control_light": ToolSpec(DeviceType.LIGHT, {
-        "on": ActionSpec("on", lambda args, device: {"power": True}),
-        "off": ActionSpec("off", lambda args, device: {"power": False}),
-        "set_brightness": ActionSpec(
-            "set_brightness(brightness)",
-            lambda args, device: {
-                "power": True,
-                "brightness": _int_arg(args, "brightness", 50, 0, 100),
-            },
-        ),
-        "set_color": ActionSpec(
-            "set_color(color)",
-            lambda args, device: {"power": True, "color": args.get("color", "暖白")},
-        ),
-    }),
-    "control_ac": ToolSpec(DeviceType.AC, {
-        "on": ActionSpec(
-            "on(可带 temperature、mode)",
-            lambda args, device: {
-                "power": True,
-                "temperature": _int_arg(args, "temperature", 26, 16, 30),
-                "mode": args.get("mode", "cool"),
-            },
-        ),
-        "off": ActionSpec("off", lambda args, device: {"power": False}),
-        "set_temp": ActionSpec(
-            "set_temp(temperature)",
-            lambda args, device: {
-                "power": True,
-                "temperature": _int_arg(args, "temperature", 26, 16, 30),
-            },
-        ),
-        "set_mode": ActionSpec(
-            "set_mode(mode)",
-            lambda args, device: {"power": True, "mode": args.get("mode", "cool")},
-        ),
-        "set_fan": ActionSpec(
-            "set_fan(fan_speed)",
-            lambda args, device: {"fan_speed": args.get("fan_speed", "auto")},
-        ),
-    }),
-    "control_tv": ToolSpec(DeviceType.TV, {
-        "on": ActionSpec("on", lambda args, device: {"power": True}),
-        "off": ActionSpec("off", lambda args, device: {"power": False}),
-        "set_volume": ActionSpec(
-            "set_volume(volume)",
-            lambda args, device: {"volume": _int_arg(args, "volume", 30, 0, 100)},
-        ),
-        # mute 是翻转语义，所以期望状态依赖执行前的设备状态。
-        "mute": ActionSpec("mute", lambda args, device: {"muted": not device.muted}),
-        "set_channel": ActionSpec(
-            "set_channel(channel)",
-            lambda args, device: {
-                "power": True,
-                "channel": args.get("channel", "HDMI 1"),
-            },
-        ),
-    }),
-    "control_curtain": ToolSpec(DeviceType.CURTAIN, {
-        "open": ActionSpec("open", lambda args, device: {"position": 100}),
-        "close": ActionSpec("close", lambda args, device: {"position": 0}),
-        "set_position": ActionSpec(
-            "set_position(percentage)",
-            lambda args, device: {"position": _int_arg(args, "percentage", 100, 0, 100)},
-        ),
-    }),
-    "control_humidifier": ToolSpec(DeviceType.HUMIDIFIER, {
-        "on": ActionSpec("on", lambda args, device: {"power": True}),
-        "off": ActionSpec("off", lambda args, device: {"power": False}),
-        "set_humidity": ActionSpec(
-            "set_humidity(target_humidity)",
-            lambda args, device: {
-                "power": True,
-                "target_humidity": _int_arg(args, "target_humidity", 60, 30, 80),
-            },
-        ),
-        "set_mist_level": ActionSpec(
-            "set_mist_level(mist_level)",
-            lambda args, device: {
-                "power": True,
-                "mist_level": args.get("mist_level", "auto"),
-            },
-        ),
-    }),
-    "control_water_heater": ToolSpec(DeviceType.WATER_HEATER, {
-        "on": ActionSpec("on", lambda args, device: {"power": True}),
-        "off": ActionSpec("off", lambda args, device: {"power": False}),
-        "set_temp": ActionSpec(
-            "set_temp(target_temp)",
-            lambda args, device: {
-                "power": True,
-                "target_temp": _int_arg(args, "target_temp", 45, 35, 75),
-            },
-        ),
-    }),
-    "control_lock": ToolSpec(DeviceType.LOCK, {
-        "lock": ActionSpec("lock", lambda args, device: {"locked": True}),
-        "unlock": ActionSpec("unlock", lambda args, device: {"locked": False}),
-    }),
-    "control_kettle": ToolSpec(DeviceType.KETTLE, {
-        "on": ActionSpec("on", lambda args, device: {"power": True}),
-        "off": ActionSpec("off", lambda args, device: {"power": False}),
-        "set_temp": ActionSpec(
-            "set_temp(target_temp)",
-            lambda args, device: {
-                "power": True,
-                "target_temp": _int_arg(args, "target_temp", 100, 40, 100),
-            },
-        ),
-        "boil": ActionSpec(
-            "boil",
-            lambda args, device: {"power": True, "target_temp": 100},
-        ),
-    }),
+# 为什么从 capabilities 派生而不是手写：这份信息以前散成三份手写副本（喂 Planner
+# 的词表、expected_state_for_step 的近百行 if/elif、工具实现的 if/elif），漏改一处
+# 的表现是 Planner 第一版计划稳定失败，且不报错。现在工具实现、合法 action、
+# 期望状态三处同源于 capabilities，一致性由 tests/test_capabilities.py 钉住。
+DEVICE_ACTION_SPECS: dict[str, PlanningToolSpec] = {
+    cap.tool_name: PlanningToolSpec(
+        cap.device_type,
+        {
+            action.name: PlanningActionSpec(action.signature, action.expected)
+            for action in cap.actions
+        },
+    )
+    for cap in CAPABILITIES
 }
 
 # 以下两个常量都是 DEVICE_ACTION_SPECS 的派生视图，不要手写。
@@ -202,15 +73,12 @@ class PlanStep(BaseModel):
 
     step_id: int = Field(ge=1)
     description: str = Field(min_length=1)
-    # 这里必须是静态字面量：structured output 靠它生成 JSON Schema 的 enum，
-    # 从而在模型侧就约束住工具名。所以它无法从 DEVICE_ACTION_SPECS 派生，
-    # 只能手写 + 由一致性用例钉住两者的键集相等（漏加时测试失败，而非运行时静默）。
+    # Literal 也从能力声明派生（P0）：Literal[tuple(...)] 会把元组展开成字面量。
+    # structured output 靠它生成 JSON Schema 的 enum，从而在模型侧就约束住工具名；
+    # 以前这里必须手写、靠一致性用例钉住，漏加时 Planner 明明该用新工具却被
+    # pydantic 拒掉。现在新增设备自动带上，一致性由测试兜底。
     # 传感器故意不在其中：规划分支只做写操作，read_sensor 不该出现在计划里。
-    tool_name: Literal[
-        "control_light", "control_ac", "control_tv", "control_curtain",
-        "control_humidifier", "control_water_heater", "control_lock",
-        "control_kettle",
-    ]
+    tool_name: Literal[tuple(PLANNING_TOOL_NAMES)]  # type: ignore[valid-type]
     arguments: dict[str, Any]
 
 
@@ -240,35 +108,6 @@ class VerificationResult(BaseModel):
     reason: str
     actual_state: dict[str, Any] = Field(default_factory=dict)
     expected_state: dict[str, Any] = Field(default_factory=dict)
-
-
-def should_use_planner(text: str) -> bool:
-    """Conservatively route explicit custom multi-action requests to Planner."""
-    normalized = text.strip()
-    if not normalized:
-        return False
-
-    # Predefined scene requests remain on the existing ReAct + scene approval path.
-    if any(marker in normalized for marker in (
-        "回家模式", "离家模式", "睡眠模式", "观影模式", "起床模式",
-        "我回来了", "我要出门", "我要睡", "看电影", "起床了",
-    )):
-        return False
-
-    action_patterns = (
-        r"打开", r"开启", r"关闭", r"关掉", r"调到", r"设为",
-        r"调成", r"拉开", r"拉上", r"静音", r"切换",
-    )
-    action_count = sum(len(re.findall(pattern, normalized)) for pattern in action_patterns)
-    device_kinds = sum(
-        1 for keyword in ("灯", "空调", "电视", "窗帘", "加湿器", "热水器", "门锁", "烧水壶")
-        if keyword in normalized
-    )
-    connectors = any(
-        connector in normalized
-        for connector in ("并且", "然后", "同时", "再把", "再将", "以及", "顺便")
-    )
-    return action_count >= 2 and (device_kinds >= 2 or connectors)
 
 
 def planner_prompt(
@@ -351,7 +190,7 @@ def expected_state_for_step(
         return device.device_id, {}, _unsupported_action(tool_name, action)
     try:
         return device.device_id, action_spec.expected(args, device), None
-    except _InvalidArgument as exc:
+    except InvalidPlanArgument as exc:
         return device.device_id, {}, str(exc)
 
 

@@ -21,7 +21,7 @@ from src.models import (
     PresenceSensor,
     TempHumiditySensor,
 )
-from src.tools import activate_scene, control_humidifier, read_sensor, set_registry
+from src.tools import build_all_tools
 
 
 def _iso_minutes_ago(minutes: int) -> str:
@@ -89,7 +89,10 @@ class SensorSimulatorTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = {
+            tool.name: tool
+            for tool in build_all_tools(self.registry, enable_preference_tracking=False)
+        }
 
     def test_default_devices_include_both_sensor_kinds(self):
         self.assertEqual(len(self.registry.get_by_type(DeviceType.TEMP_HUMIDITY_SENSOR)), 2)
@@ -207,15 +210,18 @@ class ReadSensorToolTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = {
+            tool.name: tool
+            for tool in build_all_tools(self.registry, enable_preference_tracking=False)
+        }
 
     def test_reads_all_temp_humidity_sensors_by_default(self):
-        result = read_sensor.invoke({"sensor_type": "temp_humidity"})
+        result = self.tools["read_sensor"].invoke({"sensor_type": "temp_humidity"})
         self.assertIn("客厅温湿度传感器", result)
         self.assertIn("卧室温湿度传感器", result)
 
     def test_filters_by_location(self):
-        result = read_sensor.invoke(
+        result = self.tools["read_sensor"].invoke(
             {"sensor_type": "temp_humidity", "location": "客厅"}
         )
         self.assertIn("客厅温湿度传感器", result)
@@ -223,18 +229,18 @@ class ReadSensorToolTests(unittest.TestCase):
 
     def test_reads_presence_sensors(self):
         self.registry.update("entryway_presence", last_motion_at=_iso_minutes_ago(1))
-        result = read_sensor.invoke({"sensor_type": "presence", "location": "玄关"})
+        result = self.tools["read_sensor"].invoke({"sensor_type": "presence", "location": "玄关"})
         self.assertIn("玄关人体传感器", result)
         self.assertIn("有人", result)
 
     def test_unknown_sensor_type_is_rejected_with_options(self):
-        result = read_sensor.invoke({"sensor_type": "co2"})
+        result = self.tools["read_sensor"].invoke({"sensor_type": "co2"})
         self.assertTrue(result.startswith("❌"))
         self.assertIn("temp_humidity", result)
         self.assertIn("presence", result)
 
     def test_unknown_location_lists_available_places(self):
-        result = read_sensor.invoke(
+        result = self.tools["read_sensor"].invoke(
             {"sensor_type": "temp_humidity", "location": "书房"}
         )
         self.assertTrue(result.startswith("❌"))
@@ -243,13 +249,13 @@ class ReadSensorToolTests(unittest.TestCase):
     def test_tool_advances_environment_before_reporting(self):
         """读取是唯一会推进环境的入口，所以读到的值应当已经反映加湿器在工作"""
         self.registry.update("living_room_humidifier", power=True, target_humidity=60)
-        read_sensor.invoke({"sensor_type": "temp_humidity", "location": "客厅"})
+        self.tools["read_sensor"].invoke({"sensor_type": "temp_humidity", "location": "客厅"})
         self.assertGreater(self.registry.get("living_room_th_sensor").humidity, 42)
 
     def test_control_then_read_shows_the_closed_loop(self):
         """完整闭环: 开加湿器 → 反复读取 → 湿度确实升到目标"""
-        control_humidifier.invoke({"device_name": "客厅加湿器", "action": "on"})
-        control_humidifier.invoke(
+        self.tools["control_humidifier"].invoke({"device_name": "客厅加湿器", "action": "on"})
+        self.tools["control_humidifier"].invoke(
             {
                 "device_name": "客厅加湿器",
                 "action": "set_humidity",
@@ -257,7 +263,7 @@ class ReadSensorToolTests(unittest.TestCase):
             }
         )
         for _ in range(20):
-            read_sensor.invoke({"sensor_type": "temp_humidity", "location": "客厅"})
+            self.tools["read_sensor"].invoke({"sensor_type": "temp_humidity", "location": "客厅"})
         self.assertEqual(self.registry.get("living_room_th_sensor").humidity, 60)
 
 
@@ -267,10 +273,13 @@ class SensorReadOnlyContractTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        self.tools = {
+            tool.name: tool
+            for tool in build_all_tools(self.registry, enable_preference_tracking=False)
+        }
 
     def test_leaving_scene_does_not_switch_sensors_off(self):
-        activate_scene.invoke({"scene_name": "离家模式"})
+        self.tools["activate_scene"].invoke({"scene_name": "离家模式"})
         for sensor in self.registry.get_by_type(DeviceType.TEMP_HUMIDITY_SENSOR).values():
             self.assertTrue(sensor.power, "离家模式不应该关闭温湿度传感器")
         for sensor in self.registry.get_by_type(DeviceType.PRESENCE_SENSOR).values():

@@ -6,14 +6,18 @@ from src.agent.planning import expected_state_for_step
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.models import DeviceType, FanSpeed, HumidifierDevice
-from src.tools import activate_scene, control_humidifier, set_registry
+from src.tools import build_all_tools
 
 
 class HumidifierDeviceTests(unittest.TestCase):
     def setUp(self):
         self.backend = SimulatorBackend()
         self.registry = DeviceRegistry(self.backend)
-        set_registry(self.registry)
+        # P1: 工具由工厂按依赖显式构建；本文件不测偏好观察，显式关闭。
+        self.tools = {
+            tool.name: tool
+            for tool in build_all_tools(self.registry, enable_preference_tracking=False)
+        }
 
     def test_model_validates_fields_and_formats_status(self):
         device = HumidifierDevice(
@@ -44,14 +48,14 @@ class HumidifierDeviceTests(unittest.TestCase):
         self.assertEqual(self.registry.get(device.device_id).target_humidity, 60)
 
     def test_control_tool_updates_power_humidity_and_mist_level(self):
-        on_result = control_humidifier.invoke({
+        on_result = self.tools["control_humidifier"].invoke({
             "device_name": "客厅加湿器",
             "action": "on",
         })
         self.assertTrue(on_result.startswith("✅"))
         self.assertTrue(self.registry.get("living_room_humidifier").power)
 
-        humidity_result = control_humidifier.invoke({
+        humidity_result = self.tools["control_humidifier"].invoke({
             "device_name": "客厅加湿器",
             "action": "set_humidity",
             "target_humidity": 75,
@@ -59,7 +63,7 @@ class HumidifierDeviceTests(unittest.TestCase):
         self.assertIn("75%", humidity_result)
         self.assertEqual(self.registry.get("living_room_humidifier").target_humidity, 75)
 
-        mist_result = control_humidifier.invoke({
+        mist_result = self.tools["control_humidifier"].invoke({
             "device_name": "客厅加湿器",
             "action": "set_mist_level",
             "mist_level": "high",
@@ -72,13 +76,13 @@ class HumidifierDeviceTests(unittest.TestCase):
 
     def test_empty_water_tank_blocks_power_on(self):
         self.assertTrue(self.registry.update("living_room_humidifier", water_level=0))
-        result = control_humidifier.invoke({
+        result = self.tools["control_humidifier"].invoke({
             "device_name": "客厅加湿器",
             "action": "on",
         })
         self.assertTrue(result.startswith("❌"))
         self.assertFalse(self.registry.get("living_room_humidifier").power)
-        humidity_result = control_humidifier.invoke({
+        humidity_result = self.tools["control_humidifier"].invoke({
             "device_name": "客厅加湿器",
             "action": "set_humidity",
             "target_humidity": 70,
@@ -88,7 +92,7 @@ class HumidifierDeviceTests(unittest.TestCase):
 
     def test_leaving_scene_turns_humidifier_off(self):
         self.assertTrue(self.registry.update("living_room_humidifier", power=True))
-        result = activate_scene.invoke({"scene_name": "离家模式"})
+        result = self.tools["activate_scene"].invoke({"scene_name": "离家模式"})
         self.assertIn("加湿器、热水器和烧水壶已关闭", result)
         self.assertFalse(self.registry.get("living_room_humidifier").power)
 

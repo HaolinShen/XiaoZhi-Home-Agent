@@ -2,11 +2,23 @@
 
 The router is deliberately small: it selects a business path, while the
 specialised Agent/Planner nodes still decide the concrete tool calls.
+
+P3 改造: 兜底分类器的关键词表已迁到 `heuristics.py`（ROUTING_* 常量），
+本模块只保留分类流程本身。语义与迁移前逐字一致。
 """
 
-import re
 from typing import Literal
 from pydantic import BaseModel, Field
+
+from .heuristics import (
+    ROUTING_AUTOMATION_WORDS,
+    ROUTING_CONTROL_WORDS,
+    ROUTING_KNOWLEDGE_WORDS,
+    ROUTING_MEMORY_WORDS,
+    ROUTING_QUERY_WORDS,
+    ROUTING_SCENE_WORDS,
+    has_future_time,
+)
 
 
 Intent = Literal[
@@ -49,31 +61,17 @@ def classify_intent_fallback(text: str) -> IntentResult:
     value = text.strip().lower()
     if not value:
         return IntentResult(intent="clarification", confidence=0.1, reason="请求为空")
-    memory_words = ("记住", "忘记", "删除记忆", "偏好", "喜欢", "家庭规则", "记忆")
-    automation_words = (
-        "定时", "闹钟", "车辆回家", "汽车回家", "到家前", "回家前",
-        "取消例程", "自动化", "提前准备", "提前打开",
-    )
-    knowledge_words = ("故障", "错误代码", "说明书", "怎么清洗", "怎么维护", "支持什么", "是什么意思")
-    scene_words = ("场景", "模式", "睡眠", "离家", "回家", "观影", "起床")
-    query_words = ("查询", "状态", "温度", "开着吗", "在线", "有哪些设备")
-    control_words = ("打开", "关闭", "开启", "关掉", "调到", "设置", "调高", "调低")
-    has_future_time = bool(re.search(
-        r"(?:今天|明天|后天|周[一二三四五六日天]|星期[一二三四五六日天]).{0,10}"
-        r"(?:上午|下午|晚上|早上|凌晨|\d{1,2}\s*[点时])",
-        value,
-    ))
-    if has_future_time or any(word in value for word in automation_words):
+    if has_future_time(value) or any(word in value for word in ROUTING_AUTOMATION_WORDS):
         return IntentResult(intent="automation_management", confidence=0.9, reason="包含定时或事件自动化词")
-    if any(word in value for word in memory_words):
+    if any(word in value for word in ROUTING_MEMORY_WORDS):
         return IntentResult(intent="memory_management", confidence=0.92, reason="包含记忆或偏好操作词")
-    if any(word in value for word in knowledge_words):
+    if any(word in value for word in ROUTING_KNOWLEDGE_WORDS):
         return IntentResult(intent="device_knowledge", confidence=0.9, reason="包含设备知识或故障咨询词")
-    if any(word in value for word in scene_words):
+    if any(word in value for word in ROUTING_SCENE_WORDS):
         return IntentResult(intent="scene_control", confidence=0.88, reason="包含场景或模式词")
-    if any(word in value for word in query_words):
+    if any(word in value for word in ROUTING_QUERY_WORDS):
         return IntentResult(intent="device_query", confidence=0.86, reason="包含设备查询词")
-    if any(word in value for word in control_words):
+    if any(word in value for word in ROUTING_CONTROL_WORDS):
         return IntentResult(intent="device_control", confidence=0.82, reason="包含设备控制词")
     if len(value) < 2:
         return IntentResult(intent="clarification", confidence=0.2, reason="请求信息不足")

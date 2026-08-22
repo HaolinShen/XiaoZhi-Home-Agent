@@ -11,14 +11,12 @@ from src.agent.graph import build_graph
 from src.agent.routing import IntentResult, classify_intent, classify_intent_fallback
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
-from src.tools import set_registry
 
 
 class PhaseEightStructuredRoutingTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.registry = DeviceRegistry(SimulatorBackend())
-        set_registry(self.registry)
         self.directory = SpaceDirectory.from_registry(self.registry, "home-a")
         self.context = AgentContext(
             home_id="home-a", user_id="user-a", session_id="routing-session", client_id="test"

@@ -13,7 +13,6 @@ from src.agent.time_travel import fork_from_checkpoint, list_state_history
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.memory import MemoryScope, MemoryType, MemoryWrite
-from src.tools import set_registry
 
 
 class EchoLLM:
@@ -28,7 +27,6 @@ class PhaseElevenMemoryTimeTravelStreamingTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.registry = DeviceRegistry(SimulatorBackend())
-        set_registry(self.registry)
         self.directory = SpaceDirectory.from_registry(self.registry, "home-a")
         self.context = AgentContext(
             home_id="home-a", user_id="user-a", session_id="phase-eleven", client_id="test"

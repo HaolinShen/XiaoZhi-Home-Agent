@@ -42,21 +42,11 @@ from typing import Optional
 from loguru import logger
 
 from .base import DeviceBackend
+from .capabilities import CAPABILITIES, SENSOR_DEFAULT_DEVICES
 from ..models import (
     AnyDevice,
     DeviceType,
-    LightDevice,
-    ACDevice,
-    TVDevice,
-    CurtainDevice,
     ACMode,
-    FanSpeed,
-    HumidifierDevice,
-    WaterHeaterDevice,
-    KettleDevice,
-    LockDevice,
-    TempHumiditySensor,
-    PresenceSensor,
 )
 
 
@@ -241,144 +231,18 @@ class SimulatorBackend(DeviceBackend):
     # ---- 初始化默认设备 ----
 
     def _init_default_devices(self) -> None:
-        """创建默认的智能家居设备列表"""
-        default_devices: list[AnyDevice] = [
-            # ===== 灯光 =====
-            LightDevice(
-                device_id="living_room_light",
-                name="客厅灯",
-                location="客厅",
-                brightness=80,
-                color="暖白",
-            ),
-            LightDevice(
-                device_id="bedroom_light",
-                name="卧室灯",
-                location="卧室",
-                brightness=60,
-                color="暖白",
-            ),
-            LightDevice(
-                device_id="kitchen_light",
-                name="厨房灯",
-                location="厨房",
-                brightness=100,
-                color="白光",
-            ),
+        """创建默认的智能家居设备列表。
 
-            # ===== 空调 =====
-            ACDevice(
-                device_id="living_room_ac",
-                name="客厅空调",
-                location="客厅",
-                temperature=26,
-                mode=ACMode.COOL,
-                fan_speed=FanSpeed.AUTO,
-            ),
-            ACDevice(
-                device_id="bedroom_ac",
-                name="卧室空调",
-                location="卧室",
-                temperature=26,
-                mode=ACMode.COOL,
-                fan_speed=FanSpeed.AUTO,
-            ),
-
-            # ===== 电视 =====
-            TVDevice(
-                device_id="living_room_tv",
-                name="客厅电视",
-                location="客厅",
-                volume=30,
-                channel="HDMI 1",
-            ),
-
-            # ===== 窗帘 =====
-            CurtainDevice(
-                device_id="living_room_curtain",
-                name="客厅窗帘",
-                location="客厅",
-                position=0,
-            ),
-            CurtainDevice(
-                device_id="bedroom_curtain",
-                name="卧室窗帘",
-                location="卧室",
-                position=0,
-            ),
-
-            # ===== 加湿器 =====
-            HumidifierDevice(
-                device_id="living_room_humidifier",
-                name="客厅加湿器",
-                location="客厅",
-                target_humidity=60,
-                mist_level=FanSpeed.AUTO,
-                water_level=100,
-            ),
-
-            # ===== 电热水器（洗澡用）=====
-            WaterHeaterDevice(
-                device_id="bathroom_water_heater",
-                name="卫生间电热水器",
-                location="卫生间",
-                power=False,
-                target_temp=45,
-            ),
-
-            # ===== 智能门锁 =====
-            # 出厂即锁（locked=True），解锁是对外动作，会走人工审批。
-            LockDevice(
-                device_id="entryway_lock",
-                name="玄关门锁",
-                location="玄关",
-                locked=True,
-                battery=90,
-            ),
-
-            # ===== 电热水壶 =====
-            KettleDevice(
-                device_id="kitchen_kettle",
-                name="厨房烧水壶",
-                location="厨房",
-                power=False,
-                target_temp=100,
-            ),
-
-            # ===== 温湿度传感器（只读）=====
-            # 初始湿度低于加湿器目标湿度 60%，这样"开加湿器 → 湿度上升"
-            # 的闭环一开机就能演示出来。
-            TempHumiditySensor(
-                device_id="living_room_th_sensor",
-                name="客厅温湿度传感器",
-                location="客厅",
-                temperature=27.0,
-                humidity=42,
-            ),
-            TempHumiditySensor(
-                device_id="bedroom_th_sensor",
-                name="卧室温湿度传感器",
-                location="卧室",
-                temperature=26.0,
-                humidity=48,
-            ),
-
-            # ===== 人体存在传感器（只读）=====
-            # last_motion_at 留空表示开机时没有任何活动记录，
-            # 因此 occupied 为 False。测试可以写入具体时间来控制状态。
-            PresenceSensor(
-                device_id="living_room_presence",
-                name="客厅人体传感器",
-                location="客厅",
-                timeout_minutes=15,
-            ),
-            PresenceSensor(
-                device_id="entryway_presence",
-                name="玄关人体传感器",
-                location="玄关",
-                timeout_minutes=5,
-            ),
-        ]
+        P0 改造: 默认实例不再手写在本文件，而是从 capabilities 的
+        CAPABILITIES / SENSOR_DEFAULT_DEVICES 派生 —— 新增设备类型时声明一次，
+        模拟器、工具、规划、关键词匹配全部自动跟上。
+        """
+        default_devices: list[AnyDevice] = []
+        for cap in CAPABILITIES:
+            for model_cls, kwargs in cap.default_devices:
+                default_devices.append(model_cls(**kwargs))
+        for model_cls, kwargs in SENSOR_DEFAULT_DEVICES:
+            default_devices.append(model_cls(**kwargs))
 
         for device in default_devices:
             self._devices[device.device_id] = device
