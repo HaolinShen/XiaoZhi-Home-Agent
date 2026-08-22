@@ -306,6 +306,23 @@ def _invoke_with_approval(
     return graph.get_state(config).values
 
 
+def _release_runtime_resources(automation_runtime, graph) -> None:
+    """释放 CLI 持有的后台线程和 SQLite 连接。
+
+    长期记忆库由 build_graph 内部创建，只作为 graph.memory_repository 暴露出来，
+    所以退出时必须由调用方来关 —— 之前这里只关了 automation_runtime，那个连接
+    一直靠进程退出兜底，一旦 build_graph 被用在长驻服务里就是泄漏。
+    graph 可能为 None（初始化过程中途失败），memory_repository 也可能为 None
+    （关掉了长期记忆），两者都用 getattr 兜住。
+    """
+    if automation_runtime is not None:
+        automation_runtime.close()
+        set_automation_runtime(None)
+    repository = getattr(graph, "memory_repository", None)
+    if repository is not None:
+        repository.close()
+
+
 # ============================================================
 # Agent 对话循环
 # ============================================================
@@ -501,6 +518,7 @@ def chat(
 
     # ---- 构建 Agent 图 ----
     console.print("[dim]正在初始化 Agent...[/dim]")
+    graph = None
     try:
         external_tools = load_external_tools(settings.external_mcp_servers)
         graph = build_graph(registry, settings, space_directory, external_tools=external_tools)
@@ -522,9 +540,7 @@ def chat(
             session_id=session_id,
         )
     except Exception as e:
-        if automation_runtime is not None:
-            automation_runtime.close()
-            set_automation_runtime(None)
+        _release_runtime_resources(automation_runtime, graph)
         console.print(f"\n[red]❌ Agent 初始化失败: {e}[/red]\n")
         console.print(
             "[dim]可能的原因:\n"
@@ -560,9 +576,7 @@ def chat(
             automation_runtime,
         )
     finally:
-        if automation_runtime is not None:
-            automation_runtime.close()
-            set_automation_runtime(None)
+        _release_runtime_resources(automation_runtime, graph)
 
 
 @app.command()
