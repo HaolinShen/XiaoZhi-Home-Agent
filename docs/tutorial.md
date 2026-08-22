@@ -214,7 +214,7 @@ langgraph/
 │   │   ├── routines.py       # 起床、车辆回家例程模板
 │   │   └── runtime.py        # 应用侧自动化运行时
 │   │
-│   ├── middleware/           # 中间件层
+│   ├── middleware/           # 中间件层（教学演示，未接入运行路径，见 4.6）
 │   │   ├── __init__.py
 │   │   └── interceptors.py   # 日志拦截器 + 重试拦截器
 │   │
@@ -1058,6 +1058,10 @@ result = graph.invoke(
 
 ### 4.6 中间件 (`middleware/interceptors.py`)
 
+> ⚠️ **这一层是装饰器模式的教学演示，没有接进运行路径。** 全库没有一处 import 它，
+> 删掉不影响任何功能。之所以留着是因为它把横切关注点的组合讲得很清楚；之所以不接，
+> 是因为直接接进去会坏事，理由见本节末尾的"为什么不接进去"。
+
 **LoggingInterceptor**: 记录每次 Agent 调用的输入/输出/耗时  
 **RetryInterceptor**: LLM 调用失败自动重试（指数退避: 1s→2s→4s）
 
@@ -1067,6 +1071,22 @@ from src.middleware import apply_all_middleware
 # 包装任意函数，自动获得日志+重试能力
 safe_func = apply_all_middleware(original_func)
 ```
+
+**为什么不接进去**
+
+1. `RetryInterceptor` 捕获的是裸 `Exception`。LangGraph 的 `interrupt()` 靠抛
+   `GraphInterrupt` 实现人工审批（见 4.5），被它当成"调用失败"重试，等于用户还没
+   回答、节点就自己又跑了一遍，审批语义直接失效。这是最致命的一条。
+2. LLM 层的重试 `ChatOpenAI(max_retries=2)` 已经在做，而且只重试可重试的错误码。
+   两层叠起来，一个 API Key 无效这类**确定性**错误会被放大到十几次请求，白等七八秒
+   才报错。
+3. `LoggingInterceptor` 想解决的可观测性问题，现在由 loguru 加
+   `observability.py:emit_progress()` 的结构化事件承担（见 6.5.11），后者还能按
+   `PLANNING_EVENTS` / `TRACE_EVENTS` 分级投递到 CLI，比打印字符串摘要有用得多。
+
+要真正启用它，第一步不是找地方调用，而是把 `RetryInterceptor` 改成**按异常类型**判断
+可重试性（至少排除 `GraphInterrupt` 和 `KeyboardInterrupt`），再决定和内层重试怎么分工。
+这本身就是个不错的练习。
 
 ### 4.7 MCP 集成 (`mcp/`)
 
@@ -1409,6 +1429,10 @@ def tick_environment(self) -> None:
 默认实现返回 `None` 表达的是“不需要做任何事”，语义准确。
 
 ### 6.3 添加自定义中间件
+
+> 前提同 4.6：中间件层目前是纯演示，下面这个 `MetricsInterceptor` 写完也不会被自动
+> 调用。真要在本项目里做指标采集，接 `emit_progress()` 的事件流（6.5.11）比包装函数
+> 更贴合现有结构 —— 事件里已经带了节点名和阶段，不用自己从 `func` 反推。
 
 ```python
 from src.middleware.interceptors import LoggingInterceptor
@@ -2459,7 +2483,7 @@ def _is_admin(config: RunnableConfig) -> bool:
 
 `RunnableConfig` 是 LangChain 注入的参数——写在工具签名里，LangChain 会自动传入，但**不会出现在生成给 LLM 的 JSON Schema 中**。模型看到的 `save_personal_memory` 只有 `memory_key`、`memory_value`、`source` 三个参数，根本没有位置去指定 `home_id`。
 
-**看一个完整工具：`src/tools/memory.py:52-72`**
+**看一个完整工具：`src/tools/memory.py:68-88`**
 
 ```python
 @tool
@@ -2482,11 +2506,11 @@ def save_personal_memory(
     return f"已保存个人记忆 {record.memory_key}（id={record.id}）"
 ```
 
-`scope` 和 `memory_type` 写死为 `USER` / `PREFERENCE`。模型**不能**通过这个工具写家庭规则——那要走 `save_home_rule`，而后者会带上 `is_admin=_is_admin(config)`（`memory.py:95`）交给 Service 校验。两个工具分开，权限差异就体现在工具本身，而不是靠一个模型可控的参数来区分。
+`scope` 和 `memory_type` 写死为 `USER` / `PREFERENCE`。模型**不能**通过这个工具写家庭规则——那要走 `save_home_rule`，而后者会带上 `is_admin=_is_admin(config)`（`memory.py:111`）交给 Service 校验。两个工具分开，权限差异就体现在工具本身，而不是靠一个模型可控的参数来区分。
 
 九个工具开头都有同一句 `if _service is None: return "长期记忆未启用"`。返回文本而不是抛异常，是因为这是**配置状态**而非错误：`ENABLE_LONG_TERM_MEMORY=false` 时模型该知道这条路走不通，然后换别的方式回答。
 
-**路径 ② 的触发点：`src/tools/memory.py:39-49`**
+**路径 ② 的触发点：`src/tools/memory.py:42-66`**
 
 ```python
 def record_preference_operation(
@@ -3059,7 +3083,7 @@ if not use_planner and (intent.intent == "clarification"
 
 三个关键点：
 
-**① Planner 优先级最高。** 每个后续分支都带 `not use_planner` 前置条件，所以复杂多步任务不会被降级成 RAG 或澄清。而且判断多步任务用的**不是 LLM 意图**，而是独立的规则函数 `should_use_planner`（`planning.py:63`）：数一句话里有几个动作词、涉及几类设备、有没有"然后/同时/并且"这类连接词，`动作 ≥ 2 且（设备种类 ≥ 2 或有连接词）` 才成立。它还专门排除了预定义场景——"我要睡了"归场景分支，不进 Planner。
+**① Planner 优先级最高。** 每个后续分支都带 `not use_planner` 前置条件，所以复杂多步任务不会被降级成 RAG 或澄清。而且判断多步任务用的**不是 LLM 意图**，而是独立的规则函数 `should_use_planner`（`planning.py:245`）：数一句话里有几个动作词、涉及几类设备、有没有"然后/同时/并且"这类连接词，`动作 ≥ 2 且（设备种类 ≥ 2 或有连接词）` 才成立。它还专门排除了预定义场景——"我要睡了"归场景分支，不进 Planner。
 
 **② 意图对了还得条件成立。** `device_knowledge` 只有在 `RAG_ENABLED=true` 时才走 RAG，否则回落 ReAct；`device_query` 只有在**真的涉及 2 个以上设备**时才走并行子图（`parallel.py:38`），查单个设备走并行反而是浪费。
 

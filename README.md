@@ -346,7 +346,7 @@ langgraph/
 │   │   └── memory.py           # 受可信上下文约束的记忆工具
 │   │
 │   └── middleware/
-│       └── interceptors.py     # 中间件（日志 + 重试）
+│       └── interceptors.py     # 中间件（日志 + 重试）—— 教学演示，未接入运行路径
 │
 └── tests/
     └── visualize_graph.ipynb   # LangGraph 图可视化 Notebook

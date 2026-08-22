@@ -3,6 +3,23 @@
 ==========
 提供 Agent 运行时的横切关注点（Cross-cutting Concerns）处理。
 
+⚠️ 本模块是装饰器模式的教学演示，**未接入任何运行路径**。
+   全库没有一处 import 它，删掉也不会影响功能。之所以保留，是因为它演示了
+   横切关注点的组合方式；之所以不接进去，有三个具体原因：
+
+   1. RetryInterceptor 无条件重试所有 Exception。LangGraph 的 `interrupt()`
+      靠抛 GraphInterrupt 实现人工审批，被它捕获重试会直接破坏审批语义 ——
+      用户还没回答，同一个节点就又跑了一遍。
+   2. LLM 层的重试 ChatOpenAI(max_retries=2) 已经在做，而且只重试可重试的
+      错误码。叠加之后，一个 API Key 无效这类确定性错误会被放大到十几次请求，
+      白等七八秒才报错。
+   3. LoggingInterceptor 想解决的可观测性问题，现在由 loguru 加
+      `src/agent/observability.py:emit_progress()` 的结构化事件承担，后者
+      还能按 PLANNING_EVENTS / TRACE_EVENTS 分级投递到 CLI。
+
+   要真正启用它，先把 RetryInterceptor 改成按异常类型判断可重试性
+   （至少排除 GraphInterrupt 与 KeyboardInterrupt），再决定和内层重试如何分工。
+
 中间件栈:
   ┌──────────────────┐
   │  LoggingInterceptor  │ ← 记录每次 LLM 调用和工具执行

@@ -52,3 +52,7 @@ logs/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# 个人答辩材料：含演示话术，只在本地保留
+docs/defense-script.md
+docs/defense-deep-dive.md
