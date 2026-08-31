@@ -16,8 +16,8 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server import FastMCP
 
+from mcp.server import FastMCP
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 CAIYUN_BASE_URL = "https://api.caiyunapp.com/v2.6"

@@ -22,12 +22,14 @@ P1 改造: `build_scene_tools(registry)` 工厂以闭包持有 registry，
 不再经过模块级单例。
 """
 
+from collections.abc import Callable
+
 from langchain_core.tools import StructuredTool
 from loguru import logger
 
-from ..models import DeviceType
 from ..devices.base import DeviceRegistry
 from ..devices.capabilities import SCENE_EXIT_TYPES
+from ..models import DeviceType
 
 # 离家/睡眠批量操作按 scene_exit 分组的类型集合（从能力声明派生，禁止手写）。
 _POWER_OFF_ON_EXIT = SCENE_EXIT_TYPES["power_off"]
@@ -67,7 +69,7 @@ SCENE_META = {
 }
 
 
-def _activate_scene(registry: DeviceRegistry) -> str:
+def _activate_scene(registry: DeviceRegistry) -> Callable[[str], str]:
 
     def activate_scene(scene_name: str) -> str:
         """
@@ -201,7 +203,7 @@ def _activate_scene(registry: DeviceRegistry) -> str:
     return activate_scene
 
 
-def _list_scenes() -> str:
+def _list_scenes() -> Callable[[str], str]:
 
     def list_scenes(query: str = "") -> str:
         """

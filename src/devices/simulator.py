@@ -37,18 +37,22 @@
   的文档字符串——让读取本身改状态会导致验证器读到的值随调用次数漂移。
 """
 
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta
+from typing import cast
+
 from loguru import logger
 
-from .base import DeviceBackend
-from .capabilities import CAPABILITIES, SENSOR_DEFAULT_DEVICES
 from ..models import (
+    ACDevice,
+    ACMode,
     AnyDevice,
     DeviceType,
-    ACMode,
+    HumidifierDevice,
+    PresenceSensor,
+    TempHumiditySensor,
 )
-
+from .base import DeviceBackend
+from .capabilities import CAPABILITIES, SENSOR_DEFAULT_DEVICES
 
 # 每次推演环境时读数的变化步长。
 # 取小值是为了让多次读取能看出趋势，而不是一步跳到目标。
@@ -76,7 +80,7 @@ class SimulatorBackend(DeviceBackend):
 
     # ---- 接口实现 ----
 
-    def get(self, device_id: str) -> Optional[AnyDevice]:
+    def get(self, device_id: str) -> AnyDevice | None:
         return self._devices.get(device_id)
 
     def get_all(self) -> dict[str, AnyDevice]:
@@ -154,11 +158,13 @@ class SimulatorBackend(DeviceBackend):
         """
         for device_id, sensor in list(self._devices.items()):
             if sensor.device_type == DeviceType.TEMP_HUMIDITY_SENSOR:
-                self._tick_temp_humidity(device_id, sensor)
+                # 运行期已按 device_type 分派，mypy 无法从枚举比较收窄联合类型，
+                # 这里用 cast 把"分派保证"写给类型检查器看——不是在骗它。
+                self._tick_temp_humidity(device_id, cast(TempHumiditySensor, sensor))
             elif sensor.device_type == DeviceType.PRESENCE_SENSOR:
-                self._tick_presence(device_id, sensor)
+                self._tick_presence(device_id, cast(PresenceSensor, sensor))
 
-    def _tick_temp_humidity(self, device_id: str, sensor: AnyDevice) -> None:
+    def _tick_temp_humidity(self, device_id: str, sensor: TempHumiditySensor) -> None:
         """推进一个温湿度传感器的读数"""
         if not sensor.power:
             return
@@ -167,7 +173,9 @@ class SimulatorBackend(DeviceBackend):
         humidity = sensor.humidity
 
         # ---- 温度: 跟随同房间正在运行的空调 ----
-        ac = self._first_running(sensor.location, DeviceType.AC)
+        # _first_running 按 device_type 过滤，拿到的必然是空调——cast 把这条
+        # 运行期保证写给类型检查器（与上面的分派 cast 同理）。
+        ac = cast(ACDevice | None, self._first_running(sensor.location, DeviceType.AC))
         if ac is not None:
             target = float(ac.temperature)
             if ac.mode == ACMode.COOL and temperature > target:
@@ -176,7 +184,10 @@ class SimulatorBackend(DeviceBackend):
                 temperature = min(target, temperature + _TEMP_STEP)
 
         # ---- 湿度: 加湿器工作则上升，否则自然回落 ----
-        humidifier = self._first_running(sensor.location, DeviceType.HUMIDIFIER)
+        humidifier = cast(
+            HumidifierDevice | None,
+            self._first_running(sensor.location, DeviceType.HUMIDIFIER),
+        )
         if humidifier is not None and humidifier.water_level > 0:
             target_humidity = humidifier.target_humidity
             if humidity < target_humidity:
@@ -189,7 +200,7 @@ class SimulatorBackend(DeviceBackend):
         if temperature != sensor.temperature or humidity != sensor.humidity:
             self.update(device_id, temperature=round(temperature, 1), humidity=humidity)
 
-    def _tick_presence(self, device_id: str, sensor: AnyDevice) -> None:
+    def _tick_presence(self, device_id: str, sensor: PresenceSensor) -> None:
         """按超时规则推算一个人体传感器的占用状态"""
         if not sensor.power:
             return
@@ -208,16 +219,16 @@ class SimulatorBackend(DeviceBackend):
             return
 
         if last_motion.tzinfo is None:
-            last_motion = last_motion.replace(tzinfo=timezone.utc)
+            last_motion = last_motion.replace(tzinfo=UTC)
 
         deadline = last_motion + timedelta(minutes=sensor.timeout_minutes)
-        occupied = datetime.now(timezone.utc) <= deadline
+        occupied = datetime.now(UTC) <= deadline
         if occupied != sensor.occupied:
             self.update(device_id, occupied=occupied)
 
     def _first_running(
         self, location: str, device_type: DeviceType
-    ) -> Optional[AnyDevice]:
+    ) -> AnyDevice | None:
         """找到指定房间里第一台正在运行的该类型设备，没有则返回 None"""
         for device in self._devices.values():
             if (

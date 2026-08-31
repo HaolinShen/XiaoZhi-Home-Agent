@@ -72,7 +72,7 @@ def _make_control_tool(
     def _fn(
         device_name: str,
         action: str,
-        config: RunnableConfig = None,
+        config: RunnableConfig = None,  # type: ignore[assignment]  # LangChain 运行时注入 config；默认 None 仅为允许不经 LangChain 直接调用,
         **kwargs: Any,
     ) -> str:
         # config 是 RunnableConfig 类型的具名参数：LangChain 依据签名注入可信身份，

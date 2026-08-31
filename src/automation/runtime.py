@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from ..devices.base import DeviceRegistry
@@ -41,7 +41,7 @@ class AutomationRuntime:
     def schedule_wake(self, home_id: str, user_id: str, wake_at: datetime):
         if wake_at.tzinfo is None:
             wake_at = wake_at.replace(tzinfo=self.timezone)
-        if wake_at <= datetime.now(timezone.utc):
+        if wake_at <= datetime.now(UTC):
             raise ValueError("起床时间必须晚于当前时间")
         routine = self.store.save_routine(build_wake_routine(home_id, user_id))
         tasks = self.scheduler.schedule(
@@ -61,7 +61,7 @@ class AutomationRuntime:
     ):
         if anchor_at.tzinfo is None:
             anchor_at = anchor_at.replace(tzinfo=self.timezone)
-        if anchor_at <= datetime.now(timezone.utc):
+        if anchor_at <= datetime.now(UTC):
             raise ValueError("目标时间必须晚于当前时间")
         actions = normalize_and_validate_automation_actions(actions, self.registry)
         routine = self.store.save_routine(

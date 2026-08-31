@@ -1,6 +1,6 @@
 """设备模块"""
 
-from .base import DeviceRegistry, DeviceBackend
+from .base import DeviceBackend, DeviceRegistry
 from .simulator import SimulatorBackend
 
 __all__ = [

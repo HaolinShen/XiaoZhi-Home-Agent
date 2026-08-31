@@ -8,6 +8,7 @@ P3 改造: 兜底分类器的关键词表已迁到 `heuristics.py`（ROUTING_* �
 """
 
 from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from .heuristics import (
@@ -19,7 +20,6 @@ from .heuristics import (
     ROUTING_SCENE_WORDS,
     has_future_time,
 )
-
 
 Intent = Literal[
     "device_query",

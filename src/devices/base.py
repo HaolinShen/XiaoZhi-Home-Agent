@@ -15,21 +15,16 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Callable
+from collections.abc import Iterable
+
 from loguru import logger
 
 from ..models import (
-    BaseDevice,
+    SENSOR_DEVICE_TYPES,
     AnyDevice,
     DeviceType,
-    LightDevice,
-    ACDevice,
-    TVDevice,
-    CurtainDevice,
-    SENSOR_DEVICE_TYPES,
 )
 from .capabilities import TYPE_KEYWORDS
-
 
 # 设备名模糊匹配时忽略的助词与量词。
 # 让"客厅的灯""那台空调"能匹配到"客厅灯""客厅空调"，
@@ -55,7 +50,7 @@ class DeviceBackend(ABC):
     """
 
     @abstractmethod
-    def get(self, device_id: str) -> Optional[AnyDevice]:
+    def get(self, device_id: str) -> AnyDevice | None:
         """根据 ID 获取设备"""
         ...
 
@@ -127,7 +122,7 @@ class DeviceRegistry:
 
     # ---- 设备查找 ----
 
-    def get(self, device_id: str) -> Optional[AnyDevice]:
+    def get(self, device_id: str) -> AnyDevice | None:
         """精确 ID 查找"""
         return self._backend.get(device_id)
 
@@ -139,7 +134,7 @@ class DeviceRegistry:
         """按类型获取设备"""
         return self._backend.get_by_type(device_type)
 
-    def find(self, user_input: str, device_type: DeviceType) -> Optional[AnyDevice]:
+    def find(self, user_input: str, device_type: DeviceType) -> AnyDevice | None:
         """
         模糊查找设备。
 
@@ -180,7 +175,9 @@ class DeviceRegistry:
         # 关键词表来自 capabilities.TYPE_KEYWORDS（P0 单一数据源）：
         # 新增设备类型时在那里声明一次，find 的匹配、工具 docstring、模拟器
         # 默认实例全部自动跟上，不用再手改本文件。
-        keywords = TYPE_KEYWORDS.get(device_type, [])
+        # 注解写成 Iterable：get() 的默认值是 list 而表里存的是 tuple，
+        # 让两者都合法，不为了类型把默认值改成空 tuple。
+        keywords: Iterable[str] = TYPE_KEYWORDS.get(device_type, ())
         for kw in keywords:
             if kw in user_input:
                 # 多候选时拒绝猜测，让 Agent 向用户澄清。

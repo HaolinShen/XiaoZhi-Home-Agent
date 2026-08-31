@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 import json
 import math
 import re
+from datetime import timedelta
 
-from .models import MemoryRecord, MemoryScope, MemoryType, MemoryWrite, PreferenceCandidate, utc_now
-from .extractor import extract_memory_candidates
-from .repository import MemoryRepository
 from ..agent.context import AgentContext, SpaceDirectory
+from .extractor import extract_memory_candidates
+from .models import MemoryRecord, MemoryScope, MemoryType, MemoryWrite, PreferenceCandidate, utc_now
+from .repository import MemoryRepository
 
 
 class MemoryPermissionError(PermissionError):
@@ -137,7 +137,14 @@ class MemoryService:
             "reason": "memory_scale_threshold_reached" if count >= threshold else "structured_filters_sufficient",
         }
 
-    def list(self, context: AgentContext) -> list[MemoryRecord]:
+    def list_memories(self, context: AgentContext) -> list[MemoryRecord]:
+        """列出当前上下文可访问的全部记忆。
+
+        方法名刻意不叫 `list`：在类作用域里，一个叫 list 的方法会遮蔽内建
+        list 类型，定义在它之后的所有 `-> list[X]` 注解都会解析到方法自身，
+        mypy 报 "Function is not valid as a type"，而且这个雷会咬到
+        今后加在它后面的每一个新方法。
+        """
         self.spaces.validate(context)
         room_id = context.room_id or self.spaces.room_for_device(context.device_id)
         return self.repository.list_accessible(
@@ -150,7 +157,7 @@ class MemoryService:
         """Rank accessible memories by relevance, confidence, importance and use."""
         if top_k < 1:
             raise ValueError("top_k must be positive")
-        records = self.list(context)
+        records = self.list_memories(context)
         if not records:
             return []
         now = utc_now()

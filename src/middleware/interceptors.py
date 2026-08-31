@@ -34,9 +34,10 @@
 """
 
 import time
-from typing import Any, Callable
-from loguru import logger
+from collections.abc import Callable
+from typing import Any
 
+from loguru import logger
 
 # ============================================================
 # 日志中间件
@@ -118,7 +119,7 @@ class RetryInterceptor:
     BASE_DELAY = 1.0  # 基础等待秒数
 
     @classmethod
-    def wrap(cls, func: Callable, max_retries: int = None) -> Callable:
+    def wrap(cls, func: Callable, max_retries: int | None = None) -> Callable:
         """
         包装一个函数，添加自动重试。
 

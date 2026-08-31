@@ -1,11 +1,11 @@
 """Subgraph and dynamic fan-out for independent device status queries."""
 
 import operator
-from typing import Annotated
-from typing_extensions import NotRequired, TypedDict
+from typing import Annotated, NotRequired
 
 from langgraph.graph import END, StateGraph
 from langgraph.types import Send
+from typing_extensions import TypedDict
 
 from ..devices.base import DeviceRegistry
 

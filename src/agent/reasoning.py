@@ -1,6 +1,7 @@
 """Explicit, auditable reasoning over retrieved long-term memories."""
 
 from typing import Any
+
 from pydantic import BaseModel, Field
 
 

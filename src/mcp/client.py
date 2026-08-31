@@ -13,9 +13,10 @@ import asyncio
 import json
 import re
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional
 
 from langchain_core.tools import StructuredTool
 from loguru import logger
@@ -28,11 +29,11 @@ class ExternalMCPService:
 
     name: str = "unknown"
     transport: str = "stdio"
-    command: Optional[str] = None
+    command: str | None = None
     args: list[str] = field(default_factory=list)
-    url: Optional[str] = None
-    cwd: Optional[str] = None
-    env: Optional[dict[str, str]] = None
+    url: str | None = None
+    cwd: str | None = None
+    env: dict[str, str] | None = None
 
 
 def parse_services_config(config_str: str) -> list[ExternalMCPService]:
@@ -137,10 +138,13 @@ def _args_model(service_name: str, tool_name: str, schema: dict[str, Any]) -> ty
             fields[name] = (python_type, Field(..., description=description))
         else:
             default = property_schema.get("default", None)
-            fields[name] = (Optional[python_type], Field(default, description=description))
+            # python_type 是运行期变量，Optional[X] 在动态构模场景下语义最明确，
+            # 不改成 `X | None`（后者对运行期值的兼容性依赖 types.UnionType）。
+            fields[name] = (Optional[python_type], Field(default, description=description))  # noqa: UP045
 
     model_name = re.sub(r"\W+", "_", f"{service_name}_{tool_name}_Input")
-    return create_model(model_name, **fields)
+    # create_model 的重载不支持动态 **fields——字段集是运行期从 MCP schema 生成的。
+    return create_model(model_name, **fields)  # type: ignore[call-overload]
 
 
 def _format_result(result: Any) -> str:

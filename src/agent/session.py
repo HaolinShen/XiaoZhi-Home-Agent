@@ -6,8 +6,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
-from .context import AgentContext, SpaceDirectory
 from ..memory.store import cleanup_expired_checkpoints
+from .context import AgentContext, SpaceDirectory
 
 
 @dataclass

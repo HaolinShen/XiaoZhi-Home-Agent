@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from ..agent.planning import PLANNING_TOOL_NAMES, expected_state_for_step
 from ..devices.base import DeviceRegistry
 
-
 # 自动化允许的工具名 = 规划控制工具 + 闹钟（P0：从 PLANNING_TOOL_NAMES 派生，
 # 以前这里手抄一份 control_xxx 清单，是第 11 处需要同步的副本）。
 AutomationToolName = Literal[tuple((*PLANNING_TOOL_NAMES, "set_alarm"))]  # type: ignore[valid-type]
@@ -40,7 +39,7 @@ class ScheduledActionInput(BaseModel):
         le=1440,
         description="相对目标时间的分钟偏移；提前执行用负数，例如提前30分钟为-30",
     )
-    tool_name: AutomationToolName
+    tool_name: AutomationToolName  # type: ignore[valid-type]  # 动态 Literal，运行期由 pydantic 求值
     arguments: dict[str, Any] = Field(default_factory=dict)
     description: str = Field(min_length=1)
 
@@ -131,9 +130,9 @@ def normalize_and_validate_automation_actions(
             raise ValueError(f"步骤 {index} 使用了不允许的工具 {action.tool_name}")
 
         arguments = dict(action.arguments)
-        arguments["action"] = AUTOMATION_ACTION_ALIASES.get(
-            arguments.get("action"), arguments.get("action")
-        )
+        raw_action = arguments.get("action")
+        if raw_action is not None:
+            arguments["action"] = AUTOMATION_ACTION_ALIASES.get(raw_action, raw_action)
         device_id = arguments.pop("device_id", None)
         if not arguments.get("device_name") and device_id:
             device = registry.get(str(device_id))

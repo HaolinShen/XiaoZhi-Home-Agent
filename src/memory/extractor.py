@@ -10,7 +10,6 @@ import re
 
 from .models import ExtractedMemoryCandidate
 
-
 _STABLE_MARKERS = ("我喜欢", "我偏好", "我习惯", "我通常", "我一般", "以后都", "以后请")
 _TEMPORARY_MARKERS = ("今天", "这次", "现在", "有点", "暂时", "刚才")
 

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timedelta, timezone
-from typing import Callable
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 from .executor import RoutineExecutor
 from .models import Routine, RoutineRun, ScheduledTask
@@ -37,7 +37,7 @@ class RoutineScheduler:
         trigger_key: str,
         now: datetime | None = None,
     ) -> list[ScheduledTask]:
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         run = RoutineRun(routine_id=routine.id, trigger_key=trigger_key, anchor_at=anchor_at)
         self.store.create_run(run)
         scheduled: list[ScheduledTask] = []
@@ -77,7 +77,7 @@ class RoutineScheduler:
         return scheduled
 
     def tick(self, now: datetime | None = None) -> list[dict]:
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         results: list[dict] = []
         for task in self.store.due_tasks(now):
             task.status = "running"

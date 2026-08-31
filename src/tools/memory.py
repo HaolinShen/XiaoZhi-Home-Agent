@@ -8,6 +8,7 @@ P1 改造: 工具不再读模块级 `_service` 单例，而是由 `build_memory_
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -113,7 +114,7 @@ def _build_memory_tools(service: MemoryService | None) -> list[StructuredTool]:
         """List shared and personal memories accessible in the current request scope."""
         if service is None:
             return "长期记忆未启用"
-        records = service.list(_context(config))
+        records = service.list_memories(_context(config))
         return json.dumps([
             {"id": r.id, "scope": r.scope.value, "key": r.memory_key, "value": r.memory_value}
             for r in records
@@ -179,7 +180,9 @@ def _build_memory_tools(service: MemoryService | None) -> list[StructuredTool]:
             for v in versions
         ], ensure_ascii=False)
 
-    functions = [
+    # 显式标注：不写的话列表元素类型被推断成第一个函数的具体签名，
+    # 后面 from_function 对其余函数全部报错。
+    functions: list[Callable[..., str]] = [
         save_personal_memory,
         save_home_rule,
         list_personal_memories,
@@ -190,6 +193,7 @@ def _build_memory_tools(service: MemoryService | None) -> list[StructuredTool]:
         reject_preference_candidate,
         list_memory_versions,
     ]
+    # 不标注的话，列表类型会被推断成第一个函数的具体签名，from_function 随之报错
     return [
         StructuredTool.from_function(fn, name=fn.__name__, description=fn.__doc__)
         for fn in functions

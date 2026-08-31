@@ -2,7 +2,6 @@
 
 from typing import Literal
 
-
 AgentRole = Literal["device", "scene", "memory", "automation", "knowledge", "chat"]
 
 

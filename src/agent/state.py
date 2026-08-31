@@ -8,9 +8,10 @@ State 设计原则:
   - 可以添加额外字段（如 device_context, user_profile 等）用于增强 Agent 能力
 """
 
-from typing import Annotated, Any, Literal
-from typing_extensions import NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired
+
 from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
 
 
 class AgentState(TypedDict):

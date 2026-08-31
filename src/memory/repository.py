@@ -6,11 +6,17 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from .models import (
-    MemoryConflict, MemoryRecord, MemoryScope, MemoryType, MemoryVersion,
-    MemoryWrite, PreferenceCandidate, utc_now,
+    MemoryConflict,
+    MemoryRecord,
+    MemoryScope,
+    MemoryType,
+    MemoryVersion,
+    MemoryWrite,
+    PreferenceCandidate,
+    utc_now,
 )
 
 

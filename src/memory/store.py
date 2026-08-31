@@ -20,21 +20,21 @@
 
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-from loguru import logger
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
+from loguru import logger
 
 try:
     from langgraph.checkpoint.sqlite import SqliteSaver
     _HAS_SQLITE = True
 except ImportError:
-    SqliteSaver = None
+    SqliteSaver = None  # type: ignore[assignment,misc]  # 条件导入的标准回退
     _HAS_SQLITE = False
 
 
-def create_checkpointer(db_path: Optional[str] = None):
+def create_checkpointer(db_path: str | None = None):
     """
     创建检查点存储器。
 
@@ -93,8 +93,8 @@ def cleanup_expired_checkpoints(
     now: datetime | None = None,
 ) -> int:
     """Delete checkpoint threads whose latest snapshot is older than ``ttl``."""
-    now = now or datetime.now(timezone.utc)
-    latest_by_thread = {}
+    now = now or datetime.now(UTC)
+    latest_by_thread: dict[str, Any] = {}
     for item in checkpointer.list(None):
         configurable = item.config.get("configurable", {})
         thread_id = configurable.get("thread_id")
@@ -110,7 +110,7 @@ def cleanup_expired_checkpoints(
     expired = [
         thread_id
         for thread_id, timestamp in latest_by_thread.items()
-        if now - timestamp.astimezone(timezone.utc) >= ttl
+        if now - timestamp.astimezone(UTC) >= ttl
     ]
     for thread_id in expired:
         checkpointer.delete_thread(thread_id)

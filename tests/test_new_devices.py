@@ -8,7 +8,7 @@ from src.agent.approval import build_approval_request
 from src.agent.planning import expected_state_for_step
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
-from src.models import KettleDevice, LockDevice, WaterHeaterDevice
+from src.models import KettleDevice, WaterHeaterDevice
 from src.tools import build_all_tools
 
 
@@ -50,7 +50,7 @@ class WaterHeaterDeviceTests(unittest.TestCase):
         self.assertIn("50°C", temp_result)
         self.assertEqual(self.registry.get("bathroom_water_heater").target_temp, 50)
 
-        off_result = self.tools["control_water_heater"].invoke({
+        self.tools["control_water_heater"].invoke({
             "device_name": "卫生间电热水器", "action": "off",
         })
         self.assertFalse(self.registry.get("bathroom_water_heater").power)

@@ -122,7 +122,7 @@ class MemoryPhaseTwoTests(unittest.TestCase):
         self.repository.close()
         self.repository = MemoryRepository(str(self.db_path))
         self.service = MemoryService(self.repository, self.directory)
-        records = self.service.list(context)
+        records = self.service.list_memories(context)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].memory_value, {"color": "冷白光"})
 
@@ -134,9 +134,9 @@ class MemoryPhaseTwoTests(unittest.TestCase):
             {"color": "蓝光"},
         )
 
-        self.assertEqual(len(self.service.list(self.context())), 1)
-        self.assertEqual(len(self.service.list(self.context(user_id="user-b"))), 0)
-        home_b = self.service.list(self.context("home-b", "user-b"))
+        self.assertEqual(len(self.service.list_memories(self.context())), 1)
+        self.assertEqual(len(self.service.list_memories(self.context(user_id="user-b"))), 0)
+        home_b = self.service.list_memories(self.context("home-b", "user-b"))
         self.assertEqual(home_b[0].memory_value, {"color": "蓝光"})
 
     def test_shared_rules_are_visible_but_personal_preferences_are_private(self) -> None:
@@ -152,7 +152,7 @@ class MemoryPhaseTwoTests(unittest.TestCase):
         )
         self.save_personal(admin, "lighting.color", {"color": "暖光"})
 
-        other_user_records = self.service.list(self.context(user_id="user-b"))
+        other_user_records = self.service.list_memories(self.context(user_id="user-b"))
         self.assertEqual([record.memory_key for record in other_user_records], ["quiet_hours"])
 
     def test_shared_memory_write_requires_admin(self) -> None:
@@ -204,7 +204,7 @@ class MemoryPhaseTwoTests(unittest.TestCase):
 
         room_keys = {
             record.memory_key
-            for record in self.service.list(
+            for record in self.service.list_memories(
                 self.context(room_id="living_room")
             )
         }
@@ -215,7 +215,7 @@ class MemoryPhaseTwoTests(unittest.TestCase):
 
         device_keys = {
             record.memory_key
-            for record in self.service.list(self.context(device_id="light-a"))
+            for record in self.service.list_memories(self.context(device_id="light-a"))
         }
         self.assertEqual(
             device_keys,
@@ -267,7 +267,7 @@ class MemoryPhaseTwoTests(unittest.TestCase):
         updated = self.service.update(owner, record.id, {"color": "冷白光"})
         self.assertEqual(updated.memory_value, {"color": "冷白光"})
         self.assertTrue(self.service.delete(owner, record.id))
-        self.assertEqual(self.service.list(owner), [])
+        self.assertEqual(self.service.list_memories(owner), [])
         with self.assertRaises(KeyError):
             self.service.get(owner, record.id)
 
@@ -297,7 +297,7 @@ class MemoryPhaseTwoTests(unittest.TestCase):
         listed = tools["list_personal_memories"].invoke({}, config=config)
         self.assertIn("lighting.color", listed)
 
-        record = self.service.list(self.context())[0]
+        record = self.service.list_memories(self.context())[0]
         updated = tools["update_personal_memory"].invoke(
             {
                 "memory_id": record.id,

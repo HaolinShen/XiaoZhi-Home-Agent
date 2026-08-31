@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -86,7 +86,7 @@ class SpaceDirectory:
         cls,
         registry: DeviceRegistry,
         home_id: str,
-    ) -> "SpaceDirectory":
+    ) -> SpaceDirectory:
         """Create a directory for the single-home simulator backend."""
         devices: dict[str, DeviceLocation] = {}
         rooms: set[str] = set()

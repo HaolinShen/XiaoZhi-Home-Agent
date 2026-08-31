@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,13 +11,13 @@ from langgraph.types import Command
 
 from src.agent.approval import build_approval_request
 from src.agent.context import AgentContext, SpaceDirectory
-from src.agent.graph import build_graph, _required_automation_tool
+from src.agent.graph import _required_automation_tool, build_graph
 from src.agent.multi_agent import agent_for_intent
 from src.agent.routing import classify_intent_fallback
 from src.automation.executor import RoutineExecutor
+from src.automation.planning import ScheduledActionInput
 from src.automation.routines import build_arrival_routine, build_wake_routine
 from src.automation.runtime import AutomationRuntime
-from src.automation.planning import ScheduledActionInput
 from src.automation.scheduler import RoutineScheduler
 from src.automation.speaker import SimulatorSpeakerBackend
 from src.automation.store import AutomationStore
@@ -27,8 +27,7 @@ from src.devices.simulator import SimulatorBackend
 from src.memory import MemoryRepository, MemoryService
 from src.tools import build_automation_tools, build_device_tools
 
-
-UTC = timezone.utc
+UTC = UTC
 
 
 class AutomationRoutineTests(unittest.TestCase):

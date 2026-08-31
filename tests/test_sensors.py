@@ -8,7 +8,7 @@
 """
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 
@@ -26,7 +26,7 @@ from src.tools import build_all_tools
 
 def _iso_minutes_ago(minutes: int) -> str:
     """生成一个"N 分钟前"的 ISO 8601 时间戳（带 UTC 时区）"""
-    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
 
 
 class SensorModelTests(unittest.TestCase):

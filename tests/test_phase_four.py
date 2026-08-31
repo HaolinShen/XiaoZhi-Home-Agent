@@ -4,12 +4,12 @@ from datetime import timedelta
 from pathlib import Path
 
 from src.agent.context import AgentContext, DeviceLocation, SpaceDirectory
-from src.memory import MemoryRepository, MemoryScope, MemoryService, MemoryType, MemoryWrite
-from src.memory.models import utc_now
-from src.tools.memory import build_memory_tools
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
+from src.memory import MemoryRepository, MemoryScope, MemoryService, MemoryType, MemoryWrite
+from src.memory.models import utc_now
 from src.tools.devices import build_device_tools
+from src.tools.memory import build_memory_tools
 
 
 class PhaseFourTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class PhaseFourTests(unittest.TestCase):
         )
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.observation_count, 3)
-        self.assertEqual(self.service.list(self.context), [])
+        self.assertEqual(self.service.list_memories(self.context), [])
 
     def test_successful_device_settings_feed_candidate_observations(self):
         registry = DeviceRegistry(SimulatorBackend())
@@ -83,7 +83,7 @@ class PhaseFourTests(unittest.TestCase):
                 self.context, "ac.fan", {"fan_speed": "low"}
             )
         self.assertTrue(self.service.reject_candidate(self.context, second.id))
-        self.assertEqual([item.memory_key for item in self.service.list(self.context)], ["ac.temperature"])
+        self.assertEqual([item.memory_key for item in self.service.list_memories(self.context)], ["ac.temperature"])
 
     def test_candidates_are_isolated_by_user_and_tools_require_trusted_context(self):
         for _ in range(3):

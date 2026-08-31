@@ -8,8 +8,8 @@ Agent 根本看不到这些工具，比旧行为"调用时报 '尚未初始化'"
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime, tzinfo
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from langchain_core.runnables import RunnableConfig
@@ -20,10 +20,6 @@ from ..automation.planning import (
     ScheduledRoutineInput,
     VehicleRoutineInput,
 )
-if TYPE_CHECKING:
-    from ..automation.runtime import AutomationRuntime
-
-UTC = timezone.utc
 
 _TASK_STATUS_TEXT = {
     "pending": "待执行",
@@ -43,7 +39,7 @@ def _identity(config: RunnableConfig | None) -> tuple[str, str]:
     return str(home_id), str(user_id)
 
 
-def _local_time(value: datetime | None, zone: ZoneInfo) -> str | None:
+def _local_time(value: datetime | None, zone: tzinfo) -> str | None:
     """Render a stored UTC timestamp in the routine's own timezone."""
     if value is None:
         return None
@@ -72,7 +68,7 @@ def _build_automation_tools(runtime) -> list[StructuredTool]:
         name: str,
         anchor_at_iso: str,
         actions: list[ScheduledActionInput],
-        config: RunnableConfig = None,
+        config: RunnableConfig = None,  # type: ignore[assignment]  # LangChain 运行时注入 config；默认 None 仅为允许不经 LangChain 直接调用
     ) -> str:
         """创建通用的一次性定时例程。
 
@@ -93,7 +89,7 @@ def _build_automation_tools(runtime) -> list[StructuredTool]:
         vehicle_id: str,
         name: str,
         actions: list[ScheduledActionInput],
-        config: RunnableConfig = None,
+        config: RunnableConfig = None,  # type: ignore[assignment]  # LangChain 运行时注入 config；默认 None 仅为允许不经 LangChain 直接调用
     ) -> str:
         """创建通用车辆 ETA 例程，动作时间相对于预计到家时间。"""
         home_id, user_id = _identity(config)
@@ -102,7 +98,10 @@ def _build_automation_tools(runtime) -> list[StructuredTool]:
         )
         return f"已创建车辆回家例程，routine_id={routine.id}。"
 
-    def schedule_wake_routine(wake_at_iso: str, config: RunnableConfig = None) -> str:
+    def schedule_wake_routine(
+        wake_at_iso: str,
+        config: RunnableConfig = None,  # type: ignore[assignment]  # LangChain 运行时注入 config；默认 None 仅为允许不经 LangChain 直接调用
+    ) -> str:
         """创建一次起床自动化。
 
         wake_at_iso 必须是带日期的 ISO 8601 时间，例如 2026-08-16T06:00:00+08:00。
@@ -115,14 +114,16 @@ def _build_automation_tools(runtime) -> list[StructuredTool]:
 
     def enable_vehicle_arrival_routine(
         vehicle_id: str,
-        config: RunnableConfig = None,
+        config: RunnableConfig = None,  # type: ignore[assignment]  # LangChain 运行时注入 config；默认 None 仅为允许不经 LangChain 直接调用
     ) -> str:
         """启用车辆回家联动；实际执行由车辆 ETA 或地理围栏事件触发。"""
         home_id, user_id = _identity(config)
         routine = runtime.enable_vehicle_arrival(home_id, user_id, vehicle_id)
         return f"已启用车辆 {vehicle_id} 的回家例程，routine_id={routine.id}。"
 
-    def list_automation_routines(config: RunnableConfig = None) -> str:
+    def list_automation_routines(
+        config: RunnableConfig = None,  # type: ignore[assignment]  # LangChain 运行时注入 config；默认 None 仅为允许不经 LangChain 直接调用
+    ) -> str:
         """列出当前住宅的自动化例程，含每个动作的设备、参数、时间和执行状态。
 
         用户询问定时任务的具体内容时使用本工具，返回结果已包含全部动作明细，
@@ -133,6 +134,8 @@ def _build_automation_tools(runtime) -> list[StructuredTool]:
         routines = store.list_routines(home_id)
         payload = []
         for item in routines:
+            # ZoneInfo 与 datetime.UTC 都是 tzinfo 子类，按基类标注才能合法回退。
+            zone: tzinfo
             try:
                 zone = ZoneInfo(item.timezone)
             except Exception:
@@ -140,7 +143,7 @@ def _build_automation_tools(runtime) -> list[StructuredTool]:
             runs = store.list_runs(item.id)
             latest_run = runs[-1] if runs else None
             # 同一动作在多次排期（如车辆 ETA 更新）下会有多条任务，取最新那条的状态。
-            latest_task = {}
+            latest_task: dict[str, Any] = {}
             for task in store.list_tasks(item.id):
                 current = latest_task.get(task.action_id)
                 if current is None or task.created_at >= current.created_at:
@@ -185,7 +188,10 @@ def _build_automation_tools(runtime) -> list[StructuredTool]:
             })
         return json.dumps(payload, ensure_ascii=False)
 
-    def cancel_automation_routine(routine_id: str, config: RunnableConfig = None) -> str:
+    def cancel_automation_routine(
+        routine_id: str,
+        config: RunnableConfig = None,  # type: ignore[assignment]  # LangChain 运行时注入 config；默认 None 仅为允许不经 LangChain 直接调用
+    ) -> str:
         """取消某个例程尚未执行的全部任务。"""
         home_id, user_id = _identity(config)
         count = runtime.cancel(routine_id, home_id, user_id)

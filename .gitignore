@@ -56,3 +56,5 @@ Desktop.ini
 # 个人答辩材料：含演示话术，只在本地保留
 docs/defense-script.md
 docs/defense-deep-dive.md
+# graphify 技能的生成产物（知识图谱快照，可用 /graphify 重建；8MB+ 不入库）
+graphify-out/

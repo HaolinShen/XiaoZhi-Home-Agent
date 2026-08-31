@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -175,7 +176,7 @@ def expected_state_for_step(
     step: dict[str, Any], registry: DeviceRegistry,
 ) -> tuple[str | None, dict[str, Any], str | None]:
     """Resolve the target and expected state before executing a plan step."""
-    tool_name = step.get("tool_name")
+    tool_name = step.get("tool_name", "")
     args = step.get("arguments", {})
     spec = DEVICE_ACTION_SPECS.get(tool_name)
     if spec is None:

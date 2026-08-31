@@ -1,18 +1,21 @@
 import tempfile
 import unittest
-from datetime import timedelta
 from pathlib import Path
-
-from langchain_core.messages import AIMessage, HumanMessage
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from langchain_core.messages import AIMessage, HumanMessage
 
 from src.agent.context import AgentContext, SpaceDirectory
 from src.agent.graph import build_graph
 from src.devices.base import DeviceRegistry
 from src.devices.simulator import SimulatorBackend
 from src.memory import (
-    MemoryRepository, MemoryScope, MemoryService, MemoryType, MemoryWrite,
+    MemoryRepository,
+    MemoryScope,
+    MemoryService,
+    MemoryType,
+    MemoryWrite,
     extract_memory_candidates,
 )
 
@@ -43,7 +46,7 @@ class PhaseFiveTests(unittest.TestCase):
         )
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].status, "pending")
-        self.assertEqual(self.service.list(self.context), [])
+        self.assertEqual(self.service.list_memories(self.context), [])
 
     def test_hybrid_retrieval_uses_top_k_and_tracks_access_count(self):
         for index, key in enumerate(("lighting.color", "ac.temperature", "tv.volume")):
