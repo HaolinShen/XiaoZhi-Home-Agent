@@ -24,10 +24,9 @@
   python -m src.main --help
 """
 
-import sys
 import os
+import sys
 from datetime import timedelta
-from typing import Optional
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,19 +35,15 @@ if _project_root not in sys.path:
 
 # ---- 第三方库 ----
 import typer
+from langchain_core.messages import HumanMessage
+from langgraph.types import Command
+from loguru import logger
+from rich import box
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
-from rich.markdown import Markdown
-from rich import box
-from loguru import logger
 
-# ---- 项目模块 ----
-from src.config import get_settings, Settings
-from src.devices import DeviceRegistry, SimulatorBackend
-from src.progress_view import PlanProgressView, format_arguments, format_state
-from src.automation.runtime import AutomationRuntime
-from src.mcp import load_external_tools
 from src.agent import (
     AgentContext,
     SessionManager,
@@ -56,8 +51,13 @@ from src.agent import (
     build_agent_request,
     build_graph,
 )
-from langchain_core.messages import HumanMessage
-from langgraph.types import Command
+from src.automation.runtime import AutomationRuntime
+
+# ---- 项目模块 ----
+from src.config import Settings, get_settings
+from src.devices import DeviceRegistry, SimulatorBackend
+from src.mcp import load_external_tools
+from src.progress_view import PlanProgressView, format_arguments, format_state
 
 # ============================================================
 # 全局对象
@@ -431,7 +431,7 @@ def run_interactive_loop(
 @app.callback()
 def chat(
     ctx: typer.Context,
-    model: Optional[str] = typer.Option(
+    model: str | None = typer.Option(
         None, "--model", "-m",
         help="覆盖 .env 中的模型配置（qwen-turbo / qwen-plus / qwen-max）",
     ),
@@ -441,10 +441,10 @@ def chat(
     ),
     home_id: str = typer.Option("demo-home", help="住宅 ID"),
     user_id: str = typer.Option("demo-user", help="用户 ID"),
-    session_id: Optional[str] = typer.Option(None, help="已有会话 ID；留空则新建"),
+    session_id: str | None = typer.Option(None, help="已有会话 ID；留空则新建"),
     client_id: str = typer.Option("cli", help="终端 ID"),
-    room_id: Optional[str] = typer.Option(None, help="当前房间 ID"),
-    device_id: Optional[str] = typer.Option(None, help="当前设备 ID"),
+    room_id: str | None = typer.Option(None, help="当前房间 ID"),
+    device_id: str | None = typer.Option(None, help="当前设备 ID"),
     admin: bool = typer.Option(
         False,
         "--admin",
@@ -604,9 +604,15 @@ def mcp_server(
     backend = SimulatorBackend()
     registry = DeviceRegistry(backend)
 
-    mcp = create_mcp_server(registry, server_name="Smart Home Agent")
+    # 端口在构造期传入（见 create_mcp_server 的说明）；run() 只认 transport。
+    mcp = create_mcp_server(
+        registry, server_name="Smart Home Agent", port=port
+    )
     console.print(f"[bold cyan]🚀 MCP 服务器启动[/bold cyan] | transport={transport}")
-    mcp.run(transport=transport, port=port if transport == "sse" else None)
+    if transport == "sse":
+        mcp.run(transport="sse")
+    else:
+        mcp.run(transport="stdio")
 
 
 # ============================================================

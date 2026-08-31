@@ -31,22 +31,26 @@ P0 改造: 本文件以前把 8 个 control_xxx 的 if/elif 副作用**又抄了
 偏好观察（enable_preference_tracking=False）。
 """
 
-import sys
-import asyncio
-from typing import Optional
+from typing import TYPE_CHECKING
+
 from loguru import logger
 
 from ..devices.base import DeviceRegistry
 from ..devices.simulator import SimulatorBackend
 
+if TYPE_CHECKING:
+    # 只在类型检查时导入：运行期由函数内部按需引入（见 create_mcp_server），
+    # 这里仅为了让返回值注解可解析。
+    from mcp.server import FastMCP
 
 # ============================================================
 # MCP 服务器构建
 # ============================================================
 
 def create_mcp_server(
-    registry: Optional[DeviceRegistry] = None,
+    registry: DeviceRegistry | None = None,
     server_name: str = "Smart Home Agent",
+    port: int = 8765,
 ) -> "FastMCP":
     """
     创建 MCP 服务器实例，注册所有智能家居工具。
@@ -54,6 +58,9 @@ def create_mcp_server(
     参数:
       registry:     设备注册中心。如果为 None，自动创建模拟后端。
       server_name:  MCP 服务器名称（显示在客户端 UI 中）
+      port:         SSE 模式的监听端口。当前依赖版本把端口挪进了构造函数
+                    （FastMCP(name, port=...)），run() 只认 transport——把 port
+                    传给 run() 会直接 TypeError，stdio 模式也一样炸。
 
     返回:
       配置好的 FastMCP 服务器实例，包含所有智能家居工具
@@ -83,7 +90,8 @@ def create_mcp_server(
         for tool in build_all_tools(registry, enable_preference_tracking=False)
     }
 
-    mcp = FastMCP(server_name)
+    # port 在构造期传入：stdio 模式忽略它，SSE 模式用它监听。
+    mcp = FastMCP(server_name, port=port)
 
     # ============================================================
     # 注册 MCP 工具
