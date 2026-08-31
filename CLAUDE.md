@@ -5,12 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 开发环境
 
 - 必须使用已有的 Conda 环境 `langgraph`，解释器路径 `F:\Software\Anaconda\envs\langgraph\python.exe`。不要用 `uv run`、不要创建 `.venv` 或其它虚拟环境，也不要在用户未明确要求时安装/升级/卸载包。
+  - 013 起新增三个已装依赖（用户明确许可后装的）：`rank-bm25`、`jieba`、`numpy`。`numpy` 以前只是被别的包顺带装上、未在 `pyproject.toml` 声明，013 起显式声明——靠传递依赖存在的包，换个环境就没有。
 - Windows 下运行任何会打印设备名或 emoji 的命令都要加 `PYTHONIOENCODING=utf-8`，否则 `UnicodeEncodeError`。
 
 ## 常用命令
 
 ```bash
-# 全量测试（当前基线 189 项 + 137 subtests；tests/test_weather_mcp.py 的 stdio 用例
+# 全量测试（当前基线 264 项 + 383 subtests；tests/test_weather_mcp.py 的 stdio 用例
 # 在受限沙箱里会因子进程被拦截而失败，真实环境可全绿）
 PYTHONIOENCODING=utf-8 "F:/Software/Anaconda/envs/langgraph/python.exe" -m pytest -q
 
@@ -20,6 +21,11 @@ PYTHONIOENCODING=utf-8 "F:/Software/Anaconda/envs/langgraph/python.exe" -m pytes
 
 # unittest 亦可（测试全部是 unittest.TestCase）
 ... -m unittest tests.test_sensors -v
+
+# 说明书检索的召回评测（013 起）。改了语料、分词、打分或阈值都要跑
+python -m src.evaluation.recall              # legacy / bm25 / dense / hybrid 四种配置对比
+python -m src.evaluation.recall --offline     # 只跑不需要 embedding 接口的两种
+python -m src.evaluation.recall --sweep       # 权重 × 分数下限网格，换语料后重新标定
 
 # 启动 CLI（需要 .env 里的 LLM_API_KEY）
 python -m src.main
@@ -31,11 +37,11 @@ python -m src.mcp.server                              # stdio
 python -m src.mcp.server --transport sse --port 8765  # SSE
 ```
 
-`pyproject.toml` 里有 `[tool.ruff]` / `[tool.mypy]` 配置（011 起，渐进式不 strict；环境未安装这两者时先 `pip install -e ".[dev]"` 再 `ruff check src tests` / `mypy src`）。没有 `conftest.py`。
+`pyproject.toml` 里有 `[tool.ruff]` / `[tool.mypy]` 配置（011 起，渐进式不 strict）。环境已安装这两个工具（用户许可后装的），**当前基线全绿**：`ruff check src tests` 与 `mypy src` 均零错误——改完代码要保持这个状态再提交。注意 `tests/visualize_graph.ipynb` 会被 ruff 扫到（可用 `--exclude "*.ipynb"` 跳过，notebook 里的 E402/I001 不算项目代码问题）。`mypy` 的 `python_version` 配置是 `3.12`（环境真实版本；写 3.11 会因 numpy stub 用了 `type` 语句而无法解析）。没有 `conftest.py`。
 
 ## 架构大局
 
-实际实现已到阶段十三（事件驱动自动化）+ 011 工程收口（能力单一数据源/显式注入/可观测性），迭代方案记录在 `docs/iterations/NNN-*.md`，`docs/tutorial.md` 是最完整的架构长文。
+实际实现已到阶段十三（事件驱动自动化）+ 011 工程收口（能力单一数据源/显式注入/可观测性）+ 012 说明书 RAG 升级（实体消解/自证分流/强制引用）+ 013 混合检索（BM25 与向量双通道/名次与准入分离/召回评测），迭代方案记录在 `docs/iterations/NNN-*.md`，`docs/tutorial.md` 是最完整的架构长文。
 
 ### 一次请求走过的图
 
@@ -110,6 +116,38 @@ scene_exit），工具 Schema、Planner 词表、`PlanStep` Literal、`registry.
 ### action 枚举已无副本（011 起）
 
 `DEVICE_ACTION_SPECS`、`TOOL_ACTIONS`、`PLANNING_TOOL_NAMES`、`expected_state_for_step()`、`PlanStep.tool_name` 的 `Literal`、工具实现、MCP 工具现在**同源于** `devices/capabilities.py`。旧的两处手写副本（工具 if/elif、Literal）已不存在；`tests/test_capabilities.py` + `tests/test_phase_seven.py` 的双向反射用例继续钉住「声明 ↔ 工具实现」的一致性。
+
+### 说明书 RAG 的声明点（012 起，013 扩展）
+
+新增一份说明书要动三处，缺一处都会在构造期或测试里失败，不会静默：
+
+1. `docs/knowledge/catalog.json` 登记文档（`id` / `title` / `model` / `file`），Markdown 用 `## 小节名` 分节。**`title` 必须与文件第一行的 H1 逐字相同**，`file` 指向的文件不存在会在构造期抛 `FileNotFoundError`（013 起；012 时代是静默跳过）。
+2. `src/devices/capabilities.py` 的默认实例里给对应设备填 `model`。**型号的唯一数据源是 `BaseDevice.model`**，知识模块里不许再放型号映射表。设备不填 `model` 是合法的，表示「没登记说明书」，检索会拒答而不是猜。
+3. 排查清单条目末尾挂行内标注：`<!--check:xxx-->`（系统可自证，`xxx` 必须是 `src/knowledge/selfcheck.py:SELF_CHECKS` 里的 id）或 `<!--manual-->`（必须人工到现场）。**引用未声明的 id 会让 `KnowledgeBase` 构造直接抛 `ValueError`**；反方向也有校验 —— **声明了却没有任何语料引用的 check id 会让测试失败**（那是死代码，加了检查却没人用，"诊断没变强"不会自己报错）。
+
+写新说明书的硬性约定：**正文一律用书面语**（写「雾量明显偏小」而不是「不怎么出雾」）。口语留给查询侧，否则「语义通道能不能跨过同义不同字」就无从验证。正文里**不要出现 3 位以上的数字**（如「220 V」「180 秒」），它们会被错误码正则当成假错误码，触发精确键过滤。
+
+**两处刻意保留的语料缺口，不要顺手"补全"**：客厅灯不登记 `model`（守 `no_model` 拒答路径）、FrostLine-AC310 的症状手册没有噪音章节（守「本型号说明书查不到就必须拒答」）。两处都有测试钉着。
+
+### 混合检索的三条不变量（013 起）
+
+`src/knowledge/` 从"零依赖词法检索"变成双通道混合检索，新增 `tokenizer.py`（jieba 分词 + 错误码正则唯一数据源）、`embeddings.py`（provider 协议 + 远程实现 + 显式的"无语义通道"）、`retrieval.py`（BM25 + 向量 + 加权 RRF）。`base.py` 现在只做 catalog 加载、分节、清单解析和**两道硬过滤**，打分全部委托出去。改这一块前先读三个模块的 docstring，里面写了每个常量为什么是这个值。
+
+1. **两套分数不能混。** `rrf` 只决定名次，`confidence`（[0,1]）只决定放不放行，三档下限套在后者身上。**绝不能拿 RRF 去守门** —— 它是纯名次的，第一名恒为满分，跟像不像无关，拒答分支会永远走不到。
+2. **硬过滤在两个通道之前。** 型号相等、错误码 issubset 是准入条件不是打分项。向量检索让这条更要紧：E4 的语义近邻天然是 E5/E7，降级成"相似度的一部分"就会拿 E7 的步骤回答 E4。
+3. **弱信号要先归零，再谈合成。** 两个通道各有噪声基线（BM25 原始分 3.5 / 余弦 0.42），低于基线既不进 `confidence` 也**不进名次**。只在 confidence 处过滤是不够的：RRF 奖励"在两个通道都出现"，而 BM25 的"出现"极其廉价，噪声会靠双通道在场击败只有一个通道支持的正确答案。
+
+阈值与常量**全部是实测标定的**，不是手调：改语料、分词、打分或权重之后必须 `python -m src.evaluation.recall --sweep` 重标，并更新 `docs/iterations/013-hybrid-retrieval.md` 里的数字。BM25 噪声基线依赖语料规模（IDF 与平均文档长度都是语料级统计量），小语料上照抄这个值会让所有候选都进不了名次。
+
+`RAG_MIN_SCORE` / `RAG_REWRITTEN_MIN_SCORE` / `RAG_RELATIVE_FLOOR` 在 `RAGConfig` 里，**默认值必须和 `rag.py` 的 `DEFAULT_*` 常量一致** —— 两处不一致会让"测试跑的"和"生产跑的"是两套阈值，而测试全绿。第三档「带错误码时下限为 0」刻意不可配置：那不是参数，是规则本身。
+
+`relative_floor`（默认 0.7）是**引用精度**的相对截断：置信度不到第一名 0.7 倍的候选不进引用。它管的是"同一份手册的兄弟小节一起被召回"（同一台电器的不同症状语义本来就近，绝对下限提高会连正确答案一起砍）。**它不是拒答闸门** —— 参照点是第一名，第一名永远保留。
+
+**查询重写的 LLM prompt 必须留"都不符合"的出口。** `_llm_rewrite` 让模型在该型号真实存在的小节标题里挑一个，但强制单选会在正确答案不在清单里时逼模型挑一个最像的，而校验只查"标题真实存在"——存在不等于相关，于是重写后的查询轻松过阈值，拿着不相关的章节权威作答。模型回「无」时要保持原句去查一次然后拒答，**连词表兜底都不走**（词表只看用户措辞，不知道这个型号有没有对应章节）。这个漏洞 012 就有，因为所有单元测试都传 `llm=None`，只有跑真实 LLM 的端到端验证才暴露。
+
+其它别踩的坑：`KnowledgeBase.search()` 的 `model` 是**关键字必填**参数（全库检索必须是调用方的显式选择，不能是漏传参数的副产品）；实体消解四态里只有 `resolved` 放行检索，**其余三态不许兜底成全库检索**；带错误码的查询永不重写；自证检查只能拿到 `CheckContext`，碰不到 `registry`，更不能调 `tick_environment()`；测试里的向量通道用 `StubEmbeddings` 注入，**不要在测试里打真实 embedding 接口**（测试不需要 API Key，且换模型不能让断言全变）。
+
+**验证要覆盖配置的真实组合，不只是单元测试。** 013 的验证分三层：单元测试（确定性、无 Key、向量通道用 stub）、召回评测（真实 embedding、无 LLM）、端到端手动跑（真实 embedding + 真实 LLM + 完整主图）。上面那个重写漏洞前两层都测不到。改完 RAG 相关代码后，至少手动跑一遍主图的知识查询。
 
 ### 进度事件双写 + token/延迟度量（011 起）
 

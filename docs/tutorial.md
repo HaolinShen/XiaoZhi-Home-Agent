@@ -42,7 +42,7 @@
 - 结构化意图路由、设备查询子图和动态并行；
 - Supervisor 按职责向设备、场景、记忆、自动化、知识和聊天 Agent 委派；
 - 显式记忆推理、Checkpoint 时间旅行和自定义进度事件；
-- 基于本地设备文档的 Agentic RAG、来源引用与轨迹评测；
+- 基于本地设备文档的 Agentic RAG：BM25 + 向量混合检索、强制来源引用、排查清单自证核对、轨迹与召回评测；
 - 固定时间与车辆 ETA 触发的持久化自动化例程，含后台调度、状态验证和取消；
 - MCP Server 工具暴露和外部 MCP Client 接入能力。
 
@@ -196,11 +196,17 @@ langgraph/
 │   │   └── service.py        # 权限、检索和生命周期规则
 │   │
 │   ├── knowledge/            # 设备知识与 Agentic RAG 子图
-│   │   ├── base.py           # Markdown 文档加载、型号过滤和词法检索
-│   │   └── rag.py            # 识别、检索、改写、回答与拒答流程
+│   │   ├── base.py           # Markdown 文档加载、分节、清单解析和两道硬过滤
+│   │   ├── tokenizer.py      # jieba 分词与错误码正则（唯一数据源）
+│   │   ├── embeddings.py     # EmbeddingProvider 协议、远程 embedding 与缓存
+│   │   ├── retrieval.py      # 混合检索：BM25 + 向量 + 加权 RRF 融合
+│   │   ├── resolution.py     # 实体消解：用户措辞 → 设备实例 → 型号（四态）
+│   │   ├── selfcheck.py      # 排查清单的自证核对（读真实设备状态）
+│   │   └── rag.py            # 识别、检索、改写、自证、回答与拒答流程
 │   │
-│   ├── evaluation/           # Agent 轨迹评测
-│   │   └── trajectory.py     # 路由、状态、来源和拒答指标
+│   ├── evaluation/           # Agent 轨迹评测与检索召回评测
+│   │   ├── trajectory.py     # 路由、状态、来源和拒答指标
+│   │   └── recall.py         # 四种检索配置的召回消融（legacy/bm25/dense/hybrid）
 │   │
 │   ├── automation/           # 事件驱动家庭自动化
 │   │   ├── __init__.py
@@ -234,6 +240,7 @@ langgraph/
 │   ├── test_phase_ten.py     # Supervisor 多智能体测试
 │   ├── test_phase_eleven.py  # 记忆推理、时间旅行与事件测试
 │   ├── test_phase_twelve.py  # Agentic RAG 与轨迹评测测试
+│   ├── test_knowledge_rag.py # 实体消解、混合检索、分词、语料一致性与自证核对测试
 │   ├── test_automation_routines.py # 起床、车辆 ETA、取消和去重测试
 │   ├── test_weather_mcp.py   # 天气 MCP 发现、调用与结果格式测试
 │   ├── test_humidifier.py    # 加湿器模型、工具、Planner 与状态测试
@@ -242,13 +249,18 @@ langgraph/
 │
 ├── docs/                     # 文档
 │   ├── tutorial.md           # 本教程
+│   ├── guide/                # 分章长教程（第 13 章讲知识检索与拒答纪律）
 │   ├── iterations/           # 各阶段设计与实现说明
-│   └── knowledge/            # 型号目录与本地设备知识文档
+│   └── knowledge/            # 型号目录与本地设备知识文档（39 篇 / 13 个型号）
+│
+├── evals/                    # 离线评测数据集
+│   └── knowledge_recall.json # 63 条说明书检索 golden 用例
 │
 └── data/                     # 运行时数据（自动创建）
     ├── checkpoints.db        # SQLite 会话检查点
     ├── memories.db           # SQLite 长期结构化记忆
-    └── automation.db         # 自动化例程、运行批次和待执行任务
+    ├── automation.db         # 自动化例程、运行批次和待执行任务
+    └── embeddings/           # 说明书向量的内容哈希缓存（按模型名分文件）
 ```
 
 ### 架构分层
@@ -286,6 +298,22 @@ print(settings.model)           # "qwen-plus"
 print(settings.mcp_server.port) # 8765
 print(settings.rag.top_k)       # 3
 ```
+
+`RAGConfig`（`env_prefix="RAG_"`）在阶段十三之后的混合检索升级里多了三组字段，它们都不是"随手可调的旋钮"，而是**按语料实测标定**出来的量：
+
+```python
+settings.rag.bm25_weight          # 0.5   词法通道权重；为 0 表示该通道完全不参与
+settings.rag.dense_weight         # 0.5   向量通道权重；两个不能同时为 0
+settings.rag.min_score            # 0.35  首轮检索的置信度下限
+settings.rag.rewritten_min_score  # 0.42  查询重写后的下限（更严）
+settings.rag.embedding_model_id   # "text-embedding-v4"；留空即关闭语义通道
+settings.rag.embedding_base_url   # 留空则回落到 LLM 的端点
+settings.rag.embedding_api_key    # 留空则回落到 LLM 的 Key
+settings.rag.embedding_dimension  # 1024
+settings.rag.embedding_cache_path # "data/embeddings"，按内容哈希缓存
+```
+
+两处刻意的设计：**第三档下限"带错误码时为 0"不可配置**——那不是参数，是"精确键命中不该被模糊阈值否决"这条规则本身；**`min_score` / `rewritten_min_score` 的默认值必须和 `src/knowledge/rag.py` 的两个常量一致**，否则"测试跑的"和"生产跑的"是两套阈值，而测试全绿。换语料或换 embedding 模型都要用 `python -m src.evaluation.recall --sweep` 重新标定（详见 `docs/guide/13-知识检索与RAG.md`）。
 
 **特性**:
 - 自动从 `.env` 加载，支持系统环境变量覆盖
@@ -952,7 +980,7 @@ print(result["messages"][-1].content)
 | `task_router` | 识别结构化意图，选择澄清、并行查询、RAG、规划或普通 Agent 分支 |
 | `clarification` | 信息不足或路由置信度低时请求用户补充信息 |
 | `device_query_subgraph` | 使用子图和 `Send` 并行查询多个设备并聚合结果 |
-| `knowledge_rag` | 按设备型号检索本地知识，支持改写、引用和无依据拒答 |
+| `knowledge_rag` | 按设备型号消解设备，混合检索（BM25 + 向量）本地说明书，自证核对排查清单，支持改写、引用和无依据拒答 |
 | `compact_context` | 限制消息和 token 规模，维护滚动摘要 |
 | `agent` | 运行普通 ReAct 或接收 Supervisor 委派后的专用 Agent |
 | `approval` | 对批量场景调用执行 `interrupt` |
@@ -1253,9 +1281,12 @@ python -m pytest -q
 
 # 只运行某个阶段，例如阶段十三
 python -m pytest -q tests/test_automation_routines.py
+
+# 只跑说明书检索（不需要 API Key，向量通道用 StubEmbeddings）
+python -m pytest -q tests/test_knowledge_rag.py
 ```
 
-当前共 157 个测试，覆盖阶段一至阶段十三、天气 MCP、加湿器设备闭环、环境传感器和规划过程可视化。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
+当前基线是 **`264 passed, 383 subtests`**，覆盖阶段一至阶段十三、说明书混合检索、天气 MCP、加湿器设备闭环、环境传感器和规划过程可视化。测试不是只检查返回文本，还会验证权限边界、数据库状态、设备真实副作用、Checkpoint 恢复和 Agent 轨迹：
 
 | 测试文件 | 主要验证内容 |
 | --- | --- |
@@ -1271,13 +1302,14 @@ python -m pytest -q tests/test_automation_routines.py
 | `test_phase_ten.py` | Supervisor 委派、专用 Agent 能力边界和工具隔离 |
 | `test_phase_eleven.py` | 显式记忆决策、Checkpoint 时间旅行和自定义进度事件 |
 | `test_phase_twelve.py` | Agentic RAG 型号过滤、引用、拒答和轨迹评测指标 |
+| `test_knowledge_rag.py` | 实体消解四态、混合检索（硬过滤不被向量绕过、名次第一 ≠ 够格放行、语义通道缺席可见、embedding 故障降级）、jieba 分词与错误码边界、语料↔代码双向一致性、12 条自证检查读真实设备状态 |
 | `test_automation_routines.py` | 动态定时计划、车辆 ETA 分阶段执行与去重、批准前不落库、动作明细输出、强制工具边界和取消 |
 | `test_weather_mcp.py` | 天气 MCP 配置解析、stdio 工具发现、同步调用和天气结果格式 |
 | `test_humidifier.py` | 加湿器字段约束、状态汇总、控制工具、空水箱保护、场景关闭和 Planner 预期状态 |
 | `test_sensors.py` | 传感器字段约束与离线展示、环境推演的确定性、`read_sensor` 的筛选与错误提示、只读约束不被场景与规划绕过 |
 | `test_planning_progress.py` | 规划事件的发出顺序（计划先于执行、执行先于验证）、重试与重新规划事件、`PlanProgressView` 的渲染与容错 |
 
-测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 157 是事件驱动自动化接入后的基线。
+测试数量会随功能增加而变化，应以 `pytest --collect-only -q` 或实际测试输出为准；这里的 `264 passed, 383 subtests` 是说明书 RAG 混合检索升级后的基线。
 
 `test_sensors.py` 的结构值得单独说一下，它按四层组织，正好对应“新设备接进来要担心
 哪四件事”：
@@ -4133,16 +4165,18 @@ for mode, chunk in graph.stream(payload, config, stream_mode=["custom", "updates
 长期记忆保存用户偏好和家庭规则，但不适合保存设备说明书、故障代码和产品知识。阶段十二已经实现设备文档 RAG 分支：
 
 ```text
-用户：空调显示 E3 是什么意思？
+用户：客厅空调显示 E3 是什么意思？
   ↓
 识别为设备知识查询
   ↓
-根据当前设备获得品牌和型号
+从设备注册中心消解出唯一设备，读它的 model 字段
   ↓
-检索对应说明书片段
+在该型号的说明书里检索对应片段
   ↓
 结合引用内容回答
 ```
+
+例句刻意带上房间。**只说"空调显示 E3"会歧义拒答**：模拟器里两台空调型号不同（`SmartCool-AC2024` / `FrostLine-AC310`），而两份说明书里 E4 的含义完全不同。定不到唯一设备就反问，不挑一台猜——这条纪律比"总能给出答案"重要。
 
 项目中的信息来源应保持清晰边界：
 
@@ -4156,29 +4190,50 @@ for mode, chunk in graph.stream(payload, config, stream_mode=["custom", "updates
 
 Agentic RAG 与普通问答 RAG 的区别在于：智能体可能先调用设备工具取得型号，再检索知识库，还可能根据检索结果继续查询状态或给出下一步操作建议。
 
-当前实现使用 `docs/knowledge/catalog.json` 保存型号与 Markdown 文件的结构化映射，`src/knowledge/base.py` 使用标准库完成可解释词法检索，不需要额外安装向量数据库。`src/knowledge/rag.py` 构建如下子图：
+当前实现使用 `docs/knowledge/catalog.json` 保存型号与 Markdown 文件的结构化映射（39 篇文档 / 124 个 chunk / 13 个型号），检索是 **BM25 词法通道 + 向量语义通道 + 加权 RRF 融合**的混合检索（`src/knowledge/retrieval.py`）。这里要更正教程早期版本的一句话：**"使用标准库完成可解释词法检索，不需要额外安装向量数据库"已经不成立**——现在依赖 `rank-bm25`、`jieba`、`numpy`，语义通道调远程 embedding 接口。仍然成立的是**不需要向量数据库**：124 个 chunk 装进一个 numpy 矩阵，一次矩阵乘法就是全库检索，装一个 Chroma 反而多一处要同步的持久化状态。
+
+未配置 embedding 时检索退化为纯 BM25，这件事会写进日志和 RAG 轨迹（`dense: false`），不是静默降级；测试用 `StubEmbeddings`，所以**仍然不需要 API Key、仍然确定性**。
+
+`src/knowledge/rag.py` 构建的子图有**六个节点**：
 
 ```text
-identify_device
-  ↓
-retrieve
-  ├── 命中 → answer + citations
-  ├── 未命中且可重试 → rewrite_query → retrieve
-  └── 仍未命中 → refuse
+identify ──(resolved)──► retrieve ──┬─(有命中)──────► self_check ──► answer ──► END
+    │                               │
+    └─(其余三态)──► refuse ──► END   ├─(无命中 & 无错误码 & 还没改写过)► rewrite ─┐
+                                    │                                       │
+                                    └─(其余)────────► refuse ──► END ◄────────┘
+                                                （rewrite 回到 retrieve 再搜一次）
 ```
 
-结构化 Router 新增 `device_knowledge` 意图。知识请求进入 RAG 子图，不绑定设备控制工具。故障代码查询还会要求文档中出现完全相同的代码，例如知识库只有 E3 时，询问 E9 不会返回“相似答案”，而是明确拒答。
+- `identify` —— 实体消解，四态之一（`resolved` / `ambiguous` / `no_model` / `unknown`），**只有 `resolved` 放行检索**；
+- `retrieve` —— 两道硬过滤（型号相等、错误码 issubset）+ 混合检索 + 三档置信度下限；
+- `rewrite` —— 口语症状改写成说明书用词，两层（LLM 在真实小节标题里挑 / 确定性症状词表）；
+- `self_check` —— 排查清单分流：带 `<!--check:xxx-->` 的读**真实设备状态**核对，带 `<!--manual-->` 的交人工；
+- `answer` —— 模型只写建议正文，来源块与核对块由代码拼接；
+- `refuse` —— 按失败原因输出拒答文案。
+
+结构化 Router 新增 `device_knowledge` 意图。知识请求进入 RAG 子图，不绑定设备控制工具。故障代码查询还会要求文档中出现完全相同的代码，例如知识库只有 E3 时，询问 E9 不会返回"相似答案"，而是明确拒答。**加了向量通道之后这道硬过滤更关键**：E4 的语义近邻天然是 E5、E7，讲的是完全不同的故障，一旦把错误码降级成"相似度的一部分"，用户问 E4 就会拿到 E7 的处理步骤，而且读起来完全通顺。
 
 RAG 状态会保存：
 
 ```python
 rag_status: Literal["answered", "refused"]
 rag_citations: list[str]
-rag_trajectory: list[dict]
+rag_trajectory: list[dict]   # 每步带 hit_count / top_score / score_floor / dense / signals
 rag_device_model: str | None
 ```
 
 `src/evaluation/trajectory.py` 可以离线计算路由准确、回答/拒答状态、来源正确性、是否发生检索、查询改写次数和引用数量。评测关注的是整条轨迹，而不只是最终回答是否流畅。
+
+`src/evaluation/recall.py` 补的是另一半：拿 `evals/knowledge_recall.json` 的 63 条 golden 用例，对四种配置做召回消融（`legacy` 词法覆盖率 / 仅 BM25 / 仅向量 / 混合）。实测口语类查询的 Recall@1 从 3/30 提到 23/30，整体 Recall@1 51.8% → 87.5%，而**拒答准确率四种配置全是 7/7**。
+
+```bash
+python -m src.evaluation.recall            # 四种配置全跑
+python -m src.evaluation.recall --offline  # 跳过需要 API 的两种
+python -m src.evaluation.recall --sweep    # 在权重 × 下限网格上重新标定
+```
+
+一个诚实的结果：**纯向量的 Recall@3 和 MRR 比混合更好**，仍然选混合，因为 `bm25_weight=0` 会让 embedding 一挂就全部拒答，而且"这份说明书没讲这件事"只有词法通道说得出来。完整推导、阈值标定数据和已知薄弱点见 `docs/iterations/013-hybrid-retrieval.md` 与 `docs/guide/13-知识检索与RAG.md`。
 
 #### 6.5.13 事件驱动例程：定时起床与车辆回家联动
 

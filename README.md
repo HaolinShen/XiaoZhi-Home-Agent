@@ -40,7 +40,7 @@
 | 🎬 **场景模式** | 回家 / 离家 / 睡眠 / 观影 / 起床，一句话一键执行多个设备操作 |
 | ⏰ **事件驱动自动化** | 定时 / 起床 / 车辆 ETA 例程持久化调度，动作在图外执行并验证 |
 | 🤝 **多智能体协作** | 6 个角色按工具集隔离（device / scene / memory / automation / knowledge / chat） |
-| 📚 **Agentic RAG** | 本地设备知识库检索 + 引用溯源，答不出时明确拒绝 |
+| 📚 **Agentic RAG（混合检索）** | 39 份设备说明书，BM25 词法通道 + 向量语义通道 RRF 融合；引用由代码拼接，答不出时明确拒绝。口语查询召回 3/30 → 23/30，Recall@1 51.8% → 87.5%（见 `evals/`） |
 | 💬 **多轮对话记忆** | 基于 LangGraph Checkpoint，默认 SQLite 持久化，重启不丢上下文 |
 | 🧠 **结构化长期记忆** | SQLite 保存家庭规则与个人偏好，支持范围隔离、查看、修改和删除 |
 | 🔌 **MCP 集成** | 通过 Model Context Protocol 将工具暴露给 Claude Desktop 等外部 AI |
@@ -357,8 +357,8 @@ langgraph/
 │   │   ├── store.py            # SQLite 持久化（data/automation.db）
 │   │   └── ...
 │   │
-│   ├── knowledge/              # 本地设备知识库 + Agentic RAG 子图
-│   ├── evaluation/             # 离线轨迹评测
+│   ├── knowledge/              # 说明书语料索引 + 混合检索 + Agentic RAG 子图
+│   ├── evaluation/             # 离线轨迹评测 + 说明书召回评测
 │   │
 │   ├── memory/
 │   │   ├── models.py           # 长期记忆数据模型
@@ -437,6 +437,9 @@ P0 改造后只需 **1 步**：在 `src/devices/capabilities.py` 的 `CAPABILITI
 | `ROUTING_ENABLED` / `ROUTING_CONFIDENCE_THRESHOLD` | `true` / `0.6` | 结构化意图路由开关与置信阈值 |
 | `MULTI_AGENT_ENABLED` / `MULTI_AGENT_MAX_HANDOFFS` | `true` / `2` | 多智能体协作开关与交接上限 |
 | `RAG_ENABLED` / `RAG_TOP_K` | `true` / `3` | 本地知识 RAG 开关与检索条数 |
+| `RAG_BM25_WEIGHT` / `RAG_DENSE_WEIGHT` | `0.5` / `0.5` | 混合检索两个通道的权重，设 0 表示该通道不参与 |
+| `RAG_EMBEDDING_MODEL_ID` | `text-embedding-v4` | 语义通道的 embedding 型号；留空则退化为纯 BM25（地址与 Key 默认回落到 `LLM_*`） |
+| `RAG_MIN_SCORE` / `RAG_REWRITTEN_MIN_SCORE` / `RAG_RELATIVE_FLOOR` | `0.35` / `0.42` / `0.7` | 命中准入的两档绝对下限与引用的相对截断（实测标定，换语料需 `--sweep` 重标） |
 | `AUTOMATION_ENABLED` / `AUTOMATION_DB_PATH` | `true` / `data/automation.db` | 事件驱动自动化开关与持久化路径 |
 
 ---

@@ -24,3 +24,5 @@
 | 009 | 规划过程的运行时可见性 | 已实现 | [009-runtime-planning-visibility.md](009-runtime-planning-visibility.md) |
 | 010 | 事件驱动家庭自动化 | 已实现 | [010-event-driven-automation.md](010-event-driven-automation.md) |
 | 011 | 工程收口：单一能力数据源、显式依赖注入与统一可观测性 | 已实现 | [011-engineering-hardening.md](011-engineering-hardening.md) |
+| 012 | 说明书 RAG 升级：实体消解、检查项自证分流与强制引用 | 已实现 | [012-manual-rag-upgrade.md](012-manual-rag-upgrade.md) |
+| 013 | 混合检索升级：BM25 与向量双通道、名次与准入分离、召回评测 | 已实现 | [013-hybrid-retrieval.md](013-hybrid-retrieval.md) |
