@@ -1,0 +1,626 @@
+{
+  "description": "说明书检索召回评测集。expected 是可接受答案的集合（不是唯一答案），命中其中任意一条即算 top-1 正确。",
+  "cases": [
+    {
+      "id": "ac-livingroom-not-cold",
+      "query": "客厅空调开着但一点都不凉",
+      "model": "SmartCool-AC2024",
+      "expected": [
+        "smartcool-ac2024-symptoms.md#制冷效果不佳"
+      ],
+      "kind": "colloquial",
+      "note": "口语「不凉」对说明书书面语「制冷效果不佳」，词法零重叠"
+    },
+    {
+      "id": "ac-livingroom-smell",
+      "query": "客厅空调吹出来一股味儿",
+      "model": "SmartCool-AC2024",
+      "expected": [
+        "smartcool-ac2024-symptoms.md#有异味"
+      ],
+      "kind": "colloquial",
+      "note": "「一股味儿」要落到「有异味」，用户口语里不会出现「异」字"
+    },
+    {
+      "id": "ac-livingroom-rattle",
+      "query": "客厅空调一开就嗡嗡响还咔哒咔哒的",
+      "model": "SmartCool-AC2024",
+      "expected": [
+        "smartcool-ac2024-symptoms.md#噪音异常"
+      ],
+      "kind": "colloquial",
+      "note": "拟声词「嗡嗡」「咔哒」要落到「噪音异常」，查询里没有「噪音」二字"
+    },
+    {
+      "id": "ac-bedroom-still-hot",
+      "query": "卧室空调开半天屋里还是热得不行",
+      "model": "FrostLine-AC310",
+      "expected": [
+        "frostline-ac310-symptoms.md#制冷效果不佳"
+      ],
+      "kind": "colloquial",
+      "note": "用体感「热」描述制冷不足；同名小节两台空调都有，同时考型号过滤"
+    },
+    {
+      "id": "ac-bedroom-dripping",
+      "query": "卧室空调往下滴水把地板都弄湿了",
+      "model": "FrostLine-AC310",
+      "expected": [
+        "frostline-ac310-symptoms.md#排水不畅",
+        "frostline-ac310-maintenance.md#冷凝水管检查"
+      ],
+      "kind": "colloquial",
+      "note": "「滴水」对「排水不畅」；冷凝水管检查讲的是同一根因，也算合理答案"
+    },
+    {
+      "id": "ac-bedroom-frozen",
+      "query": "卧室空调出风口那儿冻上了有一层冰",
+      "model": "FrostLine-AC310",
+      "expected": [
+        "frostline-ac310-symptoms.md#蒸发器结霜"
+      ],
+      "kind": "colloquial",
+      "note": "用户只会说「冻上了/结冰」，说明书写「蒸发器结霜」"
+    },
+    {
+      "id": "tv-buffering-spin",
+      "query": "客厅电视看剧老是转圈圈卡住",
+      "model": "VisionTV-V1",
+      "expected": [
+        "visiontv-v1-symptoms.md#网络视频频繁缓冲"
+      ],
+      "kind": "colloquial",
+      "note": "「转圈圈」是加载动画的口语说法，说明书写「缓冲」"
+    },
+    {
+      "id": "tv-back-hot",
+      "query": "客厅电视后背摸着挺烫的正常吗",
+      "model": "VisionTV-V1",
+      "expected": [
+        "visiontv-v1-maintenance.md#散热与固件维护"
+      ],
+      "kind": "colloquial",
+      "note": "「烫」要跨到保养文档讲散热孔积尘的那节，症状文档里没有对应条目"
+    },
+    {
+      "id": "light-bedroom-dim",
+      "query": "卧室灯感觉没以前那么亮了",
+      "model": "GlowSoft-L90",
+      "expected": [
+        "glowsoft-l90-symptoms.md#亮度明显偏低",
+        "glowsoft-l90-maintenance.md#更换光源",
+        "glowsoft-l90-maintenance.md#清洁周期"
+      ],
+      "kind": "colloquial",
+      "note": "变暗可能是亮度设置、灯罩积尘或 LED 自然光衰，三节都是合理落点"
+    },
+    {
+      "id": "light-bedroom-self-off",
+      "query": "卧室灯自己就灭了过一会儿又能亮",
+      "model": "GlowSoft-L90",
+      "expected": [
+        "glowsoft-l90-symptoms.md#频繁自动关闭"
+      ],
+      "kind": "colloquial",
+      "note": "「自己就灭了」对「频繁自动关闭」"
+    },
+    {
+      "id": "light-kitchen-one-dark",
+      "query": "厨房吊顶上有一盏灯不亮了",
+      "model": "LumiCore-L200",
+      "expected": [
+        "lumicore-l200-symptoms.md#局部筒灯不亮"
+      ],
+      "kind": "colloquial",
+      "note": "用户说「一盏灯」，说明书说「局部筒灯」"
+    },
+    {
+      "id": "light-kitchen-hot",
+      "query": "厨房灯摸上去有点烫手",
+      "model": "LumiCore-L200",
+      "expected": [
+        "lumicore-l200-symptoms.md#灯体表面温度偏高"
+      ],
+      "kind": "colloquial",
+      "note": "「烫手」对「温度偏高」；「有点」是停用词，实际只剩「烫手」可用"
+    },
+    {
+      "id": "curtain-livingroom-bunched",
+      "query": "客厅窗帘收起来以后老往一边堆一坨",
+      "model": "SilkRail-C100",
+      "expected": [
+        "silkrail-c100-symptoms.md#帘布褶皱不均"
+      ],
+      "kind": "colloquial",
+      "note": "「堆一坨」对「褶皱不均」"
+    },
+    {
+      "id": "curtain-livingroom-squeak",
+      "query": "客厅窗帘走的时候轨道里吱吱响",
+      "model": "SilkRail-C100",
+      "expected": [
+        "silkrail-c100-maintenance.md#导轨保养"
+      ],
+      "kind": "colloquial",
+      "note": "滑轮干涩发响写在保养文档，SilkRail 症状文档里没有噪音条目"
+    },
+    {
+      "id": "curtain-bedroom-gap",
+      "query": "卧室窗帘关不严中间总留一条缝",
+      "model": "QuietTrack-C60",
+      "expected": [
+        "quiettrack-c60-symptoms.md#无法完全闭合"
+      ],
+      "kind": "colloquial",
+      "note": "「关不严」对「无法完全闭合」，闭合与关是两个词"
+    },
+    {
+      "id": "curtain-bedroom-loud",
+      "query": "卧室窗帘拉的时候声音特别大",
+      "model": "QuietTrack-C60",
+      "expected": [
+        "quiettrack-c60-symptoms.md#运行噪音偏大",
+        "quiettrack-c60-maintenance.md#导轨与滑轮保养"
+      ],
+      "kind": "colloquial",
+      "note": "「声音特别大」对「噪音偏大」；导轨滑轮保养讲同一根因"
+    },
+    {
+      "id": "humidifier-little-mist",
+      "query": "加湿器不怎么出雾",
+      "model": "MistPure-H50",
+      "expected": [
+        "mistpure-h50-symptoms.md#雾量明显偏小"
+      ],
+      "kind": "colloquial",
+      "note": "「不怎么出雾」对「雾量明显偏小」"
+    },
+    {
+      "id": "humidifier-room-dry",
+      "query": "加湿器开一晚上屋里还是干得嗓子疼",
+      "model": "MistPure-H50",
+      "expected": [
+        "mistpure-h50-symptoms.md#湿度长时间不上升"
+      ],
+      "kind": "colloquial",
+      "note": "用体感「干」描述湿度不上升，与小节名词法零重叠"
+    },
+    {
+      "id": "humidifier-puddle",
+      "query": "加湿器底下桌面上一圈水",
+      "model": "MistPure-H50",
+      "expected": [
+        "mistpure-h50-symptoms.md#机身底部渗水"
+      ],
+      "kind": "colloquial",
+      "note": "「一圈水」对「渗水」"
+    },
+    {
+      "id": "water-heater-shower-cold",
+      "query": "洗澡水不够热",
+      "model": "AquaWarm-W80",
+      "expected": [
+        "aquawarm-w80-symptoms.md#出水温度偏低"
+      ],
+      "kind": "colloquial",
+      "note": "「不够热」对「出水温度偏低」，查询里连「温度」都没有"
+    },
+    {
+      "id": "water-heater-slow",
+      "query": "热水器要等好久才能洗上澡",
+      "model": "AquaWarm-W80",
+      "expected": [
+        "aquawarm-w80-symptoms.md#加热时间明显变长"
+      ],
+      "kind": "colloquial",
+      "note": "「等好久」对「加热时间明显变长」"
+    },
+    {
+      "id": "water-heater-yellow-water",
+      "query": "卫生间放出来的热水黄黄的还有股怪味",
+      "model": "AquaWarm-W80",
+      "expected": [
+        "aquawarm-w80-symptoms.md#出水有异味或浑浊"
+      ],
+      "kind": "colloquial",
+      "note": "「黄黄的」「怪味」对「异味或浑浊」"
+    },
+    {
+      "id": "lock-fingerprint-flaky",
+      "query": "门锁指纹老是不好使",
+      "model": "GuardLock-D3",
+      "expected": [
+        "guardlock-d3-symptoms.md#指纹识别成功率下降"
+      ],
+      "kind": "colloquial",
+      "note": "「不好使」对「识别成功率下降」；「老是」是停用词"
+    },
+    {
+      "id": "lock-not-relocked",
+      "query": "出门以后门自己没锁上",
+      "model": "GuardLock-D3",
+      "expected": [
+        "guardlock-d3-symptoms.md#开锁后未自动上锁"
+      ],
+      "kind": "colloquial",
+      "note": "「没锁上」对「未自动上锁」，用户不会说「自动」"
+    },
+    {
+      "id": "kettle-not-boiling",
+      "query": "水壶烧不开还没开就停了",
+      "model": "QuickBoil-K15",
+      "expected": [
+        "quickboil-k15-symptoms.md#加热中途停止"
+      ],
+      "kind": "colloquial",
+      "note": "「烧不开」对「加热中途停止」"
+    },
+    {
+      "id": "kettle-white-crust",
+      "query": "烧水壶底下结了一层白白的硬壳",
+      "model": "QuickBoil-K15",
+      "expected": [
+        "quickboil-k15-symptoms.md#壶底结垢严重",
+        "quickboil-k15-maintenance.md#除垢步骤"
+      ],
+      "kind": "colloquial",
+      "note": "用户不会说「结垢」而说「白白的硬壳」；除垢步骤是同一问题的处置小节"
+    },
+    {
+      "id": "sensor-temp-inaccurate",
+      "query": "客厅温湿度传感器显示的温度跟体感差很多",
+      "model": "ThermoSense-T20",
+      "expected": [
+        "thermosense-t20-symptoms.md#读数与实际明显偏差"
+      ],
+      "kind": "colloquial",
+      "note": "「跟体感差很多」对「读数与实际明显偏差」"
+    },
+    {
+      "id": "sensor-temp-stale",
+      "query": "卧室传感器上的数半天不变",
+      "model": "ThermoSense-T20",
+      "expected": [
+        "thermosense-t20-symptoms.md#数据长时间不刷新"
+      ],
+      "kind": "colloquial",
+      "note": "「半天不变」对「长时间不刷新」，「刷新」在口语里不出现"
+    },
+    {
+      "id": "motion-no-trigger",
+      "query": "玄关人来了灯不亮感应器好像没反应",
+      "model": "MotionEye-P10",
+      "expected": [
+        "motioneye-p10-symptoms.md#有人时未触发"
+      ],
+      "kind": "colloquial",
+      "note": "「人来了没反应」对「有人时未触发」；用户从现象（灯不亮）反推传感器"
+    },
+    {
+      "id": "motion-false-alarm",
+      "query": "客厅没人的时候传感器老报有人",
+      "model": "MotionEye-P10",
+      "expected": [
+        "motioneye-p10-symptoms.md#无人时频繁误触发"
+      ],
+      "kind": "colloquial",
+      "note": "「老报有人」对「频繁误触发」"
+    },
+    {
+      "id": "tv-no-audio-literal",
+      "query": "客厅电视有画面但是没声音",
+      "model": "VisionTV-V1",
+      "expected": [
+        "visiontv-v1-symptoms.md#画面正常但无声音"
+      ],
+      "kind": "literal",
+      "note": "口语说法恰好贴近书面语「画面正常但无声音」，属基线用例"
+    },
+    {
+      "id": "water-heater-temp-literal",
+      "query": "热水器出水温度偏低怎么排查",
+      "model": "AquaWarm-W80",
+      "expected": [
+        "aquawarm-w80-symptoms.md#出水温度偏低"
+      ],
+      "kind": "literal",
+      "note": "小节名逐字入查询，与 water-heater-shower-cold 构成书面语/口语对照"
+    },
+    {
+      "id": "humidifier-mist-literal",
+      "query": "加湿器雾量明显偏小",
+      "model": "MistPure-H50",
+      "expected": [
+        "mistpure-h50-symptoms.md#雾量明显偏小"
+      ],
+      "kind": "literal",
+      "note": "小节名逐字查询，验证重写等改动不会让书面语退化"
+    },
+    {
+      "id": "lock-fingerprint-literal",
+      "query": "门锁指纹识别成功率下降",
+      "model": "GuardLock-D3",
+      "expected": [
+        "guardlock-d3-symptoms.md#指纹识别成功率下降"
+      ],
+      "kind": "literal",
+      "note": "与 lock-fingerprint-flaky 构成书面语/口语对照"
+    },
+    {
+      "id": "curtain-noise-literal",
+      "query": "卧室窗帘运行噪音偏大",
+      "model": "QuietTrack-C60",
+      "expected": [
+        "quiettrack-c60-symptoms.md#运行噪音偏大"
+      ],
+      "kind": "literal",
+      "note": "与 curtain-bedroom-loud 构成书面语/口语对照"
+    },
+    {
+      "id": "sensor-deviation-literal",
+      "query": "温湿度传感器读数与实际明显偏差",
+      "model": "ThermoSense-T20",
+      "expected": [
+        "thermosense-t20-symptoms.md#读数与实际明显偏差"
+      ],
+      "kind": "literal",
+      "note": "小节名逐字查询"
+    },
+    {
+      "id": "motion-untriggered-literal",
+      "query": "人体传感器有人时未触发",
+      "model": "MotionEye-P10",
+      "expected": [
+        "motioneye-p10-symptoms.md#有人时未触发"
+      ],
+      "kind": "literal",
+      "note": "小节名逐字查询，短查询也要稳定命中"
+    },
+    {
+      "id": "kitchen-light-dimming-literal",
+      "query": "厨房筒灯调光不连续",
+      "model": "LumiCore-L200",
+      "expected": [
+        "lumicore-l200-symptoms.md#调光不连续"
+      ],
+      "kind": "literal",
+      "note": "小节名逐字查询；不要被 errors 的 E1（调光信号线接触不良）挤掉"
+    },
+    {
+      "id": "ac-filter-cycle-literal",
+      "query": "卧室空调滤网清洗周期是多久",
+      "model": "FrostLine-AC310",
+      "expected": [
+        "frostline-ac310-maintenance.md#滤网清洗周期"
+      ],
+      "kind": "literal",
+      "note": "书面语落在保养文档而非症状文档，验证跨文档定位"
+    },
+    {
+      "id": "light-colortemp-literal",
+      "query": "卧室灯色温切换无效",
+      "model": "GlowSoft-L90",
+      "expected": [
+        "glowsoft-l90-symptoms.md#色温切换无效"
+      ],
+      "kind": "literal",
+      "note": "小节名逐字查询"
+    },
+    {
+      "id": "code-tv-1002",
+      "query": "客厅电视报 1002 错误怎么办",
+      "model": "VisionTV-V1",
+      "expected": [
+        "visiontv-v1-errors.md#1002"
+      ],
+      "kind": "code",
+      "note": "纯数字码，错误码硬过滤应把候选收敛到唯一小节"
+    },
+    {
+      "id": "code-humidifier-e2",
+      "query": "加湿器显示 E2",
+      "model": "MistPure-H50",
+      "expected": [
+        "mistpure-h50-errors.md#E2"
+      ],
+      "kind": "code",
+      "note": "加湿器有 E1/E2/E4 三个相邻码，向量近邻会互串，必须靠硬过滤"
+    },
+    {
+      "id": "code-water-heater-e3",
+      "query": "热水器显示 E3",
+      "model": "AquaWarm-W80",
+      "expected": [
+        "aquawarm-w80-errors.md#E3"
+      ],
+      "kind": "code",
+      "note": "E3 在热水器是温度传感器短路/开路；烧水壶也有 E3，型号过滤必须生效"
+    },
+    {
+      "id": "code-kettle-e3",
+      "query": "烧水壶显示 E3",
+      "model": "QuickBoil-K15",
+      "expected": [
+        "quickboil-k15-errors.md#E3"
+      ],
+      "kind": "code",
+      "note": "同一个 E3 在烧水壶是干烧保护，与热水器那条互为反例"
+    },
+    {
+      "id": "code-lock-1003",
+      "query": "门锁显示 1003 进不去了",
+      "model": "GuardLock-D3",
+      "expected": [
+        "guardlock-d3-errors.md#1003"
+      ],
+      "kind": "code",
+      "note": "四位数字码；1003 是防试探锁定的正常保护，不能答成故障"
+    },
+    {
+      "id": "code-sensor-t20-e1",
+      "query": "卧室温湿度传感器显示 E1",
+      "model": "ThermoSense-T20",
+      "expected": [
+        "thermosense-t20-errors.md#E1"
+      ],
+      "kind": "code",
+      "note": "E1 在温湿度传感器是探头开路；人体传感器也有 E1，型号过滤必须生效"
+    },
+    {
+      "id": "code-motion-p10-e6",
+      "query": "玄关人体传感器显示 E6",
+      "model": "MotionEye-P10",
+      "expected": [
+        "motioneye-p10-errors.md#E6"
+      ],
+      "kind": "code",
+      "note": "E6 在人体传感器是配对信息失效；温湿度传感器的 E6 是链路中断"
+    },
+    {
+      "id": "code-ac-livingroom-e3",
+      "query": "客厅空调显示 E3 是什么问题",
+      "model": "SmartCool-AC2024",
+      "expected": [
+        "smartcool-ac2024-errors.md#E3"
+      ],
+      "kind": "code",
+      "note": "码与口语混在一句里，分词不能把 E3 切成 e 和 3"
+    },
+    {
+      "id": "code-light-bedroom-302",
+      "query": "卧室灯提示 302",
+      "model": "GlowSoft-L90",
+      "expected": [
+        "glowsoft-l90-errors.md#302"
+      ],
+      "kind": "code",
+      "note": "三位数字码；302 是入网超时而非灯本身故障"
+    },
+    {
+      "id": "code-curtain-livingroom-204",
+      "query": "客厅窗帘报 204",
+      "model": "SilkRail-C100",
+      "expected": [
+        "silkrail-c100-errors.md#204"
+      ],
+      "kind": "code",
+      "note": "极短查询，除了码几乎没有可用 token，全靠硬过滤定位"
+    },
+    {
+      "id": "xmodel-e4-livingroom-ac",
+      "query": "客厅空调显示 E4",
+      "model": "SmartCool-AC2024",
+      "expected": [
+        "smartcool-ac2024-errors.md#E4"
+      ],
+      "kind": "cross-model",
+      "note": "E4 在客厅空调是室内外机通信异常"
+    },
+    {
+      "id": "xmodel-e4-bedroom-ac",
+      "query": "卧室空调显示 E4",
+      "model": "FrostLine-AC310",
+      "expected": [
+        "frostline-ac310-errors.md#E4"
+      ],
+      "kind": "cross-model",
+      "note": "同一个 E4 在卧室空调是排水泵异常；型号过滤失效就会串到通信异常那节"
+    },
+    {
+      "id": "xmodel-e1-bedroom-light",
+      "query": "卧室灯显示 E1",
+      "model": "GlowSoft-L90",
+      "expected": [
+        "glowsoft-l90-errors.md#E1"
+      ],
+      "kind": "cross-model",
+      "note": "E1 在卧室灯是驱动电源过温保护"
+    },
+    {
+      "id": "xmodel-e1-kitchen-light",
+      "query": "厨房筒灯显示 E1",
+      "model": "LumiCore-L200",
+      "expected": [
+        "lumicore-l200-errors.md#E1"
+      ],
+      "kind": "cross-model",
+      "note": "同一个 E1 在厨房筒灯是调光信号线接触不良，处置步骤完全不同"
+    },
+    {
+      "id": "xmodel-e2-livingroom-curtain",
+      "query": "客厅窗帘报 E2",
+      "model": "SilkRail-C100",
+      "expected": [
+        "silkrail-c100-errors.md#E2"
+      ],
+      "kind": "cross-model",
+      "note": "E2 在客厅窗帘是行程未标定，需要重新标定端点"
+    },
+    {
+      "id": "xmodel-e2-bedroom-curtain",
+      "query": "卧室窗帘报 E2",
+      "model": "QuietTrack-C60",
+      "expected": [
+        "quiettrack-c60-errors.md#E2"
+      ],
+      "kind": "cross-model",
+      "note": "同一个 E2 在卧室窗帘是电机堵转过流保护，答错型号会让用户去标定行程"
+    },
+    {
+      "id": "refuse-ac-unknown-code",
+      "query": "客厅空调显示 E9 是什么意思",
+      "model": "SmartCool-AC2024",
+      "expected": [],
+      "kind": "refusal",
+      "note": "客厅空调只有 E3/E4，语料里没有 E9；错误码是精确键，必须查不到而不是找个相近小节"
+    },
+    {
+      "id": "refuse-tv-unknown-code",
+      "query": "客厅电视显示 E5 怎么办",
+      "model": "VisionTV-V1",
+      "expected": [],
+      "kind": "refusal",
+      "note": "电视说明书只登记了 1002 一个码，E5 在该型号下不存在"
+    },
+    {
+      "id": "refuse-lock-unknown-code",
+      "query": "门锁面板显示 E7",
+      "model": "GuardLock-D3",
+      "expected": [],
+      "kind": "refusal",
+      "note": "门锁只有 E1/E2/1003；E7 存在于空调和客厅窗帘，跨型号串答比拒答更危险"
+    },
+    {
+      "id": "refuse-bedroom-ac-noise",
+      "query": "卧室空调有点响是怎么了",
+      "model": "FrostLine-AC310",
+      "expected": [],
+      "kind": "refusal",
+      "note": "FrostLine 说明书刻意没有噪音章节（只有客厅空调有「噪音异常」），这是被现有测试保护的语料缺口，不许兜底到制冷/排水小节"
+    },
+    {
+      "id": "refuse-livingroom-light-no-model",
+      "query": "客厅灯为什么忽明忽暗",
+      "model": null,
+      "expected": [],
+      "kind": "refusal",
+      "note": "客厅灯没登记 model，实体消解拿不到型号，必须拒答而不是退化成全库检索"
+    },
+    {
+      "id": "refuse-livingroom-light-shade",
+      "query": "客厅灯的灯罩怎么拆下来擦灰",
+      "model": null,
+      "expected": [],
+      "kind": "refusal",
+      "note": "同上；这条尤其危险——全库检索会命中卧室灯的清洁步骤，看起来像正确答案"
+    },
+    {
+      "id": "refuse-offtopic-weather",
+      "query": "外面下雨了吗",
+      "model": null,
+      "expected": [],
+      "kind": "refusal",
+      "note": "完全跑题，既没有设备也没有型号，不该进入说明书检索"
+    }
+  ]
+}

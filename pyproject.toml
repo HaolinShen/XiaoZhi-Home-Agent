@@ -12,17 +12,26 @@ license = { text = "MIT" }
 dependencies = [
     "langgraph>=1.0.0",
     "langchain>=1.0.0",
+    "langchain-core>=1.0.0",
     "langchain-openai>=1.0.0",
     "langgraph-checkpoint>=4.0.0",
     "langgraph-checkpoint-sqlite>=3.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    "typing-extensions>=4.8.0",
     "python-dotenv>=1.0.0",
     "mcp>=1.0.0",
     "typer>=0.9.0",
     "rich>=13.0.0",
     "loguru>=0.7.0",
     "httpx>=0.24.0",
+    # 013 混合检索：BM25 词法通道 + 中文分词 + 向量运算。
+    # numpy 以前只是被别的包顺带装上的（未声明），013 起 retrieval.py 直接依赖它，
+    # 必须显式写出来——靠传递依赖存在的包，别人换个环境就没有。
+    # langchain-core / typing-extensions 同理：src/ 里直接 import 了它们。
+    "rank-bm25>=0.2.2",
+    "jieba>=0.42.1",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]
@@ -66,10 +75,21 @@ select = [
 # 与既有代码风格保持一致，不做过度约束。
 ignore = [
     "E501",  # 行宽交由 line-length + 格式化处理，避免噪声
+    # (str, Enum) → StrEnum 不是风格问题而是行为差异：前者的 str(x) 是
+    # "DeviceType.AC"，后者是 "ac"。项目所有枚举都是 (str, Enum) 风格，
+    # 统一转换要逐一核对 str()/f-string 内插点，收益配不上风险，先豁免。
+    "UP042",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# main.py 在导入项目模块之前必须先把项目根目录塞进 sys.path，
+# 这段引导代码天然把 import 压到非顶层位置——这是刻意的，不是坏味道。
+"src/main.py" = ["E402"]
+
 [tool.mypy]
-python_version = "3.11"
+# 3.12 而不是 3.11：环境实际跑在 3.12 上，而 numpy 的 stub 用了 3.12 的
+# type 语句——配置写 3.11 会让 mypy 连 stub 都解析不了，直接停在第一个文件。
+python_version = "3.12"
 # 渐进式类型：先不加 strict，避免一次性淹没在存量标注缺口里。
 warn_unused_ignores = false
 ignore_missing_imports = true

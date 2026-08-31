@@ -18,8 +18,8 @@
   - IDE 友好（完整的类型提示和文档字符串）
 """
 
-from typing import Optional
-from pydantic import Field, field_validator
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -104,6 +104,38 @@ class RAGConfig(BaseSettings):
     top_k: int = Field(default=3, ge=1, le=10)
     max_rewrites: int = Field(default=1, ge=0, le=3)
 
+    # ---- 013 混合检索：两个通道的权重 ----
+    # 权重为 0 表示该通道完全不参与（名次和置信度都不算），可用来做消融实验。
+    # 两个不能同时为 0。
+    bm25_weight: float = Field(default=0.5, ge=0, le=1)
+    dense_weight: float = Field(default=0.5, ge=0, le=1)
+
+    # ---- 013 命中准入的两档下限 ----
+    # 012 时代这两个数字是 rag.py 里的模块常量，改一次要动代码。
+    # 它们是**按语料实测标定**的（`python -m src.evaluation.recall --sweep`），
+    # 换语料或换 embedding 模型就要重标，所以更适合作为配置暴露出来。
+    # 默认值必须和 `rag.DEFAULT_MIN_SCORE` / `DEFAULT_REWRITTEN_MIN_SCORE` 一致——
+    # 两处不一致会让"测试跑的"和"生产跑的"是两套阈值，而测试全绿。
+    # 第三档"带错误码时下限为 0"不可配置：那不是一个可调参数，
+    # 而是"精确键命中不该被模糊阈值否决"这条规则本身。
+    min_score: float = Field(default=0.35, ge=0, le=1)
+    rewritten_min_score: float = Field(default=0.42, ge=0, le=1)
+    # 相对截断：置信度不到第一名这个比例的候选不进引用。绝对下限管不了"同一台电器的
+    # 不同症状语义本来就近"这件事——提高绝对下限会连正确答案一起砍掉。
+    # 第一名永远保留，所以它只让引用更干净，不会把能答的变成拒答。
+    relative_floor: float = Field(default=0.7, ge=0, le=1)
+
+    # ---- 013 语义通道（远程 embedding）----
+    # 型号留空即关闭语义通道，检索退化为纯 BM25（会打一条 INFO 日志说明）。
+    # 地址与 Key 留空时回落到 LLM 的那一份——多数部署里 embedding 和对话模型
+    # 在同一个 OpenAI 兼容端点上，不该逼用户填两遍。
+    embedding_model_id: str = Field(default="text-embedding-v4")
+    embedding_base_url: str = Field(default="")
+    embedding_api_key: str = Field(default="")
+    embedding_dimension: int = Field(default=1024, ge=64, le=4096)
+    # 向量按内容哈希落盘缓存，改说明书才重算。data/ 已被 gitignore。
+    embedding_cache_path: str = Field(default="data/embeddings")
+
 
 class AutomationConfig(BaseSettings):
     """Persistent event-driven routine scheduler settings."""
@@ -144,17 +176,17 @@ class Settings(BaseSettings):
     # 在 __init__ 后通过 _resolve_names() 统一解析
 
     # 通用名（优先）
-    llm_api_key: Optional[str] = Field(
+    llm_api_key: str | None = Field(
         default=None,
         alias="LLM_API_KEY",
         description="LLM API Key（通用名，优先）",
     )
-    llm_base_url: Optional[str] = Field(
+    llm_base_url: str | None = Field(
         default=None,
         alias="LLM_BASE_URL",
         description="LLM 服务地址（通用名，优先）",
     )
-    llm_model_id: Optional[str] = Field(
+    llm_model_id: str | None = Field(
         default=None,
         alias="LLM_MODEL_ID",
         description="模型名称（通用名，优先）",
@@ -166,17 +198,17 @@ class Settings(BaseSettings):
     )
 
     # 百炼专用名（fallback）
-    bailian_api_key: Optional[str] = Field(
+    bailian_api_key: str | None = Field(
         default=None,
         alias="BAILIAN_API_KEY",
         description="百炼 API Key（备选）",
     )
-    bailian_base_url: Optional[str] = Field(
+    bailian_base_url: str | None = Field(
         default=None,
         alias="BAILIAN_BASE_URL",
         description="百炼服务地址（备选）",
     )
-    bailian_model: Optional[str] = Field(
+    bailian_model: str | None = Field(
         default=None,
         alias="BAILIAN_MODEL",
         description="百炼模型名（备选）",
@@ -279,7 +311,7 @@ class Settings(BaseSettings):
 # ============================================================
 # 全局配置单例
 # ============================================================
-settings: Optional[Settings] = None
+settings: Settings | None = None
 
 
 def get_settings() -> Settings:

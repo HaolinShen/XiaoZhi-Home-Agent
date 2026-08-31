@@ -16,32 +16,51 @@ LangGraph Agent 工作流
   4. 支持升级为 SqliteSaver 实现持久化记忆
 """
 
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Literal, Sequence
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
-from loguru import logger
 
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langgraph.types import interrupt
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
+from loguru import logger
+from pydantic import SecretStr
 
-from .state import AgentState
-from .prompts import build_system_prompt
-from ..tools import build_all_tools
+from ..config import Settings
 from ..devices.base import DeviceRegistry
 from ..devices.capabilities import CONTROL_TOOL_NAMES
-from ..config import Settings
-from ..memory import create_checkpointer
-from ..memory import MemoryRepository, MemoryService
+from ..knowledge import (
+    DEFAULT_MIN_SCORE,
+    DEFAULT_RELATIVE_FLOOR,
+    DEFAULT_REWRITTEN_MIN_SCORE,
+    KnowledgeBase,
+    build_embeddings,
+    build_knowledge_rag_subgraph,
+)
+from ..memory import MemoryRepository, MemoryService, create_checkpointer
 from ..memory.summarizer import build_compaction_update
-from .context import SpaceDirectory
+from ..tools import build_all_tools
 from .approval import (
     approval_is_granted,
     build_approval_request,
     rejection_tool_messages,
+)
+from .context import SpaceDirectory
+
+# P3: 自动化创建请求的强制工具判定已迁至 heuristics.py，
+# 保留旧名 `_required_automation_tool` 以兼容既有导入（tests 等）。
+from .heuristics import required_automation_tool as _required_automation_tool
+from .multi_agent import agent_for_intent, role_prompt
+from .observability import emit_progress
+from .parallel import (
+    build_device_query_subgraph,
+    extract_query_targets,
+    should_use_parallel_query,
 )
 from .planning import (
     ExecutionPlan,
@@ -51,20 +70,11 @@ from .planning import (
     should_use_planner,
     verify_step,
 )
-from .routing import classify_intent, classify_intent_fallback
-from .parallel import (
-    build_device_query_subgraph,
-    extract_query_targets,
-    should_use_parallel_query,
-)
-from .multi_agent import agent_for_intent, role_prompt
+from .prompts import build_system_prompt
 from .reasoning import format_memory_decision, reason_about_memories
-from .observability import emit_progress
+from .routing import classify_intent, classify_intent_fallback
+from .state import AgentState
 from .telemetry import UsageTracer, traced_node
-# P3: 自动化创建请求的强制工具判定已迁至 heuristics.py，
-# 保留旧名 `_required_automation_tool` 以兼容既有导入（tests 等）。
-from .heuristics import required_automation_tool as _required_automation_tool
-from ..knowledge import KnowledgeBase, build_knowledge_rag_subgraph
 
 
 def _current_datetime(settings: Settings) -> str:
@@ -97,7 +107,8 @@ def build_llm(settings: Settings) -> ChatOpenAI:
     # 一路传播，所以路由、Planner、ReAct Agent 的每一次 LLM 调用都会被记录。
     return ChatOpenAI(
         model=settings.model,
-        api_key=settings.api_key,
+        api_key=SecretStr(settings.api_key),  # ChatOpenAI 的类型要求 SecretStr
+
         base_url=settings.base_url,
         timeout=settings.llm_timeout,
         temperature=0.3,  # 低温度确保工具调用的稳定性和一致性
@@ -112,7 +123,7 @@ def build_graph(
     space_directory: SpaceDirectory | None = None,
     external_tools: Sequence | None = None,
     automation_runtime=None,
-) -> StateGraph:
+) -> CompiledStateGraph[AgentState, None, AgentState, AgentState]:
     """
     构建 LangGraph Agent 工作流图。
 
@@ -198,11 +209,38 @@ def build_graph(
         )
     device_query_subgraph = build_device_query_subgraph(registry)
     rag_config = getattr(settings, "rag", None)
-    knowledge_base = KnowledgeBase(getattr(rag_config, "knowledge_path", "docs/knowledge"))
+    # 语义通道的地址与 Key 留空时回落到 LLM 的那一份：多数部署里 embedding 和对话
+    # 模型在同一个 OpenAI 兼容端点上。型号留空则不启用语义通道，检索退化为纯 BM25，
+    # `build_embeddings` 会打日志说明是哪一种，不留"以为在跑混合检索其实没有"的余地。
+    knowledge_base = KnowledgeBase(
+        getattr(rag_config, "knowledge_path", "docs/knowledge"),
+        embeddings=build_embeddings(
+            model_id=getattr(rag_config, "embedding_model_id", ""),
+            base_url=(
+                getattr(rag_config, "embedding_base_url", "")
+                or getattr(settings, "base_url", "")
+            ),
+            api_key=(
+                getattr(rag_config, "embedding_api_key", "")
+                or getattr(settings, "api_key", "")
+            ),
+            dimension=getattr(rag_config, "embedding_dimension", 1024),
+            cache_path=getattr(rag_config, "embedding_cache_path", "data/embeddings"),
+        ),
+        bm25_weight=getattr(rag_config, "bm25_weight", 0.5),
+        dense_weight=getattr(rag_config, "dense_weight", 0.5),
+    )
     knowledge_rag_subgraph = build_knowledge_rag_subgraph(
         knowledge_base,
+        registry,
+        llm=llm,
         top_k=getattr(rag_config, "top_k", 3),
         max_rewrites=getattr(rag_config, "max_rewrites", 1),
+        min_score=getattr(rag_config, "min_score", DEFAULT_MIN_SCORE),
+        rewritten_min_score=getattr(
+            rag_config, "rewritten_min_score", DEFAULT_REWRITTEN_MIN_SCORE
+        ),
+        relative_floor=getattr(rag_config, "relative_floor", DEFAULT_RELATIVE_FLOOR),
     )
 
     # ---- 第 4 步: 定义 Agent 节点 ----
@@ -225,7 +263,7 @@ def build_graph(
             else None
         )
 
-        result = {}
+        result: dict[str, Any] = {}
         if explicit_room_id:
             result.update({
                 "active_room_id": explicit_room_id,
@@ -340,7 +378,7 @@ def build_graph(
             intent_route = "parallel_query"
         if not use_planner and (
             intent.intent == "clarification" or intent.confidence < confidence_threshold
-            or state.get("memory_decision", {}).get("needs_clarification", False)
+            or (state.get("memory_decision") or {}).get("needs_clarification", False)
         ):
             intent_route = "clarification"
         result = {
@@ -373,7 +411,7 @@ def build_graph(
             goal=latest_text,
             reason="请求包含多个自定义动作，交由 Planner 先出计划再执行",
         )
-        result.update({
+        planning_reset: dict[str, Any] = {
             "planning_active": True,
             "planning_goal": latest_text,
             "plan": None,
@@ -384,7 +422,8 @@ def build_graph(
             "planning_status": "planning",
             "planning_failure_feedback": "",
             "planning_results": [],
-        })
+        }
+        result.update(planning_reset)
         return result
 
     @traced_node("planner")
@@ -440,7 +479,11 @@ def build_graph(
 
     def plan_approval_node(state: AgentState) -> dict:
         """Pause before executing a newly generated or revised plan."""
-        request = plan_approval_payload(state["plan"])
+        plan = state["plan"]
+        # planning_status 状态机保证：走到审批节点时 plan 必已落定（planner 先写）。
+        # assert 同时充当类型收窄，mypy 认 this 形式。
+        assert plan is not None
+        request = plan_approval_payload(plan)
         decision = interrupt(request)
         approved = approval_is_granted(decision)
         emit_progress("plan_decision", approved=approved, revision=state.get("plan_revision", 1))
@@ -453,8 +496,10 @@ def build_graph(
     def executor_node(state: AgentState, config: RunnableConfig) -> dict:
         """Execute exactly one plan step using the existing trusted tools."""
         index = state.get("current_step_index", 0)
-        total = len(state["plan"]["steps"])
-        step = state["plan"]["steps"][index]
+        plan = state["plan"]
+        assert plan is not None  # 状态机保证：executor 只在 planning 后运行
+        total = len(plan["steps"])
+        step = plan["steps"][index]
         attempt = state.get("step_retry_count", 0) + 1
         emit_progress(
             "step_started",
@@ -507,6 +552,9 @@ def build_graph(
     def verifier_node(state: AgentState) -> dict:
         """Check the actual device state and select the next control action."""
         execution = state["last_execution"]
+        assert execution is not None  # 状态机保证：verifier 只在 executor 后运行
+        plan = state["plan"]
+        assert plan is not None  # 同上：verifier 只在计划落定后运行
         verification = verify_step(
             registry,
             execution.get("device_id"),
@@ -519,7 +567,7 @@ def build_graph(
             success=verification.success,
             step_id=execution["step"]["step_id"],
             step_index=state.get("current_step_index", 0) + 1,
-            step_total=len(state["plan"]["steps"]),
+            step_total=len(plan["steps"]),
             problem_type=verification.problem_type,
             reason=verification.reason,
             expected_state=verification.expected_state,
@@ -536,7 +584,7 @@ def build_graph(
         })
         if verification.success:
             next_index = index + 1
-            finished = next_index >= len(state["plan"]["steps"])
+            finished = next_index >= len(plan["steps"])
             return {
                 "last_verification": verification.model_dump(),
                 "planning_results": results,
@@ -636,11 +684,21 @@ def build_graph(
 
     def knowledge_rag_node(state: AgentState) -> dict:
         latest_text = _latest_text(state)
-        result = knowledge_rag_subgraph.invoke({"query": latest_text})
+        # 可信空间一起传进子图：用户只说"空调显示 E4"时，要靠 active_room_id
+        # 才能定位到是哪一台（两台空调型号不同，说明书不通用）。
+        # 这两个值由 sync_context 从 RunnableConfig 落定，不是模型生成的。
+        result = knowledge_rag_subgraph.invoke({
+            "query": latest_text,
+            "active_room_id": state.get("active_room_id"),
+            "active_device_id": state.get("active_device_id"),
+        })
         emit_progress(
             "knowledge_rag_completed",
             status=result.get("rag_status"),
             citation_count=len(result.get("citations", [])),
+            device_model=result.get("device_model"),
+            auto_checked=len(result.get("check_outcomes", [])),
+            manual_items=len(result.get("manual_items", [])),
         )
         return {
             "messages": [AIMessage(content=result["answer"])],
@@ -739,7 +797,7 @@ def build_graph(
         else:
             logger.info("Agent 决策: 直接文本回复")
 
-        result = {"messages": [response]}
+        result: dict[str, Any] = {"messages": [response]}
         if role:
             result["collaboration_status"] = "working"
         emit_progress(
@@ -927,8 +985,8 @@ def build_graph(
     checkpointer = create_checkpointer(settings.memory.db_path)
     graph = workflow.compile(checkpointer=checkpointer)
     # Expose owned resources for application shutdown and integration tests.
-    graph.memory_service = memory_service
-    graph.memory_repository = memory_repository
+    graph.memory_service = memory_service  # type: ignore[attr-defined]  # 刻意附着，供关闭与测试访问
+    graph.memory_repository = memory_repository  # type: ignore[attr-defined]
 
     logger.info(
         f"Agent 图构建完成 | checkpointer={checkpointer.__class__.__name__}"

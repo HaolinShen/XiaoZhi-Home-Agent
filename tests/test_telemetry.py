@@ -10,7 +10,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.agent.telemetry import UsageTracer, _extract_usage, _normalize_usage, traced_node
+from src.agent.telemetry import (
+    UsageTracer,
+    _extract_model,
+    _extract_usage,
+    _normalize_usage,
+    traced_node,
+)
 
 
 class UsageExtractionTests(unittest.TestCase):
@@ -39,6 +45,23 @@ class UsageExtractionTests(unittest.TestCase):
             "input_tokens": None, "output_tokens": None, "total_tokens": None,
         })
 
+    def test_extracts_model_name_from_llm_output(self):
+        response = SimpleNamespace(llm_output={"model_name": "deepseek-chat"}, generations=[])
+        self.assertEqual(_extract_model(response), "deepseek-chat")
+
+    def test_extracts_model_name_from_response_metadata(self):
+        chunk = SimpleNamespace(
+            message=SimpleNamespace(response_metadata={"model": "gpt-4o-mini"}),
+            generation_info={},
+        )
+        response = SimpleNamespace(llm_output=None, generations=[[chunk]])
+        self.assertEqual(_extract_model(response), "gpt-4o-mini")
+
+    def test_missing_model_falls_back_to_unknown(self):
+        """取不到模型名也必须返回字符串——否则 _log 的格式串会缺键。"""
+        response = SimpleNamespace(llm_output=None, generations=[])
+        self.assertEqual(_extract_model(response), "unknown")
+
 
 class UsageTracerTests(unittest.TestCase):
     def test_tracer_records_one_entry_per_llm_call(self):
@@ -62,6 +85,46 @@ class UsageTracerTests(unittest.TestCase):
         tracer.on_llm_end(SimpleNamespace(llm_output=None, generations=[]), run_id="run-2")
         self.assertEqual(len(seen), 1)
         self.assertIn("total_tokens", seen[0])
+
+    def test_default_sink_actually_writes_a_log_line(self):
+        """默认 sink（_log）必须真能格式化成功。
+
+        两个用真实依赖的理由，缺一不可：
+          1. 不能注入自定义 sink —— 上面两个用例都注入了，于是 `_log` 这条
+             唯一有 bug 的路径从未被覆盖：格式串引用的 `model` 键当时并不存在。
+          2. 不能 patch 成 MagicMock —— Mock 的 .info() 接受任何参数，
+             而 KeyError 恰恰发生在 loguru 内部的 str.format 里。
+        `_log` 抛出的异常会被 LangChain 回调管理器吞掉（只打一行 stderr），
+        所以这类故障不会让业务失败，只会让度量静默归零，必须靠测试兜住。
+        """
+        from loguru import logger
+
+        lines: list[str] = []
+        sink_id = logger.add(
+            lines.append,
+            level="INFO",
+            format="{message}",
+            filter=lambda record: record["extra"].get("channel") == "llm_usage",
+        )
+        self.addCleanup(logger.remove, sink_id)
+
+        tracer = UsageTracer()  # 刻意用默认 sink
+        tracer.on_llm_start([], [], run_id="run-3")
+        tracer.on_llm_end(
+            SimpleNamespace(
+                llm_output={
+                    "model_name": "deepseek-chat",
+                    "token_usage": {"prompt_tokens": 7, "completion_tokens": 1, "total_tokens": 8},
+                },
+                generations=[],
+            ),
+            run_id="run-3",
+        )
+
+        self.assertEqual(len(lines), 1)
+        self.assertIn("model=deepseek-chat", lines[0])
+        self.assertIn("input=7", lines[0])
+        self.assertIn("total=8", lines[0])
 
 
 class ProgressEmissionTests(unittest.TestCase):

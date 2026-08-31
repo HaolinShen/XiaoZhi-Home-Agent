@@ -11,9 +11,8 @@
 """
 
 from enum import Enum
-from typing import Optional, Union
-from pydantic import BaseModel, Field, field_validator
 
+from pydantic import BaseModel, Field, field_validator
 
 # ============================================================
 # 枚举定义（确保值的合法性）
@@ -211,6 +210,16 @@ class BaseDevice(BaseModel):
     location: str = Field(
         default="",
         description="设备所在房间，如 客厅、卧室",
+    )
+    # 型号必须落在设备模型上，而不是留在知识库那边自己维护一张 device_id → 型号 的表。
+    # 原因是说明书检索的第一步是「用户措辞 → 设备实例 → 型号 → 该型号的文档集合」，
+    # 型号若只存在于知识库侧，这一跳就变成了第二份数据源：注册中心新增一台空调、
+    # 知识库那张表忘了同步，检索会拿着错误型号去查，而**查错型号的说明书比查不到更危险**
+    # ——它会给出一个看起来权威、实际不适用的答案。所以型号跟着设备实例走。
+    # 允许为空：不是每台设备都需要挂说明书；为空时知识检索必须拒答而不是猜型号。
+    model: str | None = Field(
+        default=None,
+        description="设备型号，如 SmartCool-AC2024；用于定位该设备对应的说明书文档集合",
     )
 
     # ---- 通用方法 ----
@@ -558,7 +567,7 @@ class PresenceSensor(BaseDevice):
     )
     power: bool = Field(default=True, description="传感器是否在线")
     occupied: bool = Field(default=False, description="当前是否检测到人")
-    last_motion_at: Optional[str] = Field(
+    last_motion_at: str | None = Field(
         default=None, description="最近一次检测到活动的 ISO 8601 时间，None 表示从未"
     )
     timeout_minutes: int = Field(
@@ -580,18 +589,18 @@ class PresenceSensor(BaseDevice):
 # ============================================================
 # 类型别名（方便联合类型使用）
 # ============================================================
-AnyDevice = Union[
-    LightDevice,
-    ACDevice,
-    TVDevice,
-    CurtainDevice,
-    HumidifierDevice,
-    WaterHeaterDevice,
-    KettleDevice,
-    LockDevice,
-    TempHumiditySensor,
-    PresenceSensor,
-]
+AnyDevice = (
+    LightDevice
+    | ACDevice
+    | TVDevice
+    | CurtainDevice
+    | HumidifierDevice
+    | WaterHeaterDevice
+    | KettleDevice
+    | LockDevice
+    | TempHumiditySensor
+    | PresenceSensor
+)
 
 # 只读传感器类型集合。工具层和场景层用它来判断"这台设备不能被控制"，
 # 避免每处都硬编码一遍类型列表。

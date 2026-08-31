@@ -24,8 +24,9 @@ DEVICE_ACTION_SPECS 与 PlanStep 的 Literal、mcp/server、scenes 的类型清�
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from ..models import (
     ACDevice,
@@ -287,7 +288,7 @@ def _curtain_handlers() -> dict[str, Handler]:
 _CURTAIN_HANDLERS = _curtain_handlers()
 
 
-def _humidifier_handlers() -> dict[str, Handler]:
+def _humidifier_handlers() -> dict[str, Callable[..., Any]]:
     valid_levels = {"auto", "low", "mid", "high"}
 
     def empty_tank(device, args) -> str | None:
@@ -349,7 +350,7 @@ def _water_heater_handlers() -> dict[str, Handler]:
 _WATER_HEATER_HANDLERS = _water_heater_handlers()
 
 
-def _lock_handlers() -> dict[str, Handler]:
+def _lock_handlers() -> dict[str, Callable[..., Any]]:
     def offline(device, args) -> str | None:
         if not device.power:
             return f"❌ {device.name}离线，无法操作。"
@@ -444,9 +445,14 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
             ),
         ),
         default_devices=(
+            # 客厅灯**刻意不填 model**。013 给全部设备类型补齐了说明书，
+            # 但必须留一台没登记型号的设备，否则"型号未登记 → 知识检索拒答"
+            # 这条路径在演示和测试里都不可见了（tests/test_knowledge_rag.py 有两条
+            # 用例直接钉着「客厅灯」走 no_model 分支）。留灯而不是留窗帘，
+            # 是因为"家里有一盏没牌子的老灯"最贴近真实住宅。
             (LightDevice, {"device_id": "living_room_light", "name": "客厅灯", "location": "客厅", "brightness": 80, "color": "暖白"}),
-            (LightDevice, {"device_id": "bedroom_light", "name": "卧室灯", "location": "卧室", "brightness": 60, "color": "暖白"}),
-            (LightDevice, {"device_id": "kitchen_light", "name": "厨房灯", "location": "厨房", "brightness": 100, "color": "白光"}),
+            (LightDevice, {"device_id": "bedroom_light", "name": "卧室灯", "location": "卧室", "brightness": 60, "color": "暖白", "model": "GlowSoft-L90"}),
+            (LightDevice, {"device_id": "kitchen_light", "name": "厨房灯", "location": "厨房", "brightness": 100, "color": "白光", "model": "LumiCore-L200"}),
         ),
         scene_exit="power_off",
     ),
@@ -511,8 +517,13 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
             ),
         ),
         default_devices=(
-            (ACDevice, {"device_id": "living_room_ac", "name": "客厅空调", "location": "客厅", "temperature": 26, "mode": ACMode.COOL, "fan_speed": FanSpeed.AUTO}),
-            (ACDevice, {"device_id": "bedroom_ac", "name": "卧室空调", "location": "卧室", "temperature": 26, "mode": ACMode.COOL, "fan_speed": FanSpeed.AUTO}),
+            # 两台空调刻意给了不同型号。真实家庭很少两台空调同款（不同年份买的），
+            # 而这个差异对说明书检索是决定性的：SmartCool-AC2024 的 E4 是室内外机通信异常，
+            # FrostLine-AC310 的 E4 是排水泵异常——同一个代码，两套完全不同的处理步骤。
+            # 所以用户只说"空调显示 E4"时，系统必须问是哪一台，而不能挑一台猜。
+            # 若两台同型号，这条约束在演示和测试里都不可见，型号过滤就成了摆设。
+            (ACDevice, {"device_id": "living_room_ac", "name": "客厅空调", "location": "客厅", "temperature": 26, "mode": ACMode.COOL, "fan_speed": FanSpeed.AUTO, "model": "SmartCool-AC2024"}),
+            (ACDevice, {"device_id": "bedroom_ac", "name": "卧室空调", "location": "卧室", "temperature": 26, "mode": ACMode.COOL, "fan_speed": FanSpeed.AUTO, "model": "FrostLine-AC310"}),
         ),
         scene_exit="power_off",
     ),
@@ -562,7 +573,10 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
             ),
         ),
         default_devices=(
-            (TVDevice, {"device_id": "living_room_tv", "name": "客厅电视", "location": "客厅", "volume": 30, "channel": "HDMI 1"}),
+            # model 是说明书检索的唯一数据源，必须与 docs/knowledge/catalog.json 的
+            # model 字段**逐字相等**。差一个字符（大小写、连字符）不会报错，
+            # 只会让型号过滤全部落空，表现为"明明有说明书却一直拒答"。
+            (TVDevice, {"device_id": "living_room_tv", "name": "客厅电视", "location": "客厅", "volume": 30, "channel": "HDMI 1", "model": "VisionTV-V1"}),
         ),
         scene_exit="power_off",
     ),
@@ -594,8 +608,10 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
             ),
         ),
         default_devices=(
-            (CurtainDevice, {"device_id": "living_room_curtain", "name": "客厅窗帘", "location": "客厅", "position": 0}),
-            (CurtainDevice, {"device_id": "bedroom_curtain", "name": "卧室窗帘", "location": "卧室", "position": 0}),
+            # 两台窗帘刻意用不同型号，理由同两台空调：同型号的话"型号过滤"
+            # 这条约束在演示和测试里都不可见，等于摆设。
+            (CurtainDevice, {"device_id": "living_room_curtain", "name": "客厅窗帘", "location": "客厅", "position": 0, "model": "SilkRail-C100"}),
+            (CurtainDevice, {"device_id": "bedroom_curtain", "name": "卧室窗帘", "location": "卧室", "position": 0, "model": "QuietTrack-C60"}),
         ),
         scene_exit="curtain_close",
     ),
@@ -646,7 +662,7 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
             ),
         ),
         default_devices=(
-            (HumidifierDevice, {"device_id": "living_room_humidifier", "name": "客厅加湿器", "location": "客厅", "target_humidity": 60, "mist_level": FanSpeed.AUTO, "water_level": 100}),
+            (HumidifierDevice, {"device_id": "living_room_humidifier", "name": "客厅加湿器", "location": "客厅", "target_humidity": 60, "mist_level": FanSpeed.AUTO, "water_level": 100, "model": "MistPure-H50"}),
         ),
         scene_exit="power_off",
     ),
@@ -681,7 +697,7 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
             ),
         ),
         default_devices=(
-            (WaterHeaterDevice, {"device_id": "bathroom_water_heater", "name": "卫生间电热水器", "location": "卫生间", "power": False, "target_temp": 45}),
+            (WaterHeaterDevice, {"device_id": "bathroom_water_heater", "name": "卫生间电热水器", "location": "卫生间", "power": False, "target_temp": 45, "model": "AquaWarm-W80"}),
         ),
         scene_exit="power_off",
     ),
@@ -711,7 +727,7 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
         ),
         default_devices=(
             # 出厂即锁（locked=True）。
-            (LockDevice, {"device_id": "entryway_lock", "name": "玄关门锁", "location": "玄关", "locked": True, "battery": 90}),
+            (LockDevice, {"device_id": "entryway_lock", "name": "玄关门锁", "location": "玄关", "locked": True, "battery": 90, "model": "GuardLock-D3"}),
         ),
         scene_exit="lock",
     ),
@@ -754,7 +770,7 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
             ),
         ),
         default_devices=(
-            (KettleDevice, {"device_id": "kitchen_kettle", "name": "厨房烧水壶", "location": "厨房", "power": False, "target_temp": 100}),
+            (KettleDevice, {"device_id": "kitchen_kettle", "name": "厨房烧水壶", "location": "厨房", "power": False, "target_temp": 100, "model": "QuickBoil-K15"}),
         ),
         scene_exit="power_off",
     ),
@@ -766,12 +782,16 @@ CAPABILITIES: tuple[DeviceCapability, ...] = (
 # ============================================================
 
 SENSOR_DEFAULT_DEVICES: tuple[tuple[type, dict], ...] = (
+    # 同类两台传感器刻意用**同一个型号**（真实住宅就是同款买两个）。
+    # 副作用是只说"温湿度传感器"会解析成 ambiguous——这不是缺陷：
+    # 说明书通用而设备不通用，问的是哪一台仍然要说清楚，因为自证核对读的是
+    # 那一台的真实状态（电量、读数）。
     # 初始湿度低于加湿器目标湿度 60%，"开加湿器 → 湿度上升"闭环一开机就能演示。
-    (TempHumiditySensor, {"device_id": "living_room_th_sensor", "name": "客厅温湿度传感器", "location": "客厅", "temperature": 27.0, "humidity": 42}),
-    (TempHumiditySensor, {"device_id": "bedroom_th_sensor", "name": "卧室温湿度传感器", "location": "卧室", "temperature": 26.0, "humidity": 48}),
+    (TempHumiditySensor, {"device_id": "living_room_th_sensor", "name": "客厅温湿度传感器", "location": "客厅", "temperature": 27.0, "humidity": 42, "model": "ThermoSense-T20"}),
+    (TempHumiditySensor, {"device_id": "bedroom_th_sensor", "name": "卧室温湿度传感器", "location": "卧室", "temperature": 26.0, "humidity": 48, "model": "ThermoSense-T20"}),
     # last_motion_at 留空表示开机时没有任何活动记录，occupied 为 False。
-    (PresenceSensor, {"device_id": "living_room_presence", "name": "客厅人体传感器", "location": "客厅", "timeout_minutes": 15}),
-    (PresenceSensor, {"device_id": "entryway_presence", "name": "玄关人体传感器", "location": "玄关", "timeout_minutes": 5}),
+    (PresenceSensor, {"device_id": "living_room_presence", "name": "客厅人体传感器", "location": "客厅", "timeout_minutes": 15, "model": "MotionEye-P10"}),
+    (PresenceSensor, {"device_id": "entryway_presence", "name": "玄关人体传感器", "location": "玄关", "timeout_minutes": 5, "model": "MotionEye-P10"}),
 )
 
 # registry.find 策略 3 的类型关键词（原 base.py 里手写的 keywords_map 迁移到此）。

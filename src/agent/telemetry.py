@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import functools
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 from loguru import logger
@@ -58,6 +59,37 @@ def _extract_usage(response) -> dict:
             _merge_usage(usage, getattr(chunk, "generation_info", None) or {})
 
     return usage
+
+
+def _extract_model(response) -> str:
+    """尽力提取模型名，取不到就返回 "unknown"。
+
+    这里必须"永远返回一个字符串"：`_log` 的格式串直接 `**record` 展开，
+    loguru 在 `logger.info()` 里就地做 `str.format`，缺键会当场抛 KeyError。
+    而这个异常会被 LangChain 的回调管理器吞成一行 stderr 提示
+    （`Error in UsageTracer.on_llm_end callback: KeyError('model')`），
+    业务链路照常跑完，token 日志却一条都不落盘 —— 度量静默失效比没有度量更糟。
+    曾经就是因为格式串引用了一个从未被赋值的 `model` 键踩了这个坑。
+    """
+    for source in _metadata_sources(response):
+        for key in ("model_name", "model"):
+            value = source.get(key)
+            if value:
+                return str(value)
+    return "unknown"
+
+
+def _metadata_sources(response):
+    """按优先级产出可能带元信息的 dict：llm_output → 每代消息的 response_metadata。"""
+    llm_output = getattr(response, "llm_output", None) or {}
+    if isinstance(llm_output, dict):
+        yield llm_output
+    for generation in getattr(response, "generations", None) or []:
+        for chunk in generation:
+            message = getattr(chunk, "message", None)
+            metadata = getattr(message, "response_metadata", None) or {}
+            if isinstance(metadata, dict):
+                yield metadata
 
 
 def _normalize_usage(raw: dict) -> dict:
@@ -105,6 +137,7 @@ class UsageTracer(BaseCallbackHandler):
         normalized = _normalize_usage(_extract_usage(response))
         record = {
             "run_id": str(run_id),
+            "model": _extract_model(response),
             "latency_ms": latency_ms,
             **normalized,
         }

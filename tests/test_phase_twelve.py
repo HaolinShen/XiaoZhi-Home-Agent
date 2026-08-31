@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from src.agent.context import AgentContext, SpaceDirectory
 from src.agent.graph import build_graph
@@ -39,7 +39,7 @@ class PhaseTwelveAgenticRAGTests(unittest.TestCase):
 
     def test_rag_answers_with_model_filtered_citation(self):
         kb = KnowledgeBase("docs/knowledge")
-        graph = build_knowledge_rag_subgraph(kb)
+        graph = build_knowledge_rag_subgraph(kb, self.registry, llm=None)
         result = graph.invoke({"query": "客厅空调显示 E3 是什么意思"})
         self.assertEqual(result["rag_status"], "answered")
         self.assertIn("温度传感器", result["answer"])
@@ -47,21 +47,32 @@ class PhaseTwelveAgenticRAGTests(unittest.TestCase):
         self.assertEqual(result["trajectory"][0]["step"], "identify")
 
     def test_rag_refuses_unsupported_error_code(self):
-        graph = build_knowledge_rag_subgraph(KnowledgeBase("docs/knowledge"))
-        result = graph.invoke({"query": "空调显示 E9 是什么意思"})
+        graph = build_knowledge_rag_subgraph(KnowledgeBase("docs/knowledge"), self.registry, llm=None)
+        # 点名到具体设备，隔离出"型号定位成功、但该型号说明书里没有这个码"这一种失败。
+        # 只说"空调"会先在实体消解那步因两台空调型号不同而歧义拒答，测不到这条路径。
+        result = graph.invoke({"query": "客厅空调显示 E9 是什么意思"})
         self.assertEqual(result["rag_status"], "refused")
         self.assertEqual(result["citations"], [])
         self.assertIn("不能可靠确认", result["answer"])
 
     def test_main_graph_routes_knowledge_query_to_rag(self):
-        class UnusedLLM:
+        class KnowledgeOnlyLLM:
+            """ReAct 主路一旦被走到就炸，但允许知识子图做答案综合。
+
+            两者靠入参区分：`agent_node` 传消息列表，RAG 综合传纯字符串 prompt。
+            """
+
             def bind_tools(self, tools):
                 return self
 
-            def invoke(self, messages):
-                raise AssertionError("knowledge query should not invoke ReAct")
+            def invoke(self, payload):
+                if not isinstance(payload, str):
+                    raise AssertionError("knowledge query should not invoke ReAct")
+                return AIMessage(
+                    content="这条代码指向室内温度传感器异常，先断电 5 分钟重启，仍报错请联系售后。"
+                )
 
-        with patch("src.agent.graph.build_llm", return_value=UnusedLLM()):
+        with patch("src.agent.graph.build_llm", return_value=KnowledgeOnlyLLM()):
             graph = build_graph(self.registry, self.settings, self.directory)
             result = graph.invoke(
                 {"messages": [HumanMessage(content="客厅空调显示 E3 是什么意思")], **self.context.to_state_input()},
