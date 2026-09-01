@@ -53,8 +53,32 @@ logs/
 Thumbs.db
 Desktop.ini
 
-# 个人答辩材料：含演示话术，只在本地保留
+# ---------------------------------------------------------------------------
+# 只在本地保留、不进云端仓库的材料
+#
+# 云端仓库只放「跑起来所必需」的东西：src/、tests/、pyproject.toml、.env.example，
+# 加上运行时真的会被读取的资产 —— docs/knowledge/（说明书语料，KnowledgeBase 构造
+# 期直接加载，缺文件会抛 FileNotFoundError）和 evals/（召回评测数据集）。
+# 下面这些是教学、复盘和个人求职材料：删掉不影响运行，留着会让仓库主体被淹没。
+# ---------------------------------------------------------------------------
+
+# 个人答辩与求职材料：含演示话术和自述，本就不该公开
 docs/defense-script.md
 docs/defense-deep-dive.md
+docs/resume-*.md
+
+# 教程与学习材料
+docs/guide/
+docs/tutorial.md
+docs/tutorial-v2.md
+docs/gap-analysis.md
+docs/agent_workflow_official.png
+
+# 迭代设计记录（本地按 NNN-主题.md 继续写，只是不推云端）
+docs/iterations/
+
+# 探索性 notebook（图可视化、SQL 观察、模型试验、示例）
+*.ipynb
+example/
 # graphify 技能的生成产物（知识图谱快照，可用 /graphify 重建；8MB+ 不入库）
 graphify-out/

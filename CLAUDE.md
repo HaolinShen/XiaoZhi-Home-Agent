@@ -43,6 +43,13 @@ python -m src.mcp.server --transport sse --port 8765  # SSE
 
 实际实现已到阶段十三（事件驱动自动化）+ 011 工程收口（能力单一数据源/显式注入/可观测性）+ 012 说明书 RAG 升级（实体消解/自证分流/强制引用）+ 013 混合检索（BM25 与向量双通道/名次与准入分离/召回评测），迭代方案记录在 `docs/iterations/NNN-*.md`，`docs/tutorial.md` 是最完整的架构长文。
 
+> **注意：`docs/iterations/`、`docs/guide/`、`docs/tutorial*.md`、`docs/gap-analysis.md` 与
+> notebook 只在开发者本地存在，已被 `.gitignore` 排除，不在云端仓库里。** 从 GitHub 克隆
+> 的副本看不到这些文件，此时 `README.md` 是唯一的架构文档，它已自足（含图结构、阈值标定
+> 数字、召回评测表、扩展指南与已知边界）。本地写完新迭代文档后照旧不必也无法提交。
+> 云端仓库只有：`src/`、`tests/`、`docs/knowledge/`（RAG 语料，运行时资产）、
+> `evals/`（评测数据集）、`pyproject.toml`、`.env.example`、`README.md`、本文件与 `AGENTS.md`。
+
 ### 一次请求走过的图
 
 `src/agent/graph.py:build_graph()` 是单个 `StateGraph`，编译出的图里有五条互斥业务路径。入口固定是三段前置处理：
